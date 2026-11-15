@@ -46,9 +46,9 @@ if(SNX_TEST_SANITIZERS)
     cmake_language(DEFER DIRECTORY "${PROJECT_SOURCE_DIR}" CALL snx_test_sanitize
         # the common code: the platform layer, network, filesystems, LZ4, ZBIC and xxHash, the Vulkan setup the
         # frontends share, the launcher's HTTPS and the roots it carries, the zip reader of VPKs and APKs, the glTF
-        # reader of a Mii's parts
+        # reader of a Mii's parts, the Bluetooth LE scan and its system backend
         scarletnx-common scarletnx-platform scarletnx-net scarletnx-ldn scarletnx-filesystem snx_demangle snx_lz4
-        snx_zbic snx_xxhash snx_vk_common snx_https snx_cacert snx_zip snx_cgltf
+        snx_zbic snx_xxhash snx_vk_common snx_https snx_cacert snx_zip snx_cgltf snx_ble snx_ble_system
         snx-logscan
         # the recompiler, its backends and what they take of the common code
         snx_recompiler_base snx_llvm snx_arm_llvm snx_arm_decode scarletnx-recompiler scarletnx-recompiler-shared
