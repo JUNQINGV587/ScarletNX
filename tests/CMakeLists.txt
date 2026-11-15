@@ -2607,6 +2607,18 @@ if(NOT SNX_TOOLS_ONLY)
     snx_test_target(snx-test-vk-buffer-pages 23)
     target_link_libraries(snx-test-vk-buffer-pages PRIVATE snx_nx_flags)
     add_test(NAME vk_buffer_pages COMMAND snx-test-vk-buffer-pages)
+    # the barriers of an image's uses (gpu/vk/surface.c vk_surf_use) in the layouts that VK_LAYOUT names: with unified
+    # image layouts, GENERAL and no barrier between reads of another kind; without them, each use's own layout
+    add_executable(snx-test-vk-surf-layouts vk_surf_layouts.c tracy_stubs.c)
+    snx_test_target(snx-test-vk-surf-layouts 23)
+    target_link_libraries(snx-test-vk-surf-layouts PRIVATE snx_nx_flags)
+    add_test(NAME vk_surf_layouts COMMAND snx-test-vk-surf-layouts)
+    # a draw that binds an owner where it is (gpu/vk/buffer.c buf_get_owned): one that a draw or the page cache wrote
+    # in this submission takes a pass end and a barrier first, any other none
+    add_executable(snx-test-vk-buffer-owned vk_buffer_owned.c tracy_stubs.c)
+    snx_test_target(snx-test-vk-buffer-owned 23)
+    target_link_libraries(snx-test-vk-buffer-owned PRIVATE snx_nx_flags)
+    add_test(NAME vk_buffer_owned COMMAND snx-test-vk-buffer-owned)
     # the file of shaders and pipelines kept across runs (gpu/vk/pipeline_file.c): records back as written, pipelines
     # by their shaders' records (a shipped shader's reference among them), a cut or changed record ending the reading,
     # another key starting over, a full file; its records packed into zstd units and unpacked in their place, a unit

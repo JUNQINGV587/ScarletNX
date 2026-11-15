@@ -948,6 +948,7 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         g_vk.has_depth_range_unrestricted = snx_vk_choice_has(c, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
         has_pipeline_robustness = snx_vk_choice_has(c, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
         has_robustness2 = snx_vk_choice_has(c, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    g_vk.has_unified_layouts = snx_vk_choice_has(c, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
         /* the driver's budget for each heap, the other processes' use taken out (devmem.c): without it the budget
            is 80% of a heap's size, blind to what the desktop and other programs hold */
         g_vk.has_budget = snx_vk_choice_has(c, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
@@ -1125,6 +1126,8 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_FEATURES_EXT};
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR qlocal = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR qunified = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR};
     VkPhysicalDeviceConditionalRenderingFeaturesEXT qcond = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CONDITIONAL_RENDERING_FEATURES_EXT};
     VkPhysicalDeviceProvokingVertexFeaturesEXT qprov = {
@@ -1189,6 +1192,7 @@ static bool choose_device(SnxVkChoice* c, void* user) {
                            g_vk.has_feedback ? &qloop : NULL,
                            has_feedback_dynamic ? &qloop_dyn : NULL,
                            g_vk.has_local_read ? &qlocal : NULL,
+                           g_vk.has_unified_layouts ? &qunified : NULL,
                            has_cond ? &qcond : NULL,
                            has_provoking ? &qprov : NULL,
                            has_list_restart ? &qlist_restart : NULL,
@@ -1372,6 +1376,9 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     g_vk.has_feedback_dynamic =
         g_vk.has_feedback && has_feedback_dynamic && qloop_dyn.attachmentFeedbackLoopDynamicState;
     g_vk.has_local_read = g_vk.has_feedback && g_vk.has_local_read && qlocal.dynamicRenderingLocalRead;
+    /* the extension alone allows GENERAL where the specification asks for it. The feature says that GENERAL costs
+       nothing against each use's own layout, which is why the renderer then keeps its images there */
+    g_vk.has_unified_layouts = g_vk.has_unified_layouts && qunified.unifiedImageLayouts;
     g_spirv_translate.maximal_reconvergence = has_reconvergence && qreconv.shaderMaximalReconvergence;
     g_spirv_translate.clock_scopes =
         has_shader_clock ? (qclock.shaderSubgroupClock ? 1 : 0) | (qclock.shaderDeviceClock ? 2 : 0) : 0;
@@ -1837,6 +1844,14 @@ static bool choose_device(SnxVkChoice* c, void* user) {
     if (g_vk.has_local_read) {
         chain = &flocal;
         snx_vk_choice_enable(c, VK_KHR_DYNAMIC_RENDERING_LOCAL_READ_EXTENSION_NAME);
+    }
+    VkPhysicalDeviceUnifiedImageLayoutsFeaturesKHR funified = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_UNIFIED_IMAGE_LAYOUTS_FEATURES_KHR,
+        .pNext = chain,
+        .unifiedImageLayouts = VK_TRUE};
+    if (g_vk.has_unified_layouts) {
+        chain = &funified;
+        ext[next++] = VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME;
     }
     VkPhysicalDeviceBlendOperationAdvancedFeaturesEXT fadvanced = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BLEND_OPERATION_ADVANCED_FEATURES_EXT,
