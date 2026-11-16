@@ -667,6 +667,9 @@ void video_init(const char* title, const char* addons) {
         SDL_CreateWindow(header, w, h, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
     if (!g_sdl3.win) fatal("SDL could not open a Vulkan window: %s", SDL_GetError());
     snx_window_icon(g_sdl3.win);
+    /* the display server's own arrow: the game is the picture, and a pointer the mouse has not moved has no place on
+       it. The menu shows it again for the mouse the desktop's menus take */
+    SDL_HideCursor();
     overlay_set_display_scale(SDL_GetWindowDisplayScale(g_sdl3.win));
 #if defined(__ANDROID__) || defined(SDL_PLATFORM_IOS)
     overlay_set_fingers(1); /* a screen of fingers, as the launcher's SNX_TOUCH_UI: the menu's rows a finger's */
@@ -1291,7 +1294,11 @@ static u64 finger_id(const SDL_TouchFingerEvent* f) {
     return (u64)f->fingerID | (f->touchID == SDL_PEN_TOUCHID ? 1ull << 63 : 0);
 }
 static void menu_open(int open) {
-    if (overlay_shown() != open) overlay_toggle();
+    if (overlay_shown() != open) {
+        overlay_toggle();
+        if (overlay_shown()) SDL_ShowCursor();
+        else SDL_HideCursor();
+    }
     vpad_release();
     g_sdl3.keys_held = 0;
     /* a finger or button down before this (Home on the on-screen controls opened it) lifts without a tap */
