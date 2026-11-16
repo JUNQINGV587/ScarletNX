@@ -88,6 +88,20 @@ The two settings pull apart only if a game needs the console's own answer: `touc
 without a touch screen, and `--resolution=1` gives the console's 1080p picture. A port that changes either says why
 in its launcher and in the note on the port.
 
+### How a port is shipped
+
+A finished port is one AppImage per game and an install of it on the handheld. `scripts/make-appimage.sh` makes the
+AppImage, and a copy named after the game loads that game's module: `games/MyGame.AppImage` loads
+`games/MyGame_code.so`. The handheld's install has a desktop entry next to the AppImage.
+
+A port's save data also runs on the server: `snx-saves [TITLE ID]` copies `.scarletnx/save` into
+`/mnt/unraid/saves/<TITLE ID>/` as a snapshot, and keeps the newest three. The mount is the server's `workspace`
+share at `//192.168.233.1/workspace`, and the user timer `snx-saves.timer` runs the command every ten minutes. A
+snapshot that matches the newest one is not made again.
+
+While a port is in debug, it runs from `~/Applications/ScarletNX/scarletnx-abi19` and no AppImage is made. When the
+port is complete, make the AppImage, install it, and run that copy from then on.
+
 
 - The Bash tool runs **zsh**. `$t:s` is a zsh modifier, so write `"${t}:s"`. The scripts in the repo use bash
   shebangs.
