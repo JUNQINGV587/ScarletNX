@@ -79,14 +79,14 @@ rules that sessions get wrong, and it points to the skills that hold the procedu
 
 ### The standard a port of a Switch game runs at
 
-Every port of a Switch game runs with the TV mode's display and a handheld's input: 1920x1080 in the guest, the
-internal resolution at 3x that (5760x3240, a 16:9 frame a 16:10 screen shows with the bars `screen_fit` keeps), and
-the game told handheld mode so its touch screen reaches it. That is `--docked=1 --resolution=3` in the launcher, with
-the runtime's own defaults `docked=1` and `touch_in_tv=1`, so a game without a launcher of its own gets it too.
+A port runs with the TV mode's display and a handheld's input. The guest frame is 1920x1080. The internal
+resolution is 3x that, 5760x3240, and `screen_fit` keeps the bars a 16:10 screen shows around it. The runtime also
+tells the game it is in handheld mode, so its touch screen reaches it. The launcher passes `--docked=1 --resolution=3`.
+The runtime defaults are `docked=1` and `touch_in_tv=1`, so a game without a launcher gets the same.
 
-The two settings pull apart only if a game needs the console's own answer: `touch_in_tv=0` gives the game TV mode
-without a touch screen, and `--resolution=1` gives the console's 1080p picture. A port that changes either says why
-in its launcher and in the note on the port.
+Two settings give the console's own answer when a game needs it. `touch_in_tv=0` gives the game TV mode without a
+touch screen. `--resolution=1` gives the console's 1080p picture. A port that changes either one states why, in its
+launcher and in the note on that port.
 
 ### How a port is shipped
 
