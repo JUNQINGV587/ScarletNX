@@ -76,6 +76,7 @@ type, range and help, tab-separated. Every setting, the recompiler's too, is des
 | Key | Default | Effect |
 | --- | --- | --- |
 | `resolution` | `1` | Internal 3D scale, `0.25` to `16`: `1` native, `2` double, `0.75` and `0.5` faster. The launcher's Settings takes only the digits, three in all with two decimals at most, and refuses a value past the range, its dialog saying so. It warns below `0.5` and above `4`, where a game may use too much GPU memory or fall apart |
+| `screen_fit` | `0` | `0` keeps the frame's shape, so a window or a screen of another shape shows bars. `1` fills the window with the picture, which stretches it when the shapes differ (`--screen_fit=N`) |
 | `dlss_upscaler` | `1` | What a Switch 2 game's DLSS evaluations run: `1` = AMD FidelityFX Super Resolution 2.2 (a temporal upscaler, on any GPU), `0` = a filtered copy (cheaper, soft, and the picture shakes with the game's camera jitter). FSR 2 falls back to the copy where it can't run |
 | `dlss_render_size` | `0` | The size a Switch 2 game is told to render at before its DLSS evaluation: `0` = what the game's own DLSS mode asks, `1` = the output's size, `2` = 1/1.5, `3` = 1/1.7, `4` = 1/2, `5` = 1/3 of it (fastest) |
 | `fsr_sharpness` | `0` | The sharpening FSR 2 applies after upscaling, 0 to 1: `0` = none, and no sharpening pass runs |
@@ -247,6 +248,7 @@ The settings, each with its extension and, where one took it in, the Vulkan vers
 | Key | Default | Effect |
 | --- | --- | --- |
 | `touch` | `2` | The game's touch screen: `2` fingers and the mouse's left button, `1` fingers, `0` off. A 3DS game takes it too, for its bottom screen (`--touch=N`): one finger or the mouse at a time, the first pressed holding it until it lets go |
+| `touch_in_tv` | `0` | `1` lets the touch screen reach the game while TV mode is on: the game hears handheld mode and the handheld input source, and the display keeps the docked one. `0` gives the console's answer, where TV mode has no touch screen (`--touch_in_tv=N`) |
 | `controls_<ID>` (ID one of `l`, `r`, `zl`, `zr`, `minus`, `plus`, `capture`, `home`, `l3`, `r3`, `dpad`, `stick_l`, `stick_r`, `a`, `b`, `x`, `y`) | empty | A control's place, written once it is moved or reset: `x y size`, its middle across the screen from 0 to 1 and its size in percent (50 to 200), as `controls_a=0.930 0.470 100` |
 | `controls_<ID>_shown` | `1` | `1` draws the control, `0` hides it; written once it is shown or hidden |
 | `controls` | `2` | The [on-screen controls](usage.md#on-screen-controls): `1` shown, `0` hidden, `2` (Auto) shown while the device has a touch screen and no gamepad is connected, hidden while one is; the log says what Auto shows and why as it changes. The launcher gives every run `2` |
@@ -257,6 +259,7 @@ The settings, each with its extension and, where one took it in, the Vulkan vers
 | Key | Default | Effect |
 | --- | --- | --- |
 | `gamepad_swap_ab` | `0` | `1` swaps a gamepad's A and B. `0` sends A, B, X and Y where the console's are. A 3DS game takes it too (the launcher passes it to `scarletnx-3ds` as `--gamepad-swap-ab=1`) |
+| `gamepad_face_labels` | `0` | `1` sends the game the button that a face button's label shows, so an Xbox gamepad's A is the game's A. `0` sends it where the console's is (`--gamepad_face_labels=N`) |
 | `gamepad_map` | none | The player's map over that, below. A 3DS game takes it too (`--gamepad-map=MAP`), Plus as Start and Minus as Select; a control sent to L3 or R3, which the 3DS has none of, sends nothing, and the log says so |
 | `gamepad_deadzone` | `20` | The sticks' dead zone, in percent of their travel (`0` to `90`). A 3DS game takes it too, for its circle pad (`--gamepad-deadzone=N`) |
 | `gamepad_rumble` | `100` | How strongly gamepads vibrate when the game asks, in percent. `0` is never. A Pro Controller or a single Joy-Con plays the game's HD rumble, with its frequencies, when SDL reads it through its HIDAPI driver (the log says "plays HD rumble"). A Pro Controller plays each side on its own actuator, and a single Joy-Con plays each band of the stronger side on its one actuator. Other controllers, two paired Joy-Cons, and a Switch controller that only the kernel driver reads get the strength of the vibration only. The log says why for each of them |

@@ -96,11 +96,11 @@ AppImage, and a copy named after the game loads that game's module: `games/MyGam
 
 A port's save data also runs on the server: `snx-saves [TITLE ID]` copies `.scarletnx/save` into
 `/mnt/unraid/saves/<TITLE ID>/` as a snapshot, and keeps the newest three. The mount is the server's `workspace`
-share at `//192.168.233.1/workspace`, and the user timer `snx-saves.timer` runs the command every ten minutes. A
-snapshot that matches the newest one is not made again.
+share at `//192.168.233.1/workspace`, and the user timer `snx-saves.timer` runs the command every ten minutes. The
+command skips a snapshot that matches the newest one.
 
-While a port is in debug, it runs from `~/Applications/ScarletNX/scarletnx-abi19` and no AppImage is made. When the
-port is complete, make the AppImage, install it, and run that copy from then on.
+While a port is in debug, it runs from `~/Applications/ScarletNX/scarletnx-abi19` and you make no AppImage. When
+the port is complete, make the AppImage, install it, and run that copy from then on.
 
 
 - The Bash tool runs **zsh**. `$t:s` is a zsh modifier, so write `"${t}:s"`. The scripts in the repo use bash
