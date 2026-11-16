@@ -58,6 +58,10 @@ const char* snx_pad_button_name(int bit);
 void snx_pad_map_position(SnxPadMap* map);
 /* A sent where B was and B where A was, whichever controls send them */
 void snx_pad_map_swap_ab(SnxPadMap* map);
+/* map by the labels a pad shows: each face button sends the console button its label names (a pad whose south
+   says A sends A), the controls a label does not name left. For a pad whose face buttons are not where the
+   console's are, an Xbox pad's */
+void snx_pad_map_by_label(SnxPadMap* map, const int labels[4]);
 /* every control SNX_PAD_UNSET; the unset ones of map taken from from */
 void snx_pad_map_unset(SnxPadMap* map);
 void snx_pad_map_fill(SnxPadMap* map, const SnxPadMap* from);

@@ -470,8 +470,18 @@ static i32 up(i32 v) { return v == -32768 ? 32767 : -v; }
    player's, else every player's), then A and B swapped as its player says, else as every player's */
 static void map_of(int slot, SnxPadMap* map) {
     const SnxPlayerConfig* p = slot >= 0 && slot < SNX_GAMEPADS ? &g_gamepad.players[slot] : NULL;
+    const SnxPadMap* own = p && p->has_map ? &p->own : &g_gamepad.cfg.own;
     int swap = p && g_settings.player_swap_a_b[slot] >= 0 ? g_settings.player_swap_a_b[slot] : g_settings.swap_a_b;
-    snx_pad_map_sent(map, p && p->has_map ? &p->own : &g_gamepad.cfg.own, swap);
+    snx_pad_map_sent(map, own, swap);
+    /* the pad's own labels, for a face button whose place is not the console's (an Xbox pad's A at the bottom),
+       where the player's map leaves that control: the game gets the button the pad shows */
+    if (g_settings.face_labels && slot >= 0 && slot < SNX_GAMEPADS && g_gamepad.pads[slot]) {
+        SnxPadMap shown;
+        snx_pad_map_unset(&shown);
+        snx_pad_map_by_label(&shown, g_gamepad.labels[slot]);
+        for (int c = SNX_PAD_SOUTH; c <= SNX_PAD_NORTH; ++c)
+            if (own->bit[c] == SNX_PAD_UNSET && shown.bit[c] != SNX_PAD_UNSET) map->bit[c] = shown.bit[c];
+    }
 }
 /* how strongly the pad in slot vibrates, in percent: its player's, else every player's */
 static u32 strength(int slot) { return (u32)(g_settings.player_vibration[slot] >= 0 ? g_settings.player_vibration[slot] : g_settings.vibration); }

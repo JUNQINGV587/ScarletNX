@@ -757,6 +757,12 @@ setting Swap A/B
     default 0
     words Off|On
     help 1 = a controller's A and B swapped: 0 = where the console's are (A right, B bottom)
+setting Face labels
+    key gamepad_face_labels
+    int 0 1
+    default 0
+    words Position|Labels
+    help 1 = a face button sends the game the button its label shows (an Xbox pad's A is the game's A), 0 = where the console's are
 setting Stick dead zone
     key gamepad_deadzone
     int 0 90

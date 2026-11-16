@@ -72,6 +72,23 @@ int main(void) {
     assert(!strcmp(snx_pad_button_name(ZL), "ZL") && !strcmp(snx_pad_button_name(SNX_PAD_NONE), "None"));
     for (c = 0; c < SNX_PAD_CONTROLS; ++c) assert(snx_pad_control_key(c)[0]);
     assert(!snx_pad_control_key(SNX_PAD_CONTROLS)[0] && !snx_pad_control_name(-1, NULL)[0]);
+    /* the labels a pad shows: an Xbox pad's A is at the bottom, so it sends A, its B on the right sends B, and its X
+       and Y stay; only the face buttons a label names are set, and a Sony pad's glyphs are places, so they leave the
+       map alone */
+    snx_pad_map_unset(&map);
+    snx_pad_map_by_label(&map, xbox);
+    assert(map.bit[SNX_PAD_SOUTH] == A && map.bit[SNX_PAD_EAST] == B && map.bit[SNX_PAD_WEST] == X &&
+           map.bit[SNX_PAD_NORTH] == Y);
+    assert(map.bit[SNX_PAD_START] == SNX_PAD_UNSET && map.bit[SNX_PAD_LT] == SNX_PAD_UNSET);
+    snx_pad_map_unset(&map);
+    snx_pad_map_by_label(&map, sony);
+    for (c = SNX_PAD_SOUTH; c <= SNX_PAD_NORTH; ++c) assert(map.bit[c] == SNX_PAD_UNSET);
+    snx_pad_map_unset(&map);
+    snx_pad_map_by_label(&map, xbox);
+    snx_pad_map_unset(&placed);
+    placed.bit[SNX_PAD_SOUTH] = B;
+    placed.bit[SNX_PAD_EAST] = A;
+    assert(map.bit[SNX_PAD_SOUTH] != placed.bit[SNX_PAD_SOUTH] && map.bit[SNX_PAD_EAST] != placed.bit[SNX_PAD_EAST]);
     puts("pad_map passed");
     return 0;
 }

@@ -31,6 +31,13 @@ void snx_pad_map_swap_ab(SnxPadMap* map) {
     for (int c = 0; c < SNX_PAD_CONTROLS; ++c)
         if (map->bit[c] == 0 || map->bit[c] == 1) map->bit[c] = (signed char)(1 - map->bit[c]); /* A is 0, B 1 */
 }
+void snx_pad_map_by_label(SnxPadMap* map, const int labels[4]) {
+    /* SNX_PAD_LABEL_ of the button, the console's bit for it: A, B, X and Y, the others none */
+    static const signed char BIT[SNX_PAD_LABEL_TRIANGLE + 1] = {-1, 0, 1, 2, 3, -1, -1, -1, -1};
+    for (int c = SNX_PAD_SOUTH; c <= SNX_PAD_NORTH; ++c)
+        if (labels[c] >= SNX_PAD_LABEL_A && labels[c] <= SNX_PAD_LABEL_TRIANGLE && BIT[labels[c]] >= 0)
+            map->bit[c] = BIT[labels[c]];
+}
 void snx_pad_map_unset(SnxPadMap* map) { memset(map->bit, SNX_PAD_UNSET, sizeof map->bit); }
 void snx_pad_map_fill(SnxPadMap* map, const SnxPadMap* from) {
     for (int c = 0; c < SNX_PAD_CONTROLS; ++c)
