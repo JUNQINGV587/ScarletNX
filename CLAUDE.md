@@ -77,6 +77,18 @@ rules that sessions get wrong, and it points to the skills that hold the procedu
 
 ## Environment
 
+### The standard a port of a Switch game runs at
+
+Every port of a Switch game runs with the TV mode's display and a handheld's input: 1920x1080 in the guest, the
+internal resolution at 3x that (5760x3240, a 16:9 frame a 16:10 screen shows with the bars `screen_fit` keeps), and
+the game told handheld mode so its touch screen reaches it. That is `--docked=1 --resolution=3` in the launcher, with
+the runtime's own defaults `docked=1` and `touch_in_tv=1`, so a game without a launcher of its own gets it too.
+
+The two settings pull apart only if a game needs the console's own answer: `touch_in_tv=0` gives the game TV mode
+without a touch screen, and `--resolution=1` gives the console's 1080p picture. A port that changes either says why
+in its launcher and in the note on the port.
+
+
 - The Bash tool runs **zsh**. `$t:s` is a zsh modifier, so write `"${t}:s"`. The scripts in the repo use bash
   shebangs.
 - Put temporary files in the session scratchpad, never in the repo root. Use `run_in_background` for long runs.
