@@ -58,9 +58,10 @@ u32 nvn_replay_present(u32 queue, const NvnReplayPresent* p, u32* shown);
 /* the effects a submission may have (each fence and event it signals), and the work queued for the GPU thread at
    once: submissions, fences and presents, each with up to NVN_JOB_HANDLES recordings. Five games measured at most
    17 effects, 71 pieces of work queued at once (at a start, while the GPU thread translated shaders) and 115
-   recordings in a submission */
+   recordings in a submission. Civilization VI queued 750 at once while its map loaded, and a full pool ends the
+   program: the bound is the runtime's own, so it stays above what a game measured */
 #define NVN_EFFECTS     1024
-#define NVN_JOBS        512
+#define NVN_JOBS        2048
 #define NVN_JOB_HANDLES 512
 /* a queue's replay state: its rendering and copy state (gpu/nvn/nvn_draw.c, nvn_copy.c), and the syncpoint its
    fences count */
