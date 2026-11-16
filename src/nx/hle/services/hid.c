@@ -90,7 +90,9 @@ static void hid_sources(HidSource src[HID_ENTRIES]) {
             src[p].p = p;
         }
     }
-    if (!snx_tv_mode()) src[8].kind = SRC_HANDHELD;
+    /* the handheld source carries the touch screen: touch_in_tv keeps it there while TV mode is on, so a game
+       that asks for handheld mode to trust a finger still finds one */
+    if (!snx_tv_mode() || g_settings.touch_in_tv_mode) src[8].kind = SRC_HANDHELD;
 }
 /* the one style an Npad has: its controller's when the game supports it, else the nearest the game does */
 static u32 hid_style_of(int e, const HidSource* s) {

@@ -746,6 +746,13 @@ setting Touch screen
     set backend_touch_mode_set
     words Off|Fingers|Fingers and mouse
     help The game's touch screen: 1 = fingers, 2 = fingers and the mouse's left button, 0 = off
+setting Touch in TV mode
+    key touch_in_tv
+    int 0 1
+    default 1
+    startup
+    words Off|On
+    help 1 = the touch screen reaches the game while TV mode is on (the game is told handheld mode and the handheld input source, the display stays the docked one); 0 = the console's, where TV mode has no touch screen
 
 table g_vpad_shown_ini
 setting Control shown

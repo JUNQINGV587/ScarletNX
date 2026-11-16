@@ -292,7 +292,7 @@ static int nn_am_service_ICommonStateGetter_ReceiveMessage(SvcObj* self, nn_am_A
 }
 static int nn_am_service_ICommonStateGetter_GetOperationMode(SvcObj* self, u8* mode) {
     (void)self;
-    *mode = snx_tv_mode() ? 1 : 0; /* nn::oe::OperationMode: Handheld, Console */
+    *mode = (snx_tv_mode() && !g_settings.touch_in_tv_mode) ? 1 : 0; /* nn::oe::OperationMode: Handheld, Console */
     R_SUCCEED();
 }
 static int nn_am_service_ICommonStateGetter_GetPerformanceMode(SvcObj* self, u32* mode) {
