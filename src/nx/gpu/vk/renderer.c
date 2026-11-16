@@ -680,6 +680,21 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
                 i32 dx = (i32)(cx + (cw - dw) / 2), dy = (i32)(cy + (ch - dh) / 2);
                 crop = (VkRect2D){{(i32)g_last_x, (i32)g_last_y}, {g_last_w, g_last_h}};
                 to = (VkRect2D){{dx, dy}, {dw, dh}};
+                /* a window of another shape than the frame's: fill it, the sides cut, or stretch it (screen_fit) */
+                const int fit = g_settings.screen_fit;
+                if (fit == 2) {
+                    to = (VkRect2D){{(i32)cx, (i32)cy}, {cw, ch}};
+                } else if (fit == 1) {
+                    u32 sw2 = g_last_w, sh2 = g_last_h;
+                    if ((u64)cw * g_last_h < (u64)ch * g_last_w) /* the window narrower: the sides cut */
+                        sw2 = (u32)((u64)g_last_h * cw / ch);
+                    else
+                        sh2 = (u32)((u64)g_last_w * ch / cw);
+                    crop = (VkRect2D){{(i32)g_last_x + (i32)((g_last_w - sw2) / 2),
+                                       (i32)g_last_y + (i32)((g_last_h - sh2) / 2)},
+                                      {(i32)sw2, (i32)sh2}};
+                    to = (VkRect2D){{(i32)cx, (i32)cy}, {cw, ch}};
+                }
                 framed = src;
             }
             { /* one pass: black, the frame, the on-screen layer */

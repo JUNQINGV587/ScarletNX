@@ -251,6 +251,14 @@ setting Resolution scale
     default 1
     startup
     help The scale of the game's 3D rendering, 0.25 to 16: 1 = the console's, 2 = double, 0.5 = half
+setting Screen fit
+    key screen_fit
+    int 0 2
+    default 0
+    startup
+    words Fit|Fill|Stretch
+    help How the game's picture fills a window of another shape than its own: 0 = its own shape, with bars beside it,
+    help 1 = scaled up until the window is covered, the sides cut, 2 = stretched to the window, which distorts it
 setting DLSS upscaler
     key dlss_upscaler
     int 0 1
