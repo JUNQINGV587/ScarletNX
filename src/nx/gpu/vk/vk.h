@@ -274,7 +274,23 @@ extern VkState g_vk;
    renderer names for its own images goes through this, so an image's barriers, attachments and descriptors agree.
    Images that other code writes descriptors or barriers for keep their own layouts: FFmpeg's decoded frames (nvdec.c)
    and FSR 2's inputs (upscale.c). Feedback loops keep ATTACHMENT_FEEDBACK_LOOP_OPTIMAL_EXT, and present PRESENT_SRC */
-#define VK_LAYOUT(name) (g_vk.has_unified_layouts ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_##name)
+static inline VkImageLayout snx_vk_layout(VkImageLayout named) {
+    if (!g_vk.has_unified_layouts) return named;
+    /* A colour or depth attachment keeps the layout its compression, its fast clears and its resolve are tied to.
+       The pictures the GPU merely samples or copies take GENERAL, where a later use of another kind needs no change. */
+    switch (named) {
+    case VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL:
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL:
+    case VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL:
+    case VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL:
+    case VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_OPTIMAL:
+    case VK_IMAGE_LAYOUT_STENCIL_ATTACHMENT_OPTIMAL:
+        return named;
+    default:
+        return VK_IMAGE_LAYOUT_GENERAL;
+    }
+}
+#define VK_LAYOUT(name) snx_vk_layout(VK_IMAGE_LAYOUT_##name)
 
 /* the swapchain's display clock (sc_clock): none; present ids and waits; their second versions, which a swapchain made
    for VK_EXT_present_timing takes; VK_GOOGLE_display_timing's past presentation timings */
