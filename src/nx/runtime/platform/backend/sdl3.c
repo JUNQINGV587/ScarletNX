@@ -686,7 +686,13 @@ void video_init(const char* title, const char* addons) {
     if (!g_renderer->start()) renderer_failed("Vulkan could not start");
     LOG("renderer: Vulkan\n");
     /* not for an unattended run: nobody is at the screen, and it would cover the desktop of whoever is */
-    if (g_settings.fullscreen && !unattended_active()) set_fullscreen(1);
+    if (g_settings.fullscreen && !unattended_active()) {
+        set_fullscreen(1);
+        /* a desktop with no window manager (a gamescope session) keeps the place it opened the window at, and a window
+           the size of the screen put there has its right and lower edges past it: the screen's own corner is where a
+           fullscreen window goes */
+        SDL_SetWindowPosition(g_sdl3.win, 0, 0);
+    }
 #ifdef _WIN32
     /* keep the display and the system awake while playing (it was set with the crash handler, headless runs too) */
     SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED);
