@@ -1014,6 +1014,18 @@ static void global_buffers(void) {
         save_fixture(global_dynamic_path, code, words);
     }
     free(code);
+    /* Frostpunk's building programs take a matrix pointer from c[16][R28] with LDC.ISL, then read it with LDG.
+       The indexed LDC keeps its runtime index; the immediate slot supplies the dynamic access's candidate buffer. */
+    const u64 indexed_ldc[] = {
+        0xEF95010000071C1Cull, /* LDC.ISL.64 R28, c[16][R28] */
+        0xEED4200000071C00ull, /* LDG.E R0, [R28] */
+    };
+    code = translate(indexed_ldc, 2, ST_VS, &info, &words, 1);
+    if (!code || info.unsupported) fprintf(stderr, "indexed LDC global base: %s\n", info.first_unsupported);
+    check(code && !info.unsupported && info.ngbuf == 1 && info.gbuf_cbuf_off[0] == (16u << 16) &&
+              (info.gbuf_rmask & 1),
+          "a register-indexed LDC can supply a global base");
+    free(code);
     /* an atomic, or an access with no tracked buffer to be in, is still refused */
     const u64 dynamic_atomic[] = {0x4C98078014470002ull, 0xEED4200000070200ull, FMUL_KEEP | 6, 0xED03000000600606ull};
     code = translate(dynamic_atomic, 4, ST_FS, &info, &words, 1);

@@ -1873,7 +1873,9 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         else if (op == O_MOV_C) {
             tag = shader_gbuf_tag(stage, B(w, 34, 5), B(w, 20, 14) * 4);
             if (!tag) tag = shader_gbuf_tag_any(stage, B(w, 34, 5), B(w, 20, 14) * 4);
-        } else if (op == O_LDC && a == 255 && (B(w, 48, 3) == 4 || B(w, 48, 3) == 5)) {
+        } else if (op == O_LDC && (B(w, 48, 3) == 4 || B(w, 48, 3) == 5)) {
+            /* LDC.IS/ISL reads a pointer through a register-indexed constant table too. The load itself keeps its
+               index; this tag makes the immediate slot's buffer a candidate for the dynamic LDG/STG address match. */
             tag = shader_gbuf_tag(stage, B(w, 36, 5), (u32)(i32)(i16)B(w, 20, 16));
             if (!tag) tag = shader_gbuf_tag_any(stage, B(w, 36, 5), (u32)(i32)(i16)B(w, 20, 16));
         } else if (op == O_MOV_R)
