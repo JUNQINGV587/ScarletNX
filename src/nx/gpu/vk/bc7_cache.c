@@ -460,7 +460,7 @@ static void bc7_later_run(const void* p) {
     if (f && bc7_read_at(f, g_bc7_cache.rd.piece, l->key, l->at, l->size, l->dst) > 0) {
         /* staging may not be host coherent, and its submission's flush (cmd.c's rings_flush) came before this */
         vk_devmem_flush(l->mem, l->off, l->size);
-        if (l->img) vkCmdCopyBufferToImage(l->cb, l->buf, l->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &l->copy);
+        if (l->img) vkCmdCopyBufferToImage(l->cb, l->buf, l->img, VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1, &l->copy);
         __atomic_add_fetch(&g_bc7_cache.rd.hits, 1, __ATOMIC_RELAXED);
         return;
     }

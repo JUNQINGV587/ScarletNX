@@ -229,7 +229,7 @@ int vk_upscale(const GpuUpscale* u) {
     for (u32 i = 0; i < 5; i++) {
         if (!reads[i] || (i == 3 && (flags & SNX_FSR2_AUTO_EXPOSURE))) continue;
         /* FSR 2 writes its descriptors itself, with this layout (fsr2.h), also with unified image layouts */
-        vk_surf_use(cb, reads[i], VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+        vk_surf_use(cb, reads[i], VK_LAYOUT(SHADER_READ_ONLY_OPTIMAL), VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                     VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
     }
     vk_render_end(); /* dispatches outside a rendering pass */

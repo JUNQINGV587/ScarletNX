@@ -574,7 +574,7 @@ static int stage_cached(VkCommandBuffer cb, const u64 key[2], u64 size, VkImage 
         if (r >= 0) return r ? CACHED_QUEUED : CACHED_NONE;
     }
     if (!vk_bc7_cache_read(key, p, size)) return CACHED_NONE;
-    if (img) rec_CmdCopyBufferToImage(cb, buf, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    if (img) rec_CmdCopyBufferToImage(cb, buf, img, VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1, &copy);
     return CACHED_DONE;
 }
 
@@ -626,7 +626,7 @@ static int bc7_from_cache(VkCommandBuffer cb, Surf* t, VkImage img, const u64 ke
                                .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, layered ? depth : 1},
                                .extent = {w, h, layered ? 1 : depth}};
         rec_CmdCopyImage(cb, l->surf->img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img,
-                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &r);
+                         VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1, &r);
         g_astc.bc7_copies++;
         live_put(key, t, level, layer, 0);
         return 1;
@@ -1438,7 +1438,7 @@ static void bg_load(void) {
             /* into the texture while it holds what j's upload wrote (bg_to_image) */
             const int into = t && !t->took_drawn;
             if (into)
-                vk_surf_use(cb, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                vk_surf_use(cb, t, VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                             VK_ACCESS_2_TRANSFER_WRITE_BIT);
             const int r = stage_cached(cb, q.key, q.bytes, into ? t->img : VK_NULL_HANDLE,
                                        piece_copy(&j->p, &q, 0, j->w, j->h, j->level, j->layer, j->as_layers), NULL);
@@ -1783,8 +1783,8 @@ static int astc_upload(VkCommandBuffer cb, Surf* t, u32 x, u32 y0, u32 w, u32 h,
                        do not leave them, or the next strip's barriers, with the ended command buffer. */
                     cb = vk_cmd();
                     /* another thread's commands may have used the image meanwhile */
-                    if (paused && t->layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
-                        vk_surf_use(cb, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                    if (paused && t->layout != VK_LAYOUT(TRANSFER_DST_OPTIMAL))
+                        vk_surf_use(cb, t, VK_LAYOUT(TRANSFER_DST_OPTIMAL), VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
                                     VK_ACCESS_2_TRANSFER_WRITE_BIT);
                 }
             }

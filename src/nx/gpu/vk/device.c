@@ -1851,7 +1851,7 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         .unifiedImageLayouts = VK_TRUE};
     if (g_vk.has_unified_layouts) {
         chain = &funified;
-        ext[next++] = VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME;
+        snx_vk_choice_enable(c, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
     }
     VkPhysicalDeviceBlendOperationAdvancedFeaturesEXT fadvanced = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BLEND_OPERATION_ADVANCED_FEATURES_EXT,

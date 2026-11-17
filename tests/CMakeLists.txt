@@ -2655,7 +2655,7 @@ if(NOT SNX_TOOLS_ONLY)
     # the BC7 cache of ASTC levels (gpu/vk/bc7_cache.c), without a GPU: every input that changes a level's blocks
     # changes its key, records come back as written and from the file in a later run, another version or a damaged
     # record starts the file over or drops the record, a record cut short is cut off, and the bound starts it over
-    add_executable(snx-test-bc7-cache bc7_cache.c tracy_stubs.c)
+    add_executable(snx-test-bc7-cache bc7_cache.c tracy_stubs.c vk_state_stub.c)
     snx_test_target(snx-test-bc7-cache 23)
     target_link_libraries(snx-test-bc7-cache PRIVATE snx_nx_flags snx_xxhash scarletnx-common scarletnx-platform)
     add_test(NAME bc7_cache COMMAND snx-test-bc7-cache)
