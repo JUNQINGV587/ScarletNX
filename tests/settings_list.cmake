@@ -4,6 +4,8 @@
 # line, the menus' name and values (runtime/options.c's ini_list), where the setting does nothing the systems it is
 # for (ini_only), and, on the rows that need a build, that build; a slider's (INI_SLIDER) slider in a twelfth, its
 # every step listed and its default one of them. Run by ctest as runtime_settings_list
+# this script is run by ctest as well as cmake, and a run without a project's policies reads IN_LIST as a word
+cmake_policy(SET CMP0057 NEW)
 execute_process(COMMAND "${RUNTIME}" --settings RESULT_VARIABLE result OUTPUT_VARIABLE list ERROR_VARIABLE errors)
 if(result OR NOT errors STREQUAL "")
     message(FATAL_ERROR "scarletnx --settings ended with ${result}: ${errors}")

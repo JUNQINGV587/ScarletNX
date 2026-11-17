@@ -395,6 +395,16 @@ setting Vertex input dynamic state
     help Android, as Eden; on = as dynamic state wherever the driver has it, those too; off = in the pipeline. Dynamic,
     help one pipeline serves every layout a program is drawn with, so fewer pipelines are made; in the pipeline, each
     help layout takes one of its own. Any other value stops the game, saying so
+setting Unified layouts
+    label Unified layouts
+    key vk_unified_layouts
+    int 0 1
+    default 0
+    startup
+    help 1 = keep every Vulkan image in one layout (VK_KHR_unified_image_layouts), so a later use in another way needs
+    help no layout change: fewer barriers, but an image that is drawn to loses the compression and the fast clears its
+    help own layout gives. 0 = the layout each use names. At 3x on this handheld 1 costs Civilization VI about 11% and
+    help gains nothing
 setting Vulkan ban ignore
     label Ignore driver bans
     key vulkan_ban_ignore

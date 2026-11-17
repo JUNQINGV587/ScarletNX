@@ -19,6 +19,7 @@
 #include "nx/gpu/texture/astc_bc.h"
 #include "common/gpu/vk/extension_bans.h"
 #include "common/gpu/vk/device_settings.h"
+#include "snx_settings.h"
 #include "nx/gpu/vk/hdr_swapchain.h"
 #include "common/gpu/vk/swapchain.h"
 #include "common/gpu/vk/vk_common.h"
@@ -948,7 +949,8 @@ static bool choose_device(SnxVkChoice* c, void* user) {
         g_vk.has_depth_range_unrestricted = snx_vk_choice_has(c, VK_EXT_DEPTH_RANGE_UNRESTRICTED_EXTENSION_NAME);
         has_pipeline_robustness = snx_vk_choice_has(c, VK_EXT_PIPELINE_ROBUSTNESS_EXTENSION_NAME);
         has_robustness2 = snx_vk_choice_has(c, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
-    g_vk.has_unified_layouts = snx_vk_choice_has(c, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
+    g_vk.has_unified_layouts = g_settings.unified_layouts &&
+                                snx_vk_choice_has(c, VK_KHR_UNIFIED_IMAGE_LAYOUTS_EXTENSION_NAME);
         /* the driver's budget for each heap, the other processes' use taken out (devmem.c): without it the budget
            is 80% of a heap's size, blind to what the desktop and other programs hold */
         g_vk.has_budget = snx_vk_choice_has(c, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
