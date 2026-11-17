@@ -219,9 +219,24 @@ void nvn_tex_layout(const NvnTexDesc* d, NvnTexLayout* o) {
         o->layer_size = o->size = (u64)stride * blk(h, t.bh);
         return;
     }
+    /* MINIMAL_LAYOUT keeps the automatic block height when it costs no more than one-GOB blocks, including their
+       mip chain and layer alignment; otherwise it takes the smaller one-GOB layout. In particular, a 4096x4096
+       single-level BC3 atlas keeps 16-GOB blocks because they add no padding. */
+    if (dpl == 2 && !pkg_h && (d->flags & NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT) && !sparse_of(d)) {
+        NvnTexDesc automatic = *d, minimal = *d;
+        NvnTexLayout al, ml;
+        automatic.flags &= ~NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT;
+        nvn_tex_layout(&automatic, &al);
+        minimal.bits = (minimal.bits & ~NVN_TEX_BLOCK_H) | 1;
+        nvn_tex_layout(&minimal, &ml);
+        if (al.size <= ml.size) {
+            *o = al;
+            return;
+        }
+    }
     /* a sparse texture (but a packaged 2D one, whose bytes are in its own layout) has blocks as high and deep as its
        tile: then a 64 KiB page of the layout is one tile, which the game maps at the offset the tile's place gives.
-       MINIMAL_LAYOUT: blocks of one GOB, as the game's driver describes such a texture */
+       MINIMAL_LAYOUT: blocks of one GOB when the automatic layout would need more space */
     if (!(dpl == 2 && pkg_h) && nvn_tex_sparse_tile(d, tile)) {
         tile_h = log2u(tile[1] / 8);
         tile_d = log2u(tile[2]);

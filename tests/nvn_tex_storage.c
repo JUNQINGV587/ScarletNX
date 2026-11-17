@@ -242,6 +242,25 @@ int main(void) {
         }
         sparse_tiles(NVN_FORMAT_RGBA_DXT1, 4, 8, sp[5].t3, 13, 7, 84, 0);
     }
+    { /* MINIMAL_LAYOUT chooses between automatic and one-GOB blocks by the whole layout's real size */
+        NvnTexDesc d = desc(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA_DXT5, 4096, 4096, 1, 1, 0,
+                            NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT);
+        NvnTexLayout minimal, automatic;
+        nvn_tex_layout(&d, &minimal);
+        d.flags &= ~NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT;
+        nvn_tex_layout(&d, &automatic);
+        CHECK(minimal.tile_h == 4 && minimal.size == automatic.size,
+              "4096x4096 BC3: automatic BH%u/%llu bytes, minimal BH%u/%llu bytes", automatic.tile_h,
+              (unsigned long long)automatic.size, minimal.tile_h, (unsigned long long)minimal.size);
+        d.flags |= NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT;
+        d.width = 1920, d.height = 1080;
+        nvn_tex_layout(&d, &minimal);
+        d.flags &= ~NVN_TEXTURE_FLAGS_MINIMAL_LAYOUT;
+        nvn_tex_layout(&d, &automatic);
+        CHECK(minimal.tile_h == 0 && minimal.size < automatic.size,
+              "1920x1080 BC3: automatic BH%u/%llu bytes, minimal BH%u/%llu bytes", automatic.tile_h,
+              (unsigned long long)automatic.size, minimal.tile_h, (unsigned long long)minimal.size);
+    }
     printf("%d checks, %d failures\n", checks, failures);
     return failures != 0;
 }
