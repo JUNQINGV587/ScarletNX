@@ -48,7 +48,9 @@ which CI runs on, copies by default: its GPU is the CPU, which can't read pages 
 without installing it, point `VK_DRIVER_FILES` at its ICD file.
 
 With `-DSNX_TEST_EDENPROBE=/path/to/edenprobe.nro`, ctest runs it as `edenprobe_vk_memory_1` (copied) and
-`edenprobe_vk_memory_2` (in place) against the baseline.
+`edenprobe_vk_memory_2` (in place) against the baseline, and as `edenprobe_compute_readback`, the wimsy suite's heavy
+level after the reference suite, against `tests/edenprobe/compute-readback.txt`: #2442's case, a compute texture's
+level read back after judged frame 1 with frame 0's texels in it.
 
 ## From the launcher
 
