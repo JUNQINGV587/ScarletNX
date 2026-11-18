@@ -3838,6 +3838,11 @@ msgid "%s is compiling (%d%%): %s waits until the queue ends"
 msgstr ""
 
 #: src/gui/main.c
+#, c-format
+msgid "Not saved: %s could not be removed (%s)"
+msgstr ""
+
+#: src/gui/main.c
 msgid "Not nearby"
 msgstr ""
 
@@ -4035,11 +4040,6 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "The search ended: Search again to look for more"
-msgstr ""
-
-#: src/gui/main.c
-#, c-format
-msgid "Not saved: %s could not be removed (%s)"
 msgstr ""
 
 #: src/gui/main.c

@@ -3841,6 +3841,11 @@ msgid "%s is compiling (%d%%): %s waits until the queue ends"
 msgstr "%s 正在编译（%d%%）：%s 要等到队列结束"
 
 #: src/gui/main.c
+#, c-format
+msgid "Not saved: %s could not be removed (%s)"
+msgstr ""
+
+#: src/gui/main.c
 msgid "Not nearby"
 msgstr ""
 
@@ -4038,11 +4043,6 @@ msgstr ""
 
 #: src/gui/main.c
 msgid "The search ended: Search again to look for more"
-msgstr ""
-
-#: src/gui/main.c
-#, c-format
-msgid "Not saved: %s could not be removed (%s)"
 msgstr ""
 
 #: src/gui/main.c
