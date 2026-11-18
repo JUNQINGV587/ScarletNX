@@ -2520,6 +2520,47 @@ static void table_ssbo_windows(const DsState* ds, const VkSh* sh, int stage, u32
                   "hold: the pointers in the others reach nothing\n",
                   runs, windows);
 }
+/* The windows of a register-indexed LDC's pointer table in a constant bank (SH_GBUF_TABLE without the SSBO bit).
+   Every 64-bit word pair is a candidate. The same mapped-run grouping as a memory table binds them, so an indexed
+   load no longer makes every address use the immediate slot's base. */
+static void table_cbuf_windows(const DsState* ds, const VkSh* sh, int stage, u32 bank, u64* base, u32* len) {
+    u32 windows = 0;
+    for (int i = 0; i < sh->si.ngbuf && i < 16; i++) {
+        u32 desc = sh->si.gbuf_cbuf_off[i];
+        windows += SH_GBUF_TABLE(desc) && !SH_GBUF_TABLE_SSBO(desc) && SH_GBUF_BANK(desc) == bank;
+    }
+    if (windows > SH_GBUF_TABLE_MAX) windows = SH_GBUF_TABLE_MAX;
+    /* An indexed load may name any pair in the actual bank. This CPU scan is not a UBO binding, so neither cbuf_max
+       nor the device's maxUniformBufferRange may truncate it. */
+    DsCbBlock in = ds_cb_inline(ds, stage, bank);
+    u32 bytes = in.bytes ? in.size : ds->bind.cb_size[stage][bank], n = 0;
+    if (!bytes) bytes = 65536;
+    if (bytes > TABLE_SSBO_MAX) bytes = TABLE_SSBO_MAX;
+    static u64* words;
+    static u32 words_size;
+    if (bytes > words_size) {
+        u64* grown = realloc(words, bytes);
+        if (grown) words = grown, words_size = bytes;
+    }
+    u64 cb = in.bytes ? 0 : ds->bind.cb_addr[stage][bank];
+    if (in.bytes && bytes <= words_size) {
+        if (bytes > in.size) bytes = in.size;
+        for (u32 off = 0; off + 8 <= bytes; off += 8)
+            words[n++] = ds_inline_word(in, off) | (u64)ds_inline_word(in, off + 4) << 32;
+    } else if (cb && bytes && bytes <= words_size) {
+        vk_compute_mem_need(cb, bytes); /* a compute dispatch may have written the pointer table since the last draw */
+        vk_buf_mem_need(cb, bytes);
+        gmem_read(cb, words, bytes);
+        snx_le32_array(words, bytes / 4);
+        n = bytes / 8;
+    }
+    u32 runs = vk_pointer_windows(words, n, windows, 0, 1, base, len);
+    if (runs)
+        LOG_LIMIT(1,
+                  "vulkan: a program's pointer table in constant buffer %u has %u runs of mapped memory that its %u "
+                  "windows can't hold: the pointers in the others reach nothing\n",
+                  bank, runs, windows);
+}
 /* the global memory each stage of the draw reads or writes, sh[] by stage (vertex, the tessellation stages, geometry,
    fragment) */
 static void draw_storage_read(const DsState* ds, VkDrawStorage* draw, VkSh* const sh[VK_DRAW_STAGES]) {
@@ -2530,17 +2571,22 @@ static void draw_storage_read(const DsState* ds, VkDrawStorage* draw, VkSh* cons
         u64 cb0 = ds_cb_inline(ds, stage, 0).bytes ? 0 : ds->bind.cb_addr[stage][0];
         draw->n[s] = sh[s]->si.ngbuf < 16 ? sh[s]->si.ngbuf : 16;
         if (cb0 && draw->n[s]) vk_buf_mem_need(cb0, 0x610);
-        u32 table = 0; /* the parent + 1 whose windows tw_ holds */
+        u32 table = 0; /* the typed parent key whose windows tw_ holds */
         u64 tw_base[SH_GBUF_TABLE_MAX];
         u32 tw_len[SH_GBUF_TABLE_MAX];
         for (int i = 0; i < draw->n[s]; i++) {
             VkDrawGbuf* b = &draw->b[s][i];
             u32 v[3] = {0, 0, 0}, desc = sh[s]->si.gbuf_cbuf_off[i];
             b->writable = (sh[s]->si.gbuf_wmask >> i) & 1;
-            if (SH_GBUF_TABLE_SSBO(desc)) { /* a window of a pointer table in memory, its base in SNX_VKB_MBASE */
-                if (table != SH_GBUF_PARENT(desc) + 1) {
-                    table_ssbo_windows(ds, sh[s], stage, SH_GBUF_PARENT(desc), tw_base, tw_len);
-                    table = SH_GBUF_PARENT(desc) + 1;
+            if (SH_GBUF_TABLE(desc)) { /* a window of a pointer table, its base in SNX_VKB_MBASE */
+                u32 parent = SH_GBUF_PARENT(desc);
+                u32 key = (parent + 1) * 2 + SH_GBUF_TABLE_SSBO(desc); /* equal parents of different kinds don't mix */
+                if (table != key) {
+                    if (SH_GBUF_TABLE_SSBO(desc))
+                        table_ssbo_windows(ds, sh[s], stage, parent, tw_base, tw_len);
+                    else
+                        table_cbuf_windows(ds, sh[s], stage, SH_GBUF_BANK(desc), tw_base, tw_len);
+                    table = key;
                 }
                 b->addr = tw_base[SH_GBUF_TABLE_WINDOW(desc)];
                 b->size = (tw_len[SH_GBUF_TABLE_WINDOW(desc)] + 3) & ~3u;

@@ -79,7 +79,7 @@ typedef struct {
     u32 depth_type, depth_sampler; /* the swapped slot's depth type and element, 0 for a kind with no depth views */
     u32 swapped;                   /* 1 + the slot whose sampler is an array element for this instruction */
     u32 image[8], image_type[8];
-    u32 gbuf[16], gbuf_pointer, smap, subgroup_lane_input;
+    u32 gbuf[16], gbuf_pointer, mbase, mbase_pointer, smap, subgroup_lane_input;
     /* a compute program's write log (write_log.c, 0 for none), and its part for each global buffer + 1 (0: none): every
        store and atomic records the bytes it writes there */
     u32 wlog;

@@ -1874,10 +1874,21 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             tag = shader_gbuf_tag(stage, B(w, 34, 5), B(w, 20, 14) * 4);
             if (!tag) tag = shader_gbuf_tag_any(stage, B(w, 34, 5), B(w, 20, 14) * 4);
         } else if (op == O_LDC && (B(w, 48, 3) == 4 || B(w, 48, 3) == 5)) {
-            /* LDC.IS/ISL reads a pointer through a register-indexed constant table too. The load itself keeps its
-               index; this tag makes the immediate slot's buffer a candidate for the dynamic LDG/STG address match. */
-            tag = shader_gbuf_tag(stage, B(w, 36, 5), (u32)(i32)(i16)B(w, 20, 16));
-            if (!tag) tag = shader_gbuf_tag_any(stage, B(w, 36, 5), (u32)(i32)(i16)B(w, 20, 16));
+            /* LDC.IS/ISL reads a pointer through a register-indexed constant table too. A bare bank's words are
+               pointers, so every indexed slot is a candidate: the renderer binds their mapped runs as windows and
+               shader_global_dynamic selects the one holding the address. A fixed bank-0 descriptor stays direct. */
+            u32 bank = B(w, 36, 5), off = (u32)(i32)(i16)B(w, 20, 16);
+            if (a != 255 && bank < 18 && off < 0x10000) {
+                /* The immediate byte offset only chooses the table's first entry; its descriptor is always window 0.
+                   Bank 0's 16-byte descriptors and fragment's occupied MBASE binding need different dynamic paths. */
+                if (stage != ST_FS && bank > 0 && !(off & 7))
+                    tag = SH_GBUF_TABLE_KEY(bank, 0) + 1;
+                else
+                    tag = 0xcbf; /* reject if a global access consumes it */
+            } else {
+                tag = shader_gbuf_tag(stage, bank, off);
+                if (!tag) tag = shader_gbuf_tag_any(stage, bank, off);
+            }
         } else if (op == O_MOV_R)
             tag = b == 255 ? 0 : gtags[b];
         else if (op == O_IADD32I && a < 255)
@@ -1936,6 +1947,14 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                 untracked_at = i;
                 untracked_reg = a;
                 return shader_untracked_reject(si, insn, untracked_at, untracked_reg, gb_at, pop_targets);
+            } else if (current == 0xcbf) {
+                free(gb_at);
+                free(pop_targets);
+                return direct_reject(si, "register-indexed global base has no dynamic path for this stage or bank");
+            } else if (SH_GBUF_TABLE((u32)(current - 1)) && op != O_LDG && op != O_STG) {
+                free(gb_at);
+                free(pop_targets);
+                return direct_reject(si, "dynamic global atomic from a register-indexed constant table");
             } else if (current == 0xcbe) {
                 if (op != O_STG) {
                     free(gb_at);
@@ -1957,13 +1976,16 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                     }
                     gbuf_off[ngbuf++] = descriptor;
                 }
-                gb_at[i] = (u8)(slot + 1);
+                gb_at[i] = SH_GBUF_TABLE(descriptor) ? GB_DYNAMIC : (u8)(slot + 1);
                 if (op != O_LDG) gbuf_wmask |= 1u << slot;
                 if (op != O_STG) gbuf_rmask |= 1u << slot; /* a load or an atomic */
                 {
                     u32 bank = SH_GBUF_BANK(descriptor), at = SH_GBUF_OFFSET(descriptor);
                     cbuf_used[bank] = 1;
-                    if ((at | 15u) + 1 > cbuf_max[bank]) cbuf_max[bank] = (at | 15u) + 1;
+                    if (SH_GBUF_TABLE(descriptor))
+                        cbuf_max[bank] = 65536; /* the register index may name any entry, not only the immediate one */
+                    else if ((at | 15u) + 1 > cbuf_max[bank])
+                        cbuf_max[bank] = (at | 15u) + 1;
                 }
             }
         }
@@ -1974,6 +1996,26 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         for (r = second; r < second + 2 && r < 255; r++)
             if (shader_writes_reg(w, op, r)) gtags[r] = 0;
         if (shader_writes_reg(w, op, d)) gtags[d] = tag;
+    }
+    /* An indexed LDC names a bank of pointers, not one buffer. The scan reserved its first window; fill the slots
+       left beside the fixed buffers with the other windows, as SM86 does. Their masks copy window 0's dynamic use. */
+    u32 ntables = 0;
+    for (int slot = 0; slot < ngbuf; slot++)
+        if (SH_GBUF_TABLE(gbuf_off[slot])) ntables++;
+    if (ntables) {
+        u32 limit = si->shared_spill ? 15 : 16;
+        u32 windows = (limit - ngbuf + ntables) / ntables;
+        if (windows > SH_GBUF_TABLE_MAX) windows = SH_GBUF_TABLE_MAX;
+        u32 fixed_ngbuf = ngbuf;
+        for (int slot = 0; slot < fixed_ngbuf; slot++) {
+            if (!SH_GBUF_TABLE(gbuf_off[slot])) continue;
+            u32 bank = SH_GBUF_BANK(gbuf_off[slot]);
+            for (u32 window = 1; window < windows; window++, ngbuf++) {
+                gbuf_off[ngbuf] = SH_GBUF_TABLE_KEY(bank, window);
+                if (gbuf_rmask >> slot & 1) gbuf_rmask |= 1u << ngbuf;
+                if (gbuf_wmask >> slot & 1) gbuf_wmask |= 1u << ngbuf;
+            }
+        }
     }
     /* an untracked access needs a tracked buffer to be in; one that stores may write any of them */
     if (untracked_at && ngbuf) {
@@ -2690,6 +2732,13 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         c->cbuf[i] = (i < g_spirv_translate.uniform_cbufs ? spv_emit_uniform_vec4_array : spv_emit_readonly_vec4_array)(
             &c->emit, vec4_u32, c->u32_type, c->u32_type, shader_vk_set(stage), i, 4096, &c->cbuf_pointer[i]);
         interfaces[count++] = c->cbuf[i];
+    }
+    int needs_mbase = 0;
+    for (int i = 0; i < ngbuf; i++) needs_mbase |= SH_GBUF_TABLE(gbuf_off[i]);
+    if (needs_mbase) {
+        c->mbase = spv_emit_uniform_vec4_array(&c->emit, vec4_u32, c->u32_type, c->u32_type, shader_vk_set(stage),
+                                               SNX_VKB_MBASE, 16, &c->mbase_pointer);
+        interfaces[count++] = c->mbase;
     }
     if (indexed_shadow) {
         c->tex_func_buffer =
