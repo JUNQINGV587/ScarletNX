@@ -51,12 +51,13 @@ VkResult vk_devmem_flush(DevMem m, u64 off, u64 size) {
 }
 static unsigned g_copies;
 static u64 g_copy_at;
+static VkImageLayout g_copy_layout; /* the layout the copy was given (VK_LAYOUT's, from the GPU thread) */
 static void VKAPI_PTR copy_stub(VkCommandBuffer cb, VkBuffer src, VkImage dst, VkImageLayout layout, uint32_t n,
                                 const VkBufferImageCopy* r) {
     (void)cb;
     (void)src;
     (void)dst;
-    (void)layout;
+    g_copy_layout = layout;
     g_copies += n;
     g_copy_at = r->bufferOffset;
 }
@@ -170,23 +171,31 @@ static void file(void) {
     remove(IDX);
     CHECK(vk_bc7_cache_open(PATH, v1, 64u << 20));
     CHECK(!vk_bc7_cache_find(ka));
+    CHECK(vk_bc7_cache_cold()); /* the run's notice: every level is encoded as it first loads */
     vk_bc7_cache_put(ka, a, na);
     vk_bc7_cache_put(kb, b, nb);
     CHECK(reads_as(ka, a, na) && reads_as(kb, b, nb));
+    CHECK(vk_bc7_cache_cold()); /* as it opened, the levels it takes since aside */
     u8 small[16];
     CHECK(!vk_bc7_cache_read(ka, small, 16)); /* another size is not the record */
     intptr_t lock;
     CHECK(snx_lock_file(PATH, &lock) == 1); /* held while open */
     vk_bc7_cache_close();
+    CHECK(!vk_bc7_cache_cold()); /* none open */
     CHECK(!snx_lock_file(PATH, &lock));
     snx_unlock_file(lock);
     /* a later run */
     CHECK(vk_bc7_cache_open(PATH, v1, 64u << 20));
     CHECK(reads_as(ka, a, na) && reads_as(kb, b, nb) && !vk_bc7_cache_find(kc));
+    CHECK(!vk_bc7_cache_cold());
     vk_bc7_cache_close();
     /* another version: the encoder, its SPIR-V, the GPU or the driver changed */
     CHECK(vk_bc7_cache_open(PATH, v2, 64u << 20));
     CHECK(!vk_bc7_cache_find(ka) && !vk_bc7_cache_find(kb) && file_size() == BC7_HEAD);
+    CHECK(vk_bc7_cache_cold());
+    vk_bc7_cache_close();
+    CHECK(vk_bc7_cache_open(PATH, v2, 64u << 20)); /* its header alone, of this version: no level yet */
+    CHECK(vk_bc7_cache_cold() && file_size() == BC7_HEAD);
     vk_bc7_cache_put(ka, a, na);
     vk_bc7_cache_put(kb, b, nb);
     vk_bc7_cache_close();
@@ -301,17 +310,20 @@ static void later(void) {
     const VkBuffer buf = (VkBuffer)(uintptr_t)16;
     const VkImage img = (VkImage)(uintptr_t)24;
     const VkBufferImageCopy copy = {.bufferOffset = 4096};
+    const VkImageLayout L = VK_IMAGE_LAYOUT_GENERAL; /* as with unified image layouts */
     /* before the recording thread runs: read at once, and the next read once it runs goes there */
-    CHECK(vk_bc7_cache_read_later(cb, ka, na, dst, 1, 4096, buf, img, &copy, NULL, 0) == -1);
+    CHECK(vk_bc7_cache_read_later(cb, ka, na, dst, 1, 4096, buf, img, L, &copy, NULL, 0) == -1);
     CHECK(!vk_bc7_cache_failed_pending());
     g_threaded = 1;
-    CHECK(vk_bc7_cache_read_later(cb, ka, na, dst, 1, 4096, buf, img, &copy, NULL, 0) == 1);
-    CHECK(g_copies == 1 && g_copy_at == 4096 && !memcmp(dst, a, (size_t)na));
-    CHECK(vk_bc7_cache_read_later(cb, ka, na, dst, 1, 4096, buf, VK_NULL_HANDLE, &copy, NULL, 0) == 1 && g_copies == 1);
-    CHECK(vk_bc7_cache_read_later(cb, ka, 16, dst, 1, 4096, buf, img, &copy, NULL, 0) == 0); /* another size */
-    CHECK(vk_bc7_cache_read_later(cb, kc, na, dst, 1, 4096, buf, img, &copy, NULL, 0) == 0); /* not there */
+    CHECK(vk_bc7_cache_read_later(cb, ka, na, dst, 1, 4096, buf, img, L, &copy, NULL, 0) == 1);
+    CHECK(g_copies == 1 && g_copy_at == 4096 && g_copy_layout == L && !memcmp(dst, a, (size_t)na));
+    CHECK(vk_bc7_cache_read_later(cb, ka, na, dst, 1, 4096, buf, VK_NULL_HANDLE, L, &copy, NULL, 0) == 1 &&
+          g_copies == 1);
+    CHECK(vk_bc7_cache_read_later(cb, ka, 16, dst, 1, 4096, buf, img, L, &copy, NULL, 0) == 0); /* another size */
+    CHECK(vk_bc7_cache_read_later(cb, kc, na, dst, 1, 4096, buf, img, L, &copy, NULL, 0) == 0); /* not there */
     CHECK(vk_bc7_cache_find(kb) == nb);
-    CHECK(vk_bc7_cache_read_later(cb, kb, nb, dst, 1, 4096, buf, img, &copy, &owner, 0x1234000) == 1 && g_copies == 1);
+    CHECK(vk_bc7_cache_read_later(cb, kb, nb, dst, 1, 4096, buf, img, L, &copy, &owner, 0x1234000) == 1 &&
+          g_copies == 1);
     CHECK(!vk_bc7_cache_find(kb) && vk_bc7_cache_find(ka) == na);
     CHECK(vk_bc7_cache_failed_pending());  /* until its owner has it */
     vk_bc7_cache_take_failed(took_failed); /* given to its owner once */
@@ -323,8 +335,8 @@ static void later(void) {
     vk_bc7_cache_stats(&hits, &stored, &restarts, &bytes);
     CHECK(hits == 2);
     vk_bc7_cache_put(kb, b, nb); /* encoded again, and kept again at another place */
-    CHECK(vk_bc7_cache_read_later(cb, kb, nb, dst, 1, 4096, buf, img, &copy, &owner, 0x1234000) == 1 && g_copies == 2 &&
-          !memcmp(dst, b, (size_t)nb));
+    CHECK(vk_bc7_cache_read_later(cb, kb, nb, dst, 1, 4096, buf, img, L, &copy, &owner, 0x1234000) == 1 &&
+          g_copies == 2 && !memcmp(dst, b, (size_t)nb));
     vk_bc7_cache_take_failed(took_failed);
     CHECK(g_failed == 1);
     /* the rate of the reads so far: none for nothing, and a whole budget's worth before any read was timed */
@@ -332,7 +344,7 @@ static void later(void) {
     vk_bc7_cache_close();
     g_threaded = 0;
     CHECK(vk_bc7_cache_open(PATH, v1, 64u << 20));
-    CHECK(vk_bc7_cache_read_later(cb, ka, na, dst, 1, 4096, buf, img, &copy, NULL, 0) == -1 && reads_as(ka, a, na));
+    CHECK(vk_bc7_cache_read_later(cb, ka, na, dst, 1, 4096, buf, img, L, &copy, NULL, 0) == -1 && reads_as(ka, a, na));
     vk_bc7_cache_close();
     remove(PATH);
     remove(IDX);

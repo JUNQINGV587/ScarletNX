@@ -174,6 +174,7 @@ def main():
             *(Path(directory) / f'quad_read_{i}.spv' for i in range(3)),
             *(Path(directory) / name for name in
               ('handle_tld_b.spv', 'handle_txd_b.spv', 'handle_tld4_b.spv', 'handle_tmml_b.spv', 'handle_txq_b.spv')),
+            *(Path(directory) / f'return_{i}.spv' for i in range(5)),
         )
         subprocess.run([args.regressions, directory], check=True)
         for fixture in (path, vertex, abs_fragment, stack_fragment, subgroup, *fixtures):

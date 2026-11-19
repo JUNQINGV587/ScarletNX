@@ -99,7 +99,7 @@ int shader_flow_init(ShFlow* f, const u64* insn, u32 n) {
     if (has_pops) {
         f->pop_targets = calloc(n ? n : 1, sizeof *f->pop_targets);
         if (!f->pop_targets) goto fail;
-        if (!shader_resolve_crs(insn, n, f->pop_targets)) {
+        if (!shader_resolve_crs(insn, n, f->pop_targets, NULL, 0)) {
             free(f->pop_targets);
             f->pop_targets = NULL;
         }
@@ -1861,7 +1861,7 @@ int shader_al2p_predicate_unseen(const ShFlow* f, u32 at) {
     work = malloc(n * sizeof *work);
     if (stack) pops = calloc(n, sizeof *pops);
     if (!seen || !work || (stack && !pops)) goto done;
-    crs = stack && shader_resolve_crs(insn, n, pops);
+    crs = stack && shader_resolve_crs(insn, n, pops, NULL, 0);
     seen[at] = 1;
     i = at + 1 + ((at + 1 - 10) % 4 == 0);
     if (i < n) {

@@ -9,6 +9,7 @@
 * [Shaders](#shaders)
 * [Surfaces](#surfaces)
 * [Driver offsets](#driver-offsets)
+* [Shading rate images](#shading-rate-images)
 * [Compute QMDs](#compute-qmds)
 * [Mesh shaders](#mesh-shaders)
   * [Stages](#stages)
@@ -151,7 +152,7 @@ bits set, with their masks, and clears the masks (`mirror_harvest.comp`). Once t
 traps guest memory, each listed page is queued, still pending (`own_entries`), and stays GPU-owned in the mirror from
 the next point where nothing is being recorded (`vk_mirror_publish`): before the releases its submits gate let the game
 see them, at the end of a GPU job, and before a CPU read of them. There the CPU's changes to it since it was brought up
-to date, the bytes its programs didn't log, are copied into the mirror (a byte both wrote keeps the program's), and
+to date are copied into the mirror (a byte both wrote keeps the CPU's, which came after the submit), and
 once that copy is submitted the page is published over guest memory with the mirror as its owner
 (`docs/layers/gpu/ownership.md`). Nothing of this is recorded where the results land: that runs inside a frame's
 recycling, a submission and a draw's setup, and recording there went into a command buffer being reset or submitted,
@@ -161,11 +162,14 @@ buffer inside the landing after a present's submission. It stayed open, and when
 recorded into it past the recording thread, with sets only that thread can resolve. The CPU's first touch of a page
 lands it whole, which is exact as none of its bytes can change in between, and the mirror lets go of its shadow then
 (`vk_mirror_landed`). Pages the CPU never reads never come back. Without traps the pass copies the pages' bytes too, and
-they land in guest memory and in the shadow once the submit is done, the bytes logged and no others. Landing every
-written page at each submit took most of the GPU thread in one game's menus. A read of guest memory under pending writes
-lands them first, and a draw reading them takes the mirror instead (`buffer.c`'s `buf_get`), as does a draw reading a
-range part of which the mirror owns (`vk_mirror_holds`): read elsewhere, the CPU's bytes between the owned pages were
-staged again for each draw.
+they land in guest memory and in the shadow once the submit is done, the bytes logged and no others, as do the pages
+the CPU touched in the last presents with traps. A logged byte that guest memory no longer holds as the shadow has it
+keeps the CPU's: the shadow holds every CPU write from before the submit, so the CPU wrote it later. Landed over it,
+the write was lost to guest memory and the mirror both (one game's characters showed squares of wrong lighting).
+Landing every written page at each submit took most of the GPU thread in one game's menus. A read of guest memory
+under pending writes lands them first, and a draw reading them takes the mirror instead (`buffer.c`'s `buf_get`), as
+does a draw reading a range part of which the mirror owns (`vk_mirror_holds`): read elsewhere, the CPU's bytes between
+the owned pages were staged again for each draw.
 Before, every writing dispatch copied the 16 MiB of each range twice (its original bytes, and its input), compared
 all of it after the dispatch and copied it back from the GPU, and the per-dispatch buffers took gigabytes of rings.
 
@@ -173,11 +177,13 @@ Without the mirror (no sparse residency of buffers, memory shared with the CPU, 
 result is made for the dispatch as before and lands from the dispatch's write log (`vk/writelog.c`), which the host
 reads once the submit is done. A writer that logs nothing (a draw, a buffer image) is compared.
 
-A byte the CPU writes while the programs' writes are pending, which a program writes too, takes the program's value:
-on the console both reach memory in an order the program left open. Once the submit is done and the page is the
-mirror's, the CPU's write traps and lands the page first, so the CPU's value comes last. A byte the CPU writes and the
-program doesn't is kept. The comparison took the CPU's value instead; over 80 seconds of one game, 14,000 results
-landed with no byte written by both.
+Without the mirror, a byte the CPU writes while a program's logged writes are pending, which the program writes too,
+takes the program's value (`vk_write_runs`): nothing keeps the bytes from before the dispatch to tell the two apart,
+and on the console both reach memory in an order the program left open. In the mirror the shadow tells them apart: a
+byte that differs from it was written after the submit, and keeps the CPU's value (above). Once the submit is done and
+the page is the mirror's, the CPU's write traps and lands the page first, so the CPU's value comes last there too. A
+byte the CPU writes and the program doesn't is kept. The comparison took the CPU's value instead; over 80 seconds of
+one game, 14,000 results landed with no byte written by both.
 
 The translator declares the global buffers `Aliased` and `Coherent`: one game binds a range and a part of it to the
 same program, writes through one and waits for the value through the other.
@@ -279,8 +285,29 @@ address, then the control section's CPU address. `nvnProgramInitializeFromBuilde
 Push constants write `table | offset << 8` to method 0x141 of the 3D or compute engine (`SET_ROOT_TABLE_SELECTOR`),
 and the words to 0x142 (`LOAD_ROOT_TABLE`). The driver passes the API's offset, in bytes, and it cuts a push at 256
 bytes, a table's size. Programs read the eight tables as banks 24 to 31, which the renderer binds as one uniform
-buffer (`SNX_VKB_ROOT`). Variable rate shading writes the shading rate image and palette, which the runtime leaves at the full rate.
+buffer (`SNX_VKB_ROOT`). Variable rate shading writes the shading rate image and palette (next section).
 `SetGeometryProcessingMode` writes method 0xe26.
+
+## Shading rate images
+
+The driver of game-d1ed1846 (its `sdk` module) writes these methods for variable rate shading:
+
+| Function | Methods |
+| --- | --- |
+| `nvnCommandBufferBindShadingRateImage(cb, texture, view)` | 8 words from 0x4aa: the address, the size and the block layout. Then 0 to 0x9f. A null texture writes 6 zero words from 0x4aa. |
+| `nvnCommandBufferShadingRateImagePalette(cb, viewport, count, rates)` | 3 words from 0xed0: the viewport in bits 4 to 7, then 16 entries of 4 bits. |
+| `nvnCommandBufferSetShadingRatePaletteMode(cb, mode)` | 0xb3: 0 for mode 1, 1 for the others. The meaning is not known. The game sets mode 1 only. |
+
+The driver sends the game's rates to the hardware with no table. The numbers are those of
+`VkShadingRatePaletteEntryNV` (5 is one invocation for each pixel). The driver fills the entries that the game leaves
+out with 5. A texel of the image covers 16x16 pixels, and holds an index into the palette of the primitive's
+viewport. The game's image is R8_UINT (format 0xF6), 160x90 texels for 2560x1440. In a race, the game sets
+palettes for viewports 0 to 4. Viewport 0 maps indices 13 to 15 to 2x2, 4x2 and 4x4, and the others to 1x1.
+
+The renderer converts the image on the GPU at each bind (`vk/shading_rate.c`). With `VK_NV_shading_rate_image`, the
+draws read the game's indices and palettes, as the console does. With the attachment of
+`VK_KHR_fragment_shading_rate`, the image holds the rates of viewport 0's palette, with no supersampled rates. The
+fragment programs read their fragment's size (S2R 0x84) from `FragmentSizeNV` or `ShadingRateKHR`.
 
 ## Compute QMDs
 
