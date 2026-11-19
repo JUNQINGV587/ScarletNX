@@ -60,6 +60,7 @@ static struct {
     size_t count, capacity;
     int failed;
 } g_fixtures;
+static const char* g_fixture_dir; /* argv[1]: the directory a run writes its SPIR-V fixtures into */
 
 static const char* fixture_path(const char* directory, const char* name) {
     size_t dir_len = strlen(directory), name_len = strlen(name);
@@ -786,6 +787,11 @@ static void save_fixture(const char* path, const u32* code, size_t words) {
     }
     int closed = fclose(out) == 0;
     check(written && closed, "shader fixture written");
+}
+
+/* the SPIR-V of one regression program, for shader_direct_test.py to validate with snx-spirv-val */
+static void save_named_fixture(const char* name, const u32* code, size_t words) {
+    if (g_fixture_dir && code) save_fixture(fixture_path(g_fixture_dir, name), code, words);
 }
 
 static int has_glsl_abs(const u32* code, size_t words) {
@@ -5849,6 +5855,13 @@ static void predicated_handle_pair_forms(void) {
                       info.tex[0].bl2_cbuf == 3 && info.tex[0].bl2_off == 1,
                   "a chosen TLD.B split handle retains both constant buffer sources");
         if (ran) check(strstr(info.chosen_why, "TLD.B at ") != NULL, "the choice log names TLD.B and its use site");
+        if (ran) {
+            ShaderInfo saved;
+            size_t words = 0;
+            u32* code = translate(program, 5, ST_FS, &saved, &words, 1);
+            save_named_fixture("handle_tld_b", code, words);
+            free(code);
+        }
     }
     {
         /* a handle no candidate proves still refuses, and the refusal names the bind and where the register came from */
@@ -5867,12 +5880,13 @@ static void predicated_handle_pair_forms(void) {
     }
     static const struct {
         const char* form;
+        const char* fixture;
         u64 insn;
         int runtime; /* 1 a float sample, 2 a size query, 3 a LOD query */
     } forms[] = {
-        {"TXD.B", 0xde40000000000000ull | 7ull << 51 | 0xfull << 31 | 2ull << 28 | 12ull << 20 | 7ull << 16 | 6ull << 8, 1},
-        {"TLD4.B", 0xdec0000000000000ull | 7ull << 51 | 0xfull << 31 | 2ull << 28 | 6ull << 20 | 7ull << 16 | 2ull << 8, 1},
-        {"TMML.B", 0xdf60000000000000ull | 3ull << 31 | 2ull << 28 | 6ull << 20 | 7ull << 16 | 8ull << 8, 3},
+        {"TXD.B", "handle_txd_b", 0xde40000000000000ull | 7ull << 51 | 0xfull << 31 | 2ull << 28 | 12ull << 20 | 7ull << 16 | 6ull << 8, 1},
+        {"TLD4.B", "handle_tld4_b", 0xdec0000000000000ull | 7ull << 51 | 0xfull << 31 | 2ull << 28 | 6ull << 20 | 7ull << 16 | 2ull << 8, 1},
+        {"TMML.B", "handle_tmml_b", 0xdf60000000000000ull | 3ull << 31 | 2ull << 28 | 6ull << 20 | 7ull << 16 | 8ull << 8, 3},
     };
     for (size_t k = 0; k < sizeof forms / sizeof forms[0]; k++) {
         const u64 program[] = {fsetp_cbuf3(0, 0), load, mov32i(6, 0x777), sampler1, forms[k].insn};
@@ -5882,6 +5896,7 @@ static void predicated_handle_pair_forms(void) {
         char what[96];
         snprintf(what, sizeof what, "%s selects the texture of a predicated split handle", forms[k].form);
         check_translated(code, &info, what);
+        save_named_fixture(forms[k].fixture, code, words);
         check(code && info.ntex == 1 && info.tex[0].cbuf_off == 0 && info.tex[0].bl_cbuf == 2 && info.tex[0].bl2 &&
                   info.tex[0].bl2_cbuf == 3 && info.tex[0].bl2_off == 1,
               "a chosen split handle retains both constant buffer sources");
@@ -5924,6 +5939,7 @@ static void predicated_handle_pair_forms(void) {
         size_t words = 0;
         u32* code = translate(program, 6, ST_FS, &info, &words, 1);
         check_translated(code, &info, "TXQ.B selects the texture of a predicated split handle");
+        save_named_fixture("handle_txq_b", code, words);
         check(code && info.ntex == 1 && info.tex[0].bl2 && info.tex[0].bl2_cbuf == 3 && info.tex[0].bl2_off == 1,
               "a chosen TXQ.B split handle retains both constant buffer sources");
         check(code && count_opcode(code, words, 103, 0xffffffffu) >= 1,
@@ -6712,6 +6728,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (argc == 2) {
+        g_fixture_dir = argv[1];
         storage_paths[0] = fixture_path(argv[1], "storage_write");
         storage_paths[1] = fixture_path(argv[1], "storage_atomic");
         storage_paths[2] = fixture_path(argv[1], "storage_write_array");

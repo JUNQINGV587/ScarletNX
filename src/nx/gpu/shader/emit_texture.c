@@ -346,10 +346,11 @@ static u32 handle_pick_match(ShHandlePick* p) {
 static void handle_pick_add(ShHandlePick* p, int slot, u32 value, int same_type, u32 bits_type) {
     DirectCtx* c = p->c;
     if (p->chosen_slot < 0) {
-        u32 zero = spv_emit_constant_u32(&c->emit, p->kept_type, 0);
-        p->chosen = p->kept_type == c->f32_type ? zero
-                                                : spv_emit_constant_vec4(&c->emit, p->kept_type,
-                                                                         (u32[4]){zero, zero, zero, zero});
+        int scalar = p->kept_type == c->f32_type;
+        u32 zero = spv_emit_constant_u32(&c->emit, scalar ? c->f32_type : c->u32_type, 0);
+        p->chosen = scalar ? zero
+                           : spv_emit_constant_vec4(&c->emit, p->kept_type,
+                                                    (u32[4]){zero, zero, zero, zero});
         p->chosen_slot = slot;
     }
     u32 bits = p->kept_type == c->f32_type || same_type
