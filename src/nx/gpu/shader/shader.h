@@ -93,14 +93,15 @@ static inline int shader_same_indexed_kind(const ShTex* tex, u64 int_mask, u64 s
    from the pointer, which it reads from guest memory, as a bare address's).
    A compute program may load a pointer from a constant buffer at an offset it computes (LDC.64 with a register): one
    of the bank's words, which one known only when it runs. Such a pointer may be in any of the bank's windows
-   (SH_GBUF_TABLE, bit 30 with bit 31 clear): window SH_GBUF_TABLE_WINDOW (bits 21-24) of bank SH_GBUF_BANK, the
-   offset 0, as many windows as the buffer slots the program's other buffers leave. The renderer reads the bank as it
+   (SH_GBUF_TABLE, bit 30 with bit 31 clear): window SH_GBUF_TABLE_WINDOW (bits 21-24) of bank SH_GBUF_BANK, whose
+   entries start at the byte offset SH_GBUF_OFFSET (bits 0-15), aligned or not, as many windows as the buffer slots
+   the program's other buffers leave. The renderer reads the bank as it
    binds the dispatch, takes its words that map as pointers, and makes a window of the memory mapped from the lowest
    of them, the next from the lowest past that one's end, and so on (vk/compute.c). The program reads each window's
    base from the uniform buffer at SNX_VKB_MBASE, the 64-bit base at the window's buffer slot. One game's culling
    programs keep the lists they fill, their counts and their draws' records in such a table in cbuf 4: 20 pointers
    into 12 mappings.
-   A graphics program (not a fragment one, whose SNX_VKB_RS is the resolution scale) may load a pointer from one of its
+   A graphics program may load a pointer from one of its
    storage buffers at an offset it computes (LDG.64 of an address made from the buffer's base): a pointer table in
    memory (SH_GBUF_TABLE_SSBO, bit 29 of a table's key), whose words are the storage buffer's that the constant buffer
    word of bits 0-20 holds (SH_GBUF_PARENT). The renderer reads that buffer from guest memory as it binds the draw and
@@ -422,6 +423,8 @@ static inline void shader_query_hint_unpack(const u32 words[SH_QUERY_WORDS], u8 
 /* compute, the fragment program's binding, which no compute program has otherwise: the windows of its pointer tables
    (SH_GBUF_TABLE), a uniform buffer of 16 vec4 of words, one for each global buffer slot: the low and high words of
    the window's base and its length in bytes */
+/* a graphics program's and a compute program's windows. A fragment program's are at SNX_VKB_MBASEFS, because its
+   SNX_VKB_RS holds the resolution scale */
 #define SNX_VKB_MBASE    SNX_VKB_RS
 /* The write log: for each logged global buffer (ShaderInfo.gbuf_mark), a part of SH_WLOG_PART words. Its first
    SH_WPAGE_SLOT words are flags, word j set to 1 by any store to the 4 KiB window j of the binding; then a bit for each
@@ -439,7 +442,11 @@ static inline void shader_query_hint_unpack(const u32 words[SH_QUERY_WORDS], u8 
 #define SNX_VKB_TEXFUNCS (SNX_VKB_TEXARRAY + 1)  /* their depth compare functions */
 #define SNX_VKB_TEXDEPTH (SNX_VKB_TEXFUNCS + 1)  /* their depth views */
 #define SNX_VKB_TEXMAP   (SNX_VKB_TEXDEPTH + 1)  /* table and element to compact descriptor index */
-#define SNX_VKB_END      (SNX_VKB_TEXMAP + 1)    /* one past the last binding */
+/* fragment: the windows of its pointer tables (SH_GBUF_TABLE). Its own binding, because a fragment program's
+   SNX_VKB_RS is the resolution scale, and one binding cannot serve both. After the array bindings, which a layout
+   without texture arrays leaves out (vk/pipeline.c) */
+#define SNX_VKB_MBASEFS  (SNX_VKB_TEXMAP + 1)
+#define SNX_VKB_END      (SNX_VKB_MBASEFS + 1)   /* one past the last binding */
 /* Transform feedback by stores (g_spirv_translate.xfb_stores), in the global buffer slots after a program's own (at
    most SNX_XFB_GBUF_MAX): the parameters (first vertex, first instance, vertices an instance and a draw capture), then
    the 4 buffers from where the capture starts */

@@ -1103,13 +1103,23 @@ static void global_buffers(void) {
     code = translate(indexed_bank0, 3, ST_VS, &info, &words, 1);
     check_refused(code, &info, "register-indexed global base", "an indexed bank-0 descriptor is not treated as fixed");
     free(code);
+    /* A fragment program's pointer tables read their windows at SNX_VKB_MBASEFS: SNX_VKB_RS is its resolution scale.
+       A table's first entry may sit at a byte offset that is not a multiple of 8, which the key carries. */
     const u64 indexed_fragment[] = {
         mov32i(28, 0),
         0xEF95010000071C1Cull, /* LDC.ISL.64 R28, c[16][R28] */
         0xEED4200000071C00ull, /* LDG.E R0, [R28] */
     };
     code = translate(indexed_fragment, 3, ST_FS, &info, &words, 1);
-    check_refused(code, &info, "register-indexed global base", "a fragment table does not alias its resolution binding");
+    check(code != NULL, "a fragment table reads its windows at its own binding");
+    free(code);
+    const u64 indexed_fragment_unaligned[] = {
+        mov32i(28, 0),
+        0xEF95010000C71C1Cull, /* LDC.ISL.64 R28, c[16][R28 + 0xc] */
+        0xEED4200000071C00ull, /* LDG.E R0, [R28] */
+    };
+    code = translate(indexed_fragment_unaligned, 3, ST_FS, &info, &words, 1);
+    check(code != NULL, "a fragment table whose first entry is not 8-byte aligned");
     free(code);
     /* an atomic, or an access with no tracked buffer to be in, is still refused */
     const u64 dynamic_atomic[] = {0x4C98078014470002ull, 0xEED4200000070200ull, FMUL_KEEP | 6, 0xED03000000600606ull};

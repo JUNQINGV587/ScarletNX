@@ -541,7 +541,7 @@ static void cbufs_fit_limits(void) {
     u32 own = 0;
     for (u32 i = SNX_VKB_SSBO; i < SNX_VKB_END; i++)
         if (binding_type(i) == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
-            (i < SNX_VKB_TEXARRAY || g_spirv_translate.texture_arrays))
+            (i < SNX_VKB_TEXARRAY || i == SNX_VKB_MBASEFS || g_spirv_translate.texture_arrays))
             own++;
     if (set < fit) fit = set;
     fit = fit > own ? fit - own : 0;
@@ -556,6 +556,7 @@ static void cbufs_fit_limits(void) {
 
 /* descriptors of each type in one set: the binding ranges in shader.h */
 static VkDescriptorType binding_type(u32 i) {
+    if (i == SNX_VKB_MBASEFS) return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     if (i == SNX_VKB_SMAP || i == SNX_VKB_CAPTURE) return VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     if (i == SNX_VKB_TEXARRAY || i == SNX_VKB_TEXDEPTH) return VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     if (i == SNX_VKB_TEXFUNCS || i == SNX_VKB_TEXMAP) return VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
@@ -580,7 +581,7 @@ void vk_pool_sizes(VkDescriptorPoolSize* sz, u32 sets, u32 array_sets) {
         u32 arrays = 0, i;
         for (i = 0; i < SNX_VKB_END; i++) {
             if (binding_type(i) != ty[k]) continue;
-            if (i < SNX_VKB_TEXARRAY)
+            if (i < SNX_VKB_TEXARRAY || i == SNX_VKB_MBASEFS)
                 n++;
             else if (g_spirv_translate.texture_arrays)
                 arrays += (i == SNX_VKB_TEXARRAY || i == SNX_VKB_TEXDEPTH) ? g_spirv_translate.tex_array : 1;
@@ -695,7 +696,8 @@ void vk_pipeline_init(void) {
         }
         for (int arrays = 0; arrays < 2; arrays++) {
             u32 n = count;
-            while (!arrays && n && b[n - 1].binding >= SNX_VKB_TEXARRAY) n--; /* the arrays are the last bindings */
+            /* the arrays are the last bindings before the fragment windows, which a layout without arrays keeps */
+            while (!arrays && n && b[n - 1].binding >= SNX_VKB_TEXARRAY && b[n - 1].binding <= SNX_VKB_TEXMAP) n--;
             VkDescriptorSetLayoutCreateInfo dl = {
                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
                 .flags = g_vk.has_descriptor_buffers ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT : 0,

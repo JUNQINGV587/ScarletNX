@@ -1149,7 +1149,8 @@ static u32 table_slot(Ctx* c, u32 key) {
     if (slot < 0) return ~0u;
     if (!c->mbase) {
         c->mbase = spv_emit_uniform_vec4_array(&c->e, c->t_v4u, c->t_u32, c->t_u32, (u32)shader_vk_set(c->stage),
-                                               SNX_VKB_MBASE, 16, &c->cbuf_ptr);
+                                               c->stage == ST_FS ? SNX_VKB_MBASEFS : SNX_VKB_MBASE, 16,
+                                               &c->cbuf_ptr);
         add_interface(c, c->mbase);
     }
     return (u32)slot;

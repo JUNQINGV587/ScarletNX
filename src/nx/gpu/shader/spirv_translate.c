@@ -2047,10 +2047,11 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                shader_global_dynamic selects the one holding the address. A fixed bank-0 descriptor stays direct. */
             u32 bank = B(w, 36, 5), off = (u32)(i32)(i16)B(w, 20, 16);
             if (a != 255 && bank < 18 && off < 0x10000) {
-                /* The immediate byte offset only chooses the table's first entry; its descriptor is always window 0.
-                   Bank 0's 16-byte descriptors and fragment's occupied MBASE binding need different dynamic paths. */
-                if (stage != ST_FS && bank > 0 && !(off & 7))
-                    tag = SH_GBUF_TABLE_KEY(bank, 0) + 1;
+                /* The immediate byte offset only chooses the table's first entry; its descriptor is always window 0,
+                   and carries the offset for the renderer's scan of the bank. Bank 0's 16-byte descriptors stay
+                   direct. A fragment program reads its windows at SNX_VKB_MBASEFS (vk/render.c writes them there). */
+                if (bank > 0)
+                    tag = (SH_GBUF_TABLE_KEY(bank, 0) | off) + 1;
                 else
                     tag = 0xcbf; /* reject if a global access consumes it */
             } else {
@@ -2179,7 +2180,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             if (!SH_GBUF_TABLE(gbuf_off[slot])) continue;
             u32 bank = SH_GBUF_BANK(gbuf_off[slot]);
             for (u32 window = 1; window < windows; window++, ngbuf++) {
-                gbuf_off[ngbuf] = SH_GBUF_TABLE_KEY(bank, window);
+                gbuf_off[ngbuf] = SH_GBUF_TABLE_KEY(bank, window) | SH_GBUF_OFFSET(gbuf_off[slot]);
                 if (gbuf_rmask >> slot & 1) gbuf_rmask |= 1u << ngbuf;
                 if (gbuf_wmask >> slot & 1) gbuf_wmask |= 1u << ngbuf;
             }
@@ -2905,7 +2906,8 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     for (int i = 0; i < ngbuf; i++) needs_mbase |= SH_GBUF_TABLE(gbuf_off[i]);
     if (needs_mbase) {
         c->mbase = spv_emit_uniform_vec4_array(&c->emit, vec4_u32, c->u32_type, c->u32_type, shader_vk_set(stage),
-                                               SNX_VKB_MBASE, 16, &c->mbase_pointer);
+                                               stage == ST_FS ? SNX_VKB_MBASEFS : SNX_VKB_MBASE, 16,
+                                               &c->mbase_pointer);
         interfaces[count++] = c->mbase;
     }
     if (indexed_shadow) {

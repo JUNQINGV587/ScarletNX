@@ -2525,14 +2525,15 @@ static void table_ssbo_windows(const DsState* ds, const VkSh* sh, int stage, u32
                   "hold: the pointers in the others reach nothing\n",
                   runs, windows);
 }
-/* The windows of a register-indexed LDC's pointer table in a constant bank (SH_GBUF_TABLE without the SSBO bit).
-   Every 64-bit word pair is a candidate. The same mapped-run grouping as a memory table binds them, so an indexed
-   load no longer makes every address use the immediate slot's base. */
-static void table_cbuf_windows(const DsState* ds, const VkSh* sh, int stage, u32 bank, u64* base, u32* len) {
+/* The windows of a register-indexed LDC's pointer table in a constant bank (SH_GBUF_TABLE without the SSBO bit), whose
+   entries start at byte start. Every 64-bit word pair from start on is a candidate. The same mapped-run grouping as a
+   memory table binds them, so an indexed load no longer makes every address use the immediate slot's base. */
+static void table_cbuf_windows(const DsState* ds, const VkSh* sh, int stage, u32 bank, u32 start, u64* base, u32* len) {
     u32 windows = 0;
     for (int i = 0; i < sh->si.ngbuf && i < 16; i++) {
         u32 desc = sh->si.gbuf_cbuf_off[i];
-        windows += SH_GBUF_TABLE(desc) && !SH_GBUF_TABLE_SSBO(desc) && SH_GBUF_BANK(desc) == bank;
+        windows += SH_GBUF_TABLE(desc) && !SH_GBUF_TABLE_SSBO(desc) && SH_GBUF_BANK(desc) == bank &&
+                   SH_GBUF_OFFSET(desc) == start;
     }
     if (windows > SH_GBUF_TABLE_MAX) windows = SH_GBUF_TABLE_MAX;
     /* An indexed load may name any pair in the actual bank. This CPU scan is not a UBO binding, so neither cbuf_max
@@ -2550,14 +2551,14 @@ static void table_cbuf_windows(const DsState* ds, const VkSh* sh, int stage, u32
     u64 cb = in.bytes ? 0 : ds->bind.cb_addr[stage][bank];
     if (in.bytes && bytes <= words_size) {
         if (bytes > in.size) bytes = in.size;
-        for (u32 off = 0; off + 8 <= bytes; off += 8)
+        for (u32 off = start; off + 8 <= bytes; off += 8)
             words[n++] = ds_inline_word(in, off) | (u64)ds_inline_word(in, off + 4) << 32;
     } else if (cb && bytes && bytes <= words_size) {
         vk_compute_mem_need(cb, bytes); /* a compute dispatch may have written the pointer table since the last draw */
         vk_buf_mem_need(cb, bytes);
         gmem_read(cb, words, bytes);
         snx_le32_array(words, bytes / 4);
-        n = bytes / 8;
+        for (u32 off = start; off + 8 <= bytes; off += 8) words[n++] = words[off / 8];
     }
     u32 runs = vk_pointer_windows(words, n, windows, 0, 1, base, len);
     if (runs)
@@ -2584,13 +2585,17 @@ static void draw_storage_read(const DsState* ds, VkDrawStorage* draw, VkSh* cons
             u32 v[3] = {0, 0, 0}, desc = sh[s]->si.gbuf_cbuf_off[i];
             b->writable = (sh[s]->si.gbuf_wmask >> i) & 1;
             if (SH_GBUF_TABLE(desc)) { /* a window of a pointer table, its base in SNX_VKB_MBASE */
-                u32 parent = SH_GBUF_PARENT(desc);
-                u32 key = (parent + 1) * 2 + SH_GBUF_TABLE_SSBO(desc); /* equal parents of different kinds don't mix */
+                /* a memory table's key is its parent, a bank table's its bank and first entry: a bank's tables at
+                   different offsets hold different windows */
+                u32 key = SH_GBUF_TABLE_SSBO(desc)
+                              ? (SH_GBUF_PARENT(desc) + 1) * 2 + 1
+                              : 0x80000000u | SH_GBUF_BANK(desc) << 16 | SH_GBUF_OFFSET(desc);
                 if (table != key) {
                     if (SH_GBUF_TABLE_SSBO(desc))
-                        table_ssbo_windows(ds, sh[s], stage, parent, tw_base, tw_len);
+                        table_ssbo_windows(ds, sh[s], stage, SH_GBUF_PARENT(desc), tw_base, tw_len);
                     else
-                        table_cbuf_windows(ds, sh[s], stage, SH_GBUF_BANK(desc), tw_base, tw_len);
+                        table_cbuf_windows(ds, sh[s], stage, SH_GBUF_BANK(desc), SH_GBUF_OFFSET(desc), tw_base,
+                                           tw_len);
                     table = key;
                 }
                 b->addr = tw_base[SH_GBUF_TABLE_WINDOW(desc)];
@@ -2776,8 +2781,8 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
         u64 range = !b ? VK_WHOLE_SIZE : gb->aliased ? gb->range : size;
         dw_buffer(&d, set, SNX_VKB_SSBO + i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, b, o, range);
     }
-    /* each pointer table window's base and length, at its buffer's slot: 16 vec4 of words (SNX_VKB_MBASE, which is
-       the fragment stage's SNX_VKB_RS: the translator makes no table for a fragment program) */
+    /* each pointer table window's base and length, at its buffer's slot: 16 vec4 of words (SNX_VKB_MBASE, or
+       SNX_VKB_MBASEFS for a fragment program, whose SNX_VKB_RS is the resolution scale) */
     u32 mb[64] = {0}, tables = 0;
     for (int i = 0; i < s->si.ngbuf && i < 16; i++)
         if (SH_GBUF_TABLE(s->si.gbuf_cbuf_off[i])) {
@@ -2793,7 +2798,8 @@ static VkDescriptorSet stage_set_(const DsState* ds, int stage, VkSh* s, Surf** 
         if (!p) return VK_NULL_HANDLE;
         memcpy(p, mb, sizeof mb);
         snx_le32_array(p, sizeof mb / 4); /* the shader reads the words little-endian */
-        dw_buffer(&d, set, SNX_VKB_MBASE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, mbase, mo, sizeof mb);
+        dw_buffer(&d, set, stage == ST_FS ? SNX_VKB_MBASEFS : SNX_VKB_MBASE, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                  mbase, mo, sizeof mb);
     }
     if (s->si.ngbuf)
         dw_buffer(&d, set, SNX_VKB_SMAP, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, draw->map_buf[stage], draw->map_off[stage],
