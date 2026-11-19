@@ -398,6 +398,8 @@ static const struct {
                       {"vk_nv_dedicated_allocation_image_aliasing",
                        "the renderer no longer uses the extension: it lost the GPU on NVIDIA's driver"},
                       {"ctr_separate_windows", "now ctr_screen_layout=4"},
+                      {"hmma_astat", "now hmma_mode, whose 4 is A-stationary (hmma_astat's 1) and 0 Auto, the way "
+                                     "the HMMA bench measures fastest"},
                       {NULL, NULL}};
 const char* ini_deprecated(const char* k) {
     int i;
