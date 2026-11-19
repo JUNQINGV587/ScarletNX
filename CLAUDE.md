@@ -120,6 +120,13 @@ returns no add-on at all for a name that is not one, so a port named after the g
 AppImage, the launcher and the desktop entry carry the display name; `scripts/make-port-appimage.sh` builds them from
 a folder that follows this.
 
+On a Bazzite handheld InputPlumber takes the built-in pad for itself: it matches the pad's evdev joystick property and
+grabs the node, and version 0.84.0 on a Claw A8 then forwards nothing to the virtual pad it publishes, so a game that
+reads the pad through SDL sees a connected controller that reports no button. Hide that one node from InputPlumber
+instead of stopping it: `scripts/pad-udev-rule.sh` (run as root on the handheld) writes a udev rule that clears
+`ID_INPUT_JOYSTICK` for the pad, which keeps InputPlumber's mouse, keyboard and touchpad devices in place while SDL,
+which does not need the property, reads the pad directly.
+
 
 - The Bash tool runs **zsh**. `$t:s` is a zsh modifier, so write `"${t}:s"`. The scripts in the repo use bash
   shebangs.
