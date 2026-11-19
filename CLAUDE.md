@@ -114,6 +114,12 @@ finished. The AppImage also carries the game's icon (its data's `icon.jpg` as `<
 installs gives the desktop entry that icon. A port reads extracted data only under `--extract-container`, so the
 launcher the AppImage installs passes it.
 
+The program keeps the game's title ID as its name, and so do its `_code.so`, `_data`, `<TITLE ID>_<ADD ON>_data`
+folders and `.ini`: `snx_addons_parse()` (common/utilities/game_ini.c) reads the game's own title ID from the name and
+returns no add-on at all for a name that is not one, so a port named after the game plays without any DLC. Only the
+AppImage, the launcher and the desktop entry carry the display name; `scripts/make-port-appimage.sh` builds them from
+a folder that follows this.
+
 
 - The Bash tool runs **zsh**. `$t:s` is a zsh modifier, so write `"${t}:s"`. The scripts in the repo use bash
   shebangs.
