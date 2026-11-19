@@ -112,10 +112,12 @@ typedef struct {
 
 /* A draw's depth bias as vkCmdSetDepthBias takes it (constant, clamp, slope) for targets scale times the console's
    size. The slope factor multiplies the depth's slope per pixel, which such a target has scale times less of: scaled
-   by it, the bias moves the depth as far as on the console. The constant (the 3D engine's units register, which is
-   Vulkan's units as they are) and the clamp are in depth units, which no scale changes */
+   by it, the bias moves the depth as far as on the console. The constant and the clamp are in depth units, which no
+   scale changes, but the units register holds twice the console's units: yuzu hands Vulkan 'regs.depth_bias / 2.0f'
+   (renderer_vulkan/vk_rasterizer.cpp:1080), and both frontends here keep that register -- the 3D engine's verbatim,
+   NVN's doubled in nvn_draw.c -- so the constant halves here, once, for both */
 static inline void ds_depth_bias(const DsDynamic* d, float scale, float out[3]) {
-    out[0] = d->bias_units;
+    out[0] = d->bias_units * 0.5f;
     out[1] = d->bias_clamp;
     out[2] = d->bias_slope * scale;
 }
