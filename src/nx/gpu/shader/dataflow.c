@@ -1808,6 +1808,35 @@ int shader_direct_handle_candidates_pair(const ShFlow* f, u32 index, u32 reg, u3
     return count > 0 ? count : 0;
 }
 
+/* The candidate words of a register handle, one-word ones first: a pair of predicated writes that agree on nothing
+   yields its candidates only when both halves exist, and the single-word search only when the paths disagree. */
+int shader_direct_handle_choice(const ShFlow* f, u32 index, u32 reg, ShHandleChoice* choice) {
+    int count = shader_direct_handle_candidates(f, index, reg, choice->bank, choice->off, SH_HANDLE_CANDIDATES);
+    choice->count = 0;
+    if (count > 0) {
+        for (int c = 0; c < count; c++) {
+            choice->bank2[c] = 0;
+            choice->off2[c] = 0;
+            choice->words[c] = 1;
+        }
+    } else {
+        count = shader_direct_handle_candidates_pair(f, index, reg, choice->bank, choice->off, choice->bank2,
+                                                     choice->off2, choice->words, SH_HANDLE_CANDIDATES);
+    }
+    if (count > 0) choice->count = count;
+    return choice->count;
+}
+
+/* The program's first choosing bind names itself and every word it may be: a reader matches the line against the
+   program it logged. */
+void shader_direct_handle_note(char* why, size_t size, const char* bind, u32 index, u32 reg,
+                               const ShHandleChoice* choice) {
+    int at = snprintf(why, size, "%s at %x, R%u:", bind, index * 8, reg);
+    for (int c = 0; c < choice->count && at > 0 && (size_t)at < size; c++)
+        at += snprintf(why + at, size - (size_t)at, "%s c[%u][0x%x]", c ? "," : "", choice->bank[c],
+                       choice->off[c] * 4);
+}
+
 /* AL2P's predicate (bits 44-46) is a range check no source describes. The NVN compiler gives every AL2P one, P0 to P6
    in turn, and overwrites or leaves them, so a program is translated without it only when nothing can see it: no
    instruction reads the predicate, or every path from the AL2P meets a comparison or AL2P without a guard that writes

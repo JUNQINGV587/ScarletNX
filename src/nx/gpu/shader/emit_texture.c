@@ -297,6 +297,71 @@ void shader_direct_swap_element(DirectCtx* c, int slot) {
     c->swapped = (u32)slot + 1;
 }
 
+/* One bind of a runtime handle: every candidate's sample or query value, selected by the candidate's constant buffer
+   word. The first candidate seeds the result with zeros, so a handle that equals none of them reads zeros. TEX samples
+   a depth compare as a float of every candidate and keeps that scalar; the bits of a texture live in vec4_u32. */
+typedef struct ShHandlePick {
+    DirectCtx* c;
+    u32 handle, chosen, kept_type;
+    int chosen_slot;
+    u32 bank, off, bank2, off2;
+    u8 words;
+} ShHandlePick;
+
+static void handle_pick_begin(ShHandlePick* p, DirectCtx* c, u32 handle, u32 kept_type) {
+    *p = (ShHandlePick){0};
+    p->c = c;
+    p->handle = handle;
+    p->kept_type = kept_type;
+    p->chosen_slot = -1;
+}
+
+static void handle_pick_candidate(ShHandlePick* p, const ShHandleChoice* choice, int cand) {
+    p->bank = choice->bank[cand];
+    p->off = choice->off[cand];
+    p->bank2 = choice->bank2[cand];
+    p->off2 = choice->off2[cand];
+    p->words = choice->words[cand];
+}
+
+/* the handle word a candidate names: its constant buffer word, or the OR of the two words of a split handle */
+static u32 handle_pick_word(ShHandlePick* p) {
+    DirectCtx* c = p->c;
+    u32 word = p->bank == SH_HANDLE_IMM ? shader_u32(c, p->off)
+                                        : shader_cbuf_read_dynamic(c, p->bank, shader_u32(c, p->off * 4));
+    if (p->words == 2) {
+        u32 sampler = p->bank2 == SH_HANDLE_IMM ? shader_u32(c, p->off2)
+                                                : shader_cbuf_read_dynamic(c, p->bank2, shader_u32(c, p->off2 * 4));
+        /* LOP.OR leaves texture|sampler in Rb itself; Rb+1 is not a second runtime handle. */
+        word = spv_emit_binary(&c->emit, SPV_OP_BITWISE_OR, c->u32_type, word, sampler);
+    }
+    return word;
+}
+
+static u32 handle_pick_match(ShHandlePick* p) {
+    return spv_emit_binary(&p->c->emit, SPV_OP_I_EQUAL, p->c->bool_type, p->handle, handle_pick_word(p));
+}
+
+/* the candidate's value in the type the registers take, selected when the runtime word is its own */
+static void handle_pick_add(ShHandlePick* p, int slot, u32 value, int same_type, u32 bits_type) {
+    DirectCtx* c = p->c;
+    if (p->chosen_slot < 0) {
+        u32 zero = spv_emit_constant_u32(&c->emit, p->kept_type, 0);
+        p->chosen = p->kept_type == c->f32_type ? zero
+                                                : spv_emit_constant_vec4(&c->emit, p->kept_type,
+                                                                         (u32[4]){zero, zero, zero, zero});
+        p->chosen_slot = slot;
+    }
+    u32 bits = p->kept_type == c->f32_type || same_type
+                   ? value
+                   : spv_emit_unary(&c->emit, SPV_OP_BITCAST, bits_type, value);
+    p->chosen = spv_emit_ternary(&c->emit, SPV_OP_SELECT, p->kept_type, handle_pick_match(p), bits, p->chosen);
+}
+
+static u32 handle_pick_end(ShHandlePick* p, int* slot) {
+    *slot = p->chosen_slot;
+    return p->chosen;
+}
 u32 shader_texture_float_component(DirectCtx* c, u32 value, u32 scalar, u32 i32_type) {
     if (scalar == c->f32_type) return value;
     return scalar == i32_type ? spv_emit_unary(&c->emit, SPV_OP_CONVERT_S_TO_F, c->f32_type, value)
@@ -519,59 +584,75 @@ void emit_texture(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
             op == O_TLD_B ? shader_direct_track_image_handle_pair(t->flow, i, b, &bank, &off, &bank2, &off2, 0) : 0;
         if (handle_count == 1) indexed = shader_direct_indexed_handle(t->flow, i, b, stage, &ldc);
         int type = ty >> 1, array = ty & 1, multisample = (int)B(w, 50, 1);
-        int slot = op == O_TLD_B && !handle_count
-                       ? direct_memh_emit_slot(t, i, b, type, array, 0, multisample)
-                       : -1;
-        if (slot < 0) {
-            slot = 0;
-            while (slot < texture_count &&
-                   (textures[slot].cbuf_off != off || textures[slot].type != type || textures[slot].array != array ||
-                    textures[slot].shadow || textures[slot].bindless != (op == O_TLD_B) ||
-                    !!(textures[slot].flags & 2) != multisample ||
-                    (op == O_TLD_B &&
-                     !shader_direct_bindless_matches(&textures[slot], bank, handle_count, bank2, off2, indexed, ldc))))
-                slot++;
+        int memory_slot =
+            op == O_TLD_B && !handle_count ? direct_memh_emit_slot(t, i, b, type, array, 0, multisample) : -1;
+        int choose = op == O_TLD_B && !handle_count && memory_slot < 0;
+        ShHandleChoice choice = {0};
+        int candidates = choose ? shader_direct_handle_choice(t->flow, i, b, &choice) : 1;
+        if (!candidates) choose = 0;
+        ShHandlePick pick = {0};
+        if (choose) handle_pick_begin(&pick, c, reg_read(c, b), vec4_u32);
+        int slot = 0;
+        u32 sample;
+        u32 mask = B(w, 31, 4);
+        for (int cand = 0; cand < candidates; cand++) {
+            if (choose) {
+                handle_pick_candidate(&pick, &choice, cand);
+                bank = choice.bank[cand];
+                off = choice.off[cand];
+                bank2 = choice.bank2[cand];
+                off2 = choice.off2[cand];
+            }
+            slot = memory_slot >= 0
+                       ? memory_slot
+                       : shader_direct_typed_slot(textures, texture_count, off, type, array, 0, multisample ? 2 : 0,
+                                                  op == O_TLD_B, bank, choose ? choice.words[cand] : handle_count,
+                                                  bank2, off2, indexed, ldc);
+            if (textures[slot].flags & SNX_TEX_INDEXED) shader_direct_swap_element(c, slot);
+            u32 x = reg_read_as(c, a + array, i32_type);
+            u32 y = type == 0 ? spv_emit_constant_u32(&c->emit, i32_type, 0) : reg_read_as(c, a + array + 1, i32_type);
+            /* Rb's operands, in order: TLD.B's handle, the level (bit 55), the offsets (bit 35) and the sample (bit 50) */
+            u32 meta = b + (op == O_TLD_B), level = B(w, 55, 1) ? meta++ : 255, packed_reg = B(w, 35, 1) ? meta++ : 255;
+            u32 z = type <= 1 && !array  ? 0
+                    : type == 0 || array ? spv_emit_unary(&c->emit, SPV_OP_BITCAST, i32_type,
+                                                          spv_emit_binary(&c->emit, SPV_OP_BITWISE_AND, c->u32_type,
+                                                                          reg_read(c, a), shader_u32(c, 0xffff)))
+                                         : reg_read_as(c, a + 2, i32_type);
+            if (packed_reg < 255) { /* 4-bit signed offsets: x, then y but for 1D, then z for 3D */
+                u32 packed = reg_read_as(c, packed_reg, i32_type);
+                u32 four = shader_u32(c, 4);
+                x = spv_emit_iadd_u32(
+                    &c->emit, i32_type, x,
+                    spv_emit_ternary(&c->emit, SPV_OP_BIT_FIELD_S_EXTRACT, i32_type, packed, c->zero, four));
+                if (type >= 1)
+                    y = spv_emit_iadd_u32(
+                        &c->emit, i32_type, y,
+                        spv_emit_ternary(&c->emit, SPV_OP_BIT_FIELD_S_EXTRACT, i32_type, packed, four, four));
+                if (type == 2)
+                    z = spv_emit_iadd_u32(
+                        &c->emit, i32_type, z,
+                        spv_emit_ternary(&c->emit, SPV_OP_BIT_FIELD_S_EXTRACT, i32_type, packed, shader_u32(c, 8),
+                                         four));
+            }
+            if (type == 0 && !array) shader_texel_row_coord(c, i32_type, &x, &y);
+            if (type == 1 && needs_texel_scale) shader_scaled_fetch(c, push, t->fragcoord, vec4, slot, i32_type, &x, &y);
+            u32 coord = z ? spv_emit_vec3_construct(&c->emit, vec3_i32, x, y, z)
+                          : spv_emit_vec2_construct(&c->emit, vec2_i32, x, y);
+            sample = multisample
+                         ? spv_emit_image_fetch_sample(&c->emit, texture_vec4[slot], c->sampled_type[slot],
+                                                       c->sampler[slot], coord, reg_read_as(c, meta, i32_type))
+                         : spv_emit_image_fetch(&c->emit, texture_vec4[slot], c->sampled_type[slot],
+                                                c->sampler[slot], coord,
+                                                level < 255 ? reg_read_as(c, level, i32_type)
+                                                            : spv_emit_constant_u32(&c->emit, i32_type, 0));
+            sample = shader_predraw_read(c, slot, sample);
+            if (choose) handle_pick_add(&pick, slot, sample, texture_vec4[slot] == vec4_u32, vec4_u32);
         }
-        if (textures[slot].flags & SNX_TEX_INDEXED) shader_direct_swap_element(c, slot);
-        u32 x = reg_read_as(c, a + array, i32_type);
-        u32 y = type == 0 ? spv_emit_constant_u32(&c->emit, i32_type, 0) : reg_read_as(c, a + array + 1, i32_type);
-        /* Rb's operands, in order: TLD.B's handle, the level (bit 55), the offsets (bit 35) and the sample (bit 50) */
-        u32 meta = b + (op == O_TLD_B), level = B(w, 55, 1) ? meta++ : 255, packed_reg = B(w, 35, 1) ? meta++ : 255;
-        u32 z = type <= 1 && !array  ? 0
-                : type == 0 || array ? spv_emit_unary(&c->emit, SPV_OP_BITCAST, i32_type,
-                                                      spv_emit_binary(&c->emit, SPV_OP_BITWISE_AND, c->u32_type,
-                                                                      reg_read(c, a), shader_u32(c, 0xffff)))
-                                     : reg_read_as(c, a + 2, i32_type);
-        if (packed_reg < 255) { /* 4-bit signed offsets: x, then y but for 1D, then z for 3D */
-            u32 packed = reg_read_as(c, packed_reg, i32_type);
-            u32 four = shader_u32(c, 4);
-            x = spv_emit_iadd_u32(
-                &c->emit, i32_type, x,
-                spv_emit_ternary(&c->emit, SPV_OP_BIT_FIELD_S_EXTRACT, i32_type, packed, c->zero, four));
-            if (type >= 1)
-                y = spv_emit_iadd_u32(
-                    &c->emit, i32_type, y,
-                    spv_emit_ternary(&c->emit, SPV_OP_BIT_FIELD_S_EXTRACT, i32_type, packed, four, four));
-            if (type == 2)
-                z = spv_emit_iadd_u32(
-                    &c->emit, i32_type, z,
-                    spv_emit_ternary(&c->emit, SPV_OP_BIT_FIELD_S_EXTRACT, i32_type, packed, shader_u32(c, 8), four));
-        }
-        if (type == 0 && !array) shader_texel_row_coord(c, i32_type, &x, &y);
-        if (type == 1 && needs_texel_scale) shader_scaled_fetch(c, push, t->fragcoord, vec4, slot, i32_type, &x, &y);
-        u32 coord = z ? spv_emit_vec3_construct(&c->emit, vec3_i32, x, y, z)
-                      : spv_emit_vec2_construct(&c->emit, vec2_i32, x, y);
-        u32 sample = multisample ? spv_emit_image_fetch_sample(&c->emit, texture_vec4[slot], c->sampled_type[slot],
-                                                               c->sampler[slot], coord, reg_read_as(c, meta, i32_type))
-                                 : spv_emit_image_fetch(&c->emit, texture_vec4[slot], c->sampled_type[slot],
-                                                        c->sampler[slot], coord,
-                                                        level < 255 ? reg_read_as(c, level, i32_type)
-                                                                    : spv_emit_constant_u32(&c->emit, i32_type, 0));
-        sample = shader_predraw_read(c, slot, sample);
-        u32 mask = B(w, 31, 4), target = d;
+        if (choose) sample = handle_pick_end(&pick, &slot);
+        u32 target = d;
         for (u32 k = 0; k < 4; k++)
             if (mask & (1u << k)) {
-                shader_texture_write(c, target, sample, texture_scalar[slot], k);
+                shader_texture_write(c, target, sample, choose ? c->u32_type : texture_scalar[slot], k);
                 if (target < 255) target++;
             }
     } else if (op == O_SULD || op == O_SUST || op == O_SURED || op == O_SUATOM) {
@@ -766,32 +847,22 @@ void emit_texture(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
         int memory_slot = bindless && !handle_count ? direct_memh_emit_slot(t, i, b, type, array, shadow, 0) : -1;
         /* a handle the writes don't agree on: each constant buffer handle that can reach it is sampled, and the sample
            of the one whose word equals the register is kept (zeros when none does) */
-        u32 cand_bank[SH_HANDLE_CANDIDATES], cand_off[SH_HANDLE_CANDIDATES];
-        u32 cand_bank2[SH_HANDLE_CANDIDATES] = {0}, cand_off2[SH_HANDLE_CANDIDATES] = {0};
-        u8 cand_words[SH_HANDLE_CANDIDATES];
-        int pair_candidates = 0;
-        int candidates = bindless && !handle_count && memory_slot < 0
-                             ? shader_direct_handle_candidates(t->flow, i, b, cand_bank, cand_off, SH_HANDLE_CANDIDATES)
-                             : 1;
-        if (!candidates && bindless && !handle_count && memory_slot < 0) {
-            candidates = shader_direct_handle_candidates_pair(t->flow, i, b, cand_bank, cand_off, cand_bank2,
-                                                              cand_off2, cand_words, SH_HANDLE_CANDIDATES);
-            pair_candidates = candidates > 0;
-        }
         int choose = bindless && !handle_count && memory_slot < 0;
-        u32 handle = choose ? reg_read(c, b) : 0;
-        u32 chosen = 0, sample = 0;
-        int chosen_slot = -1;
+        ShHandleChoice choice = {0};
+        int candidates = choose ? shader_direct_handle_choice(t->flow, i, b, &choice) : 1;
+        if (!candidates) choose = 0;
+        ShHandlePick pick = {0};
+        if (choose) handle_pick_begin(&pick, c, reg_read(c, b), shadow ? c->f32_type : vec4_u32);
+        u32 sample;
         for (int cand = 0; cand < candidates; cand++) {
             if (choose) {
-                bank = cand_bank[cand];
-                off = cand_off[cand];
-                if (pair_candidates) {
-                    bank2 = cand_bank2[cand];
-                    off2 = cand_off2[cand];
-                }
+                handle_pick_candidate(&pick, &choice, cand);
+                bank = choice.bank[cand];
+                off = choice.off[cand];
+                bank2 = choice.bank2[cand];
+                off2 = choice.off2[cand];
             }
-            int handle_words = pair_candidates ? cand_words[cand] : (handle_count ? handle_count : 1);
+            int handle_words = choose ? choice.words[cand] : (handle_count ? handle_count : 1);
             if (memory_slot >= 0) {
                 slot = memory_slot;
             } else {
@@ -911,36 +982,9 @@ void emit_texture(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
                 sample = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->f32_type, shader_indexed_is_depth(c, slot), depth,
                                           sample);
             }
-            if (choose) {
-                /* each candidate's sample as the bits the registers take, so that an integer texture and a float one
-                   are chosen alike (a depth compare's is a float of every candidate) */
-                u32 kept_type = shadow ? c->f32_type : vec4_u32;
-                if (chosen_slot < 0) {
-                    u32 zero = spv_emit_constant_u32(&c->emit, shadow ? c->f32_type : c->u32_type, 0);
-                    chosen =
-                        shadow ? zero : spv_emit_constant_vec4(&c->emit, kept_type, (u32[4]){zero, zero, zero, zero});
-                    chosen_slot = slot;
-                }
-                u32 bits = shadow || texture_vec4[slot] == vec4_u32
-                               ? sample
-                               : spv_emit_unary(&c->emit, SPV_OP_BITCAST, vec4_u32, sample);
-                u32 word = bank == SH_HANDLE_IMM ? shader_u32(c, off)
-                                                 : shader_cbuf_read_dynamic(c, bank, shader_u32(c, off * 4));
-                if (handle_words == 2) {
-                    u32 sampler_word = bank2 == SH_HANDLE_IMM
-                                           ? shader_u32(c, off2)
-                                           : shader_cbuf_read_dynamic(c, bank2, shader_u32(c, off2 * 4));
-                    /* LOP.OR leaves texture|sampler in Rb itself; Rb+1 is not a second runtime handle. */
-                    word = spv_emit_binary(&c->emit, SPV_OP_BITWISE_OR, c->u32_type, word, sampler_word);
-                }
-                u32 match = spv_emit_binary(&c->emit, SPV_OP_I_EQUAL, c->bool_type, handle, word);
-                chosen = spv_emit_ternary(&c->emit, SPV_OP_SELECT, kept_type, match, bits, chosen);
-            }
+            if (choose) handle_pick_add(&pick, slot, sample, texture_vec4[slot] == vec4_u32, vec4_u32);
         }
-        if (choose) {
-            sample = chosen;
-            slot = chosen_slot;
-        }
+        if (choose) sample = handle_pick_end(&pick, &slot);
         u32 mask = B(w, 31, 4), dst = d;
         for (u32 component = 0; component < 4; component++)
             if (mask & (1u << component)) {
@@ -958,89 +1002,111 @@ void emit_texture(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
         int handle_count =
             bindless ? shader_direct_track_image_handle_pair(t->flow, i, a, &bank, &off, &bank2, &off2, 0) : 0;
         if (handle_count == 1) indexed = shader_direct_indexed_handle(t->flow, i, a, stage, &ldc);
-        int slot = bindless && !handle_count ? direct_memh_emit_slot(t, i, a, type, array, 0, 0) : -1;
-        if (slot < 0)
-            slot = shader_direct_typed_slot(textures, texture_count, off, type, array, 0, 0, bindless, bank,
-                                            handle_count, bank2, off2, indexed, ldc);
-        if (textures[slot].flags & SNX_TEX_INDEXED) shader_direct_swap_element(c, slot);
-        u32 coord = a + (u32)bindless, packed_reg = coord + count, values[4], dx[3], dy[3], k;
-        /* a 1D texture is bound as a 2D one of height 1: y 0.5, and no change along it */
-        u32 dims = type == 0 ? 2 : count;
-        for (k = 0; k < count; k++) {
-            values[k] = reg_read_as(c, coord + k, c->f32_type);
-            dx[k] = reg_read_as(c, b + 2 * k, c->f32_type);
-            dy[k] = reg_read_as(c, b + 2 * k + 1, c->f32_type);
-        }
-        if (type == 0) {
-            values[1] = spv_emit_constant_f32(&c->emit, c->f32_type, 0.5f);
-            dx[1] = dy[1] = zero_f;
-        }
-        if (rect_slots >> slot & 1)
-            shader_rect_coords(c, push, stage == ST_FS, slot, vec2_u32, i32_type, &values[0], &values[1], dx, dy);
-        if (array) values[dims] = shader_array_layer(c, packed_reg);
-        u32 coords = dims + array == 4   ? spv_emit_vec4_construct(&c->emit, vec4, values)
-                     : dims + array == 3 ? spv_emit_vec3_construct(&c->emit, vec3, values[0], values[1], values[2])
-                                         : spv_emit_vec2_construct(&c->emit, vec2, values[0], values[1]);
-        u32 offset = 0, varying_offset = 0, varying_known = 0, varying_value = 0, dynamic_offset = 0;
-        if (B(w, 35, 1)) { /* signed 4-bit offsets from bit 16 of the packed register */
-            u32 packed = 0, o[3];
-            int known = shader_direct_track_const(t->flow, i, packed_reg, &packed, 0);
-            if (!known && !g_spirv_translate.dynamic_texture_offsets && g_shader_cb_read) {
-                u32 offset_bank, offset_word;
-                /* The shader cache records this word and makes another variant when it changes. A ConstOffset
-                   applies in the selected mip's texels; moving normalized coordinates by the base size does not. */
-                if (shader_direct_track_cbuf_word(t->flow, i, packed_reg, &offset_bank, &offset_word, 0))
-                    known = g_shader_cb_read(offset_bank, offset_word * 4, &packed);
+        int memory_slot = bindless && !handle_count ? direct_memh_emit_slot(t, i, a, type, array, 0, 0) : -1;
+        int choose = bindless && !handle_count && memory_slot < 0;
+        ShHandleChoice choice = {0};
+        int candidates = choose ? shader_direct_handle_choice(t->flow, i, a, &choice) : 1;
+        if (!candidates) choose = 0;
+        ShHandlePick pick = {0};
+        if (choose) handle_pick_begin(&pick, c, reg_read(c, a), vec4_u32);
+        int slot = 0;
+        u32 sample;
+        u32 mask = B(w, 31, 4);
+        for (int cand = 0; cand < candidates; cand++) {
+            if (choose) {
+                handle_pick_candidate(&pick, &choice, cand);
+                bank = choice.bank[cand];
+                off = choice.off[cand];
+                bank2 = choice.bank2[cand];
+                off2 = choice.off2[cand];
             }
-            if (!known) {
-                u32 known_bits = 0, known_value = 0, domain = (1u << (4 * count)) - 1;
-                shader_direct_track_known_bits(t->flow, i, packed_reg, &known_bits, &known_value, 0);
-                varying_known = known_bits >> 16 & domain;
-                varying_value = known_value >> 16 & varying_known;
-                /* A varying layer cannot force offset dispatch when every spatial offset bit is constant. */
-                known = varying_known == domain;
-                if (known) packed = known_value;
+            slot = memory_slot >= 0
+                       ? memory_slot
+                       : shader_direct_typed_slot(textures, texture_count, off, type, array, 0, 0, bindless, bank,
+                                                  choose ? choice.words[cand] : handle_count, bank2, off2, indexed,
+                                                  ldc);
+            if (textures[slot].flags & SNX_TEX_INDEXED) shader_direct_swap_element(c, slot);
+            u32 coord = a + (u32)bindless, packed_reg = coord + count, values[4], dx[3], dy[3], k;
+            /* a 1D texture is bound as a 2D one of height 1: y 0.5, and no change along it */
+            u32 dims = type == 0 ? 2 : count;
+            for (k = 0; k < count; k++) {
+                values[k] = reg_read_as(c, coord + k, c->f32_type);
+                dx[k] = reg_read_as(c, b + 2 * k, c->f32_type);
+                dy[k] = reg_read_as(c, b + 2 * k + 1, c->f32_type);
             }
-            if (known) {
-                for (k = 0; k < 3; k++)
-                    o[k] = spv_emit_constant_u32(&c->emit, i32_type,
-                                                 k < count ? (u32)((i32)(packed << (12 - 4 * k)) >> 28) : 0);
-                offset = dims == 3 ? spv_emit_constant_vec3(&c->emit, vec3_i32, o[0], o[1], o[2])
-                                   : spv_emit_constant_vec2(&c->emit, vec2_i32, o[0], o[1]);
-            } else {
-                varying_offset = reg_read(c, packed_reg);
-                if (g_spirv_translate.dynamic_texture_offsets) {
-                    /* maintenance8 keeps the offset in texels at the selected mip. Coordinates, explicit
-                       gradients, sampler filtering and the array layer all retain their original values. */
-                    u32 signed_bits = spv_emit_unary(&c->emit, SPV_OP_BITCAST, i32_type, varying_offset);
-                    u32 four = shader_u32(c, 4);
-                    for (k = 0; k < dims; k++)
-                        o[k] = k < count ? spv_emit_ternary(&c->emit, SPV_OP_BIT_FIELD_S_EXTRACT, i32_type, signed_bits,
-                                                            shader_u32(c, 16 + 4 * k), four)
-                                         : spv_emit_constant_u32(&c->emit, i32_type, 0);
-                    offset = dims == 3 ? spv_emit_vec3_construct(&c->emit, vec3_i32, o[0], o[1], o[2])
-                                       : spv_emit_vec2_construct(&c->emit, vec2_i32, o[0], o[1]);
-                    dynamic_offset = 1;
-                    varying_offset = 0;
+            if (type == 0) {
+                values[1] = spv_emit_constant_f32(&c->emit, c->f32_type, 0.5f);
+                dx[1] = dy[1] = zero_f;
+            }
+            if (rect_slots >> slot & 1)
+                shader_rect_coords(c, push, stage == ST_FS, slot, vec2_u32, i32_type, &values[0], &values[1], dx, dy);
+            if (array) values[dims] = shader_array_layer(c, packed_reg);
+            u32 coords = dims + array == 4   ? spv_emit_vec4_construct(&c->emit, vec4, values)
+                         : dims + array == 3 ? spv_emit_vec3_construct(&c->emit, vec3, values[0], values[1], values[2])
+                                             : spv_emit_vec2_construct(&c->emit, vec2, values[0], values[1]);
+            u32 offset = 0, varying_offset = 0, varying_known = 0, varying_value = 0, dynamic_offset = 0;
+            if (B(w, 35, 1)) { /* signed 4-bit offsets from bit 16 of the packed register */
+                u32 packed = 0, o[3];
+                int known = shader_direct_track_const(t->flow, i, packed_reg, &packed, 0);
+                if (!known && !g_spirv_translate.dynamic_texture_offsets && g_shader_cb_read) {
+                    u32 offset_bank, offset_word;
+                    /* The shader cache records this word and makes another variant when it changes. A ConstOffset
+                       applies in the selected mip's texels; moving normalized coordinates by the base size does not. */
+                    if (shader_direct_track_cbuf_word(t->flow, i, packed_reg, &offset_bank, &offset_word, 0))
+                        known = g_shader_cb_read(offset_bank, offset_word * 4, &packed);
+                }
+                if (!known) {
+                    u32 known_bits = 0, known_value = 0, domain = (1u << (4 * count)) - 1;
+                    shader_direct_track_known_bits(t->flow, i, packed_reg, &known_bits, &known_value, 0);
+                    varying_known = known_bits >> 16 & domain;
+                    varying_value = known_value >> 16 & varying_known;
+                    /* A varying layer cannot force offset dispatch when every spatial offset bit is constant. */
+                    known = varying_known == domain;
+                    if (known) packed = known_value;
+                }
+                if (known) {
+                    for (k = 0; k < 3; k++)
+                        o[k] = spv_emit_constant_u32(&c->emit, i32_type,
+                                                     k < count ? (u32)((i32)(packed << (12 - 4 * k)) >> 28) : 0);
+                    offset = dims == 3 ? spv_emit_constant_vec3(&c->emit, vec3_i32, o[0], o[1], o[2])
+                                       : spv_emit_constant_vec2(&c->emit, vec2_i32, o[0], o[1]);
+                } else {
+                    varying_offset = reg_read(c, packed_reg);
+                    if (g_spirv_translate.dynamic_texture_offsets) {
+                        /* maintenance8 keeps the offset in texels at the selected mip. Coordinates, explicit
+                           gradients, sampler filtering and the array layer all retain their original values. */
+                        u32 signed_bits = spv_emit_unary(&c->emit, SPV_OP_BITCAST, i32_type, varying_offset);
+                        u32 four = shader_u32(c, 4);
+                        for (k = 0; k < dims; k++)
+                            o[k] = k < count ? spv_emit_ternary(&c->emit, SPV_OP_BIT_FIELD_S_EXTRACT, i32_type, signed_bits,
+                                                                shader_u32(c, 16 + 4 * k), four)
+                                             : spv_emit_constant_u32(&c->emit, i32_type, 0);
+                        offset = dims == 3 ? spv_emit_vec3_construct(&c->emit, vec3_i32, o[0], o[1], o[2])
+                                           : spv_emit_vec2_construct(&c->emit, vec2_i32, o[0], o[1]);
+                        dynamic_offset = 1;
+                        varying_offset = 0;
+                    }
                 }
             }
+            u32 gradient_x = dims == 3 ? spv_emit_vec3_construct(&c->emit, vec3, dx[0], dx[1], dx[2])
+                                       : spv_emit_vec2_construct(&c->emit, vec2, dx[0], dx[1]);
+            u32 gradient_y = dims == 3 ? spv_emit_vec3_construct(&c->emit, vec3, dy[0], dy[1], dy[2])
+                                       : spv_emit_vec2_construct(&c->emit, vec2, dy[0], dy[1]);
+            int reduce = shader_minmax_of(si, slot);
+            sample = varying_offset ? texture_gradient_offset(t, slot, coords, gradient_x, gradient_y, varying_offset,
+                                                                  count, varying_known, varying_value)
+                         : reduce ? shader_minmax_direct(c, texture_vec4[slot], c->sampled_type[slot], c->sampler[slot],
+                                                         coords, (int)array, offset, dynamic_offset, reduce)
+                                  : spv_emit_sample_grad_offset(&c->emit, texture_vec4[slot], c->sampled_type[slot],
+                                                                c->sampler[slot], coords, gradient_x, gradient_y, offset,
+                                                                dynamic_offset, 0);
+            if (choose) handle_pick_add(&pick, slot, sample, texture_vec4[slot] == vec4_u32, vec4_u32);
         }
-        u32 gradient_x = dims == 3 ? spv_emit_vec3_construct(&c->emit, vec3, dx[0], dx[1], dx[2])
-                                   : spv_emit_vec2_construct(&c->emit, vec2, dx[0], dx[1]);
-        u32 gradient_y = dims == 3 ? spv_emit_vec3_construct(&c->emit, vec3, dy[0], dy[1], dy[2])
-                                   : spv_emit_vec2_construct(&c->emit, vec2, dy[0], dy[1]);
-        int reduce = shader_minmax_of(si, slot);
-        u32 sample = varying_offset ? texture_gradient_offset(t, slot, coords, gradient_x, gradient_y, varying_offset,
-                                                              count, varying_known, varying_value)
-                     : reduce ? shader_minmax_direct(c, texture_vec4[slot], c->sampled_type[slot], c->sampler[slot],
-                                                     coords, (int)array, offset, dynamic_offset, reduce)
-                              : spv_emit_sample_grad_offset(&c->emit, texture_vec4[slot], c->sampled_type[slot],
-                                                            c->sampler[slot], coords, gradient_x, gradient_y, offset,
-                                                            dynamic_offset, 0);
-        u32 mask = B(w, 31, 4), dst = d;
+        if (choose) sample = handle_pick_end(&pick, &slot);
+        u32 dst = d;
         for (u32 component = 0; component < 4; component++)
             if (mask & (1u << component)) {
-                shader_texture_write(c, dst, sample, texture_scalar[slot], component);
+                shader_texture_write(c, dst, sample, choose ? c->u32_type : texture_scalar[slot], component);
                 if (dst < 255) dst++;
             }
     } else if (op == O_TXQ || op == O_TXQ_B) {
@@ -1048,46 +1114,75 @@ void emit_texture(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
         u32 off = B(w, 36, 13), bank = 0, bank2 = 0, off2 = 0, indexed = 0, ldc = 0;
         int handle_count =
             bindless ? shader_direct_track_image_handle_pair(t->flow, i, a, &bank, &off, &bank2, &off2, 0) : 0;
-        int slot = -1;
-        u32 qtype = 1, qarray = 0;
         if (handle_count == 1) indexed = shader_direct_indexed_handle(t->flow, i, a, stage, &ldc);
         u32 memory_probe = bindless && !handle_count
                                ? shader_direct_memory_probe(t->flow, t->si, t->memh_at, i, a)
                                : SH_PROBE_NONE;
-        if (memory_probe != SH_PROBE_NONE) {
-            for (int k = 0; k < texture_count; k++) {
-                if ((textures[k].flags & SNX_TEX_MEMORY) && textures[k].cbuf_off == memory_probe) {
-                    slot = k;
-                    qtype = textures[k].type;
-                    qarray = textures[k].array;
-                    break;
+        int choose = bindless && !handle_count && memory_probe == SH_PROBE_NONE;
+        ShHandleChoice choice = {0};
+        int candidates = choose ? shader_direct_handle_choice(t->flow, i, a, &choice) : 1;
+        if (!candidates) choose = 0;
+        ShHandlePick pick = {0};
+        if (choose) handle_pick_begin(&pick, c, reg_read(c, a), c->u32_type);
+        u32 mask = B(w, 31, 4), values[4] = {c->zero, c->zero, c->zero, c->zero};
+        for (int cand = 0; cand < candidates; cand++) {
+            int slot = 0;
+            u32 qtype = 1, qarray = 0;
+            if (choose) {
+                handle_pick_candidate(&pick, &choice, cand);
+                bank = choice.bank[cand];
+                off = choice.off[cand];
+                bank2 = choice.bank2[cand];
+                off2 = choice.off2[cand];
+                shader_direct_query_type(t->flow, bindless, bank, off, &qtype, &qarray);
+                slot = shader_direct_typed_slot(textures, texture_count, off, qtype, qarray, 0, 0, bindless, bank,
+                                                choice.words[cand], bank2, off2, indexed, ldc);
+            } else if (memory_probe != SH_PROBE_NONE) {
+                for (int k = 0; k < texture_count; k++) {
+                    if ((textures[k].flags & SNX_TEX_MEMORY) && textures[k].cbuf_off == memory_probe) {
+                        slot = k;
+                        qtype = textures[k].type;
+                        qarray = textures[k].array;
+                        break;
+                    }
+                }
+            } else if (!indexed && shader_direct_query_type(t->flow, bindless, bank, off, &qtype, &qarray)) {
+                slot = shader_direct_typed_slot(textures, texture_count, off, qtype, qarray, 0, 0, bindless, bank,
+                                                handle_count, bank2, off2, indexed, ldc);
+            } else {
+                slot = shader_direct_query_slot(textures, texture_count, off, bindless, bank, handle_count, bank2, off2,
+                                                indexed, ldc);
+                if (slot < texture_count) { /* the key's hint typed it (tex_query_hint); 2D without one */
+                    qtype = textures[slot].type;
+                    qarray = textures[slot].array;
                 }
             }
-        } else if (!indexed && shader_direct_query_type(t->flow, bindless, bank, off, &qtype, &qarray)) {
-            slot = shader_direct_typed_slot(textures, texture_count, off, qtype, qarray, 0, 0, bindless, bank,
-                                            handle_count, bank2, off2, indexed, ldc);
-        } else {
-            slot = shader_direct_query_slot(textures, texture_count, off, bindless, bank, handle_count, bank2, off2,
-                                            indexed, ldc);
-            if (slot < texture_count) { /* the key's hint typed it (tex_query_hint); 2D without one */
-                qtype = textures[slot].type;
-                qarray = textures[slot].array;
+            if (textures[slot].flags & SNX_TEX_INDEXED) shader_direct_swap_element(c, slot);
+            /* a 3D texture's depth, or an array's layers, is the third component; a 1D texture is bound as a 2D one of
+               height 1, a cube's faces are no layers */
+            int third = qtype == 2 || qarray;
+            u32 dimensions = spv_emit_image_query_size_lod(&c->emit, third ? vec3_u32 : vec2_u32,
+                                                           c->sampled_type[slot], c->sampler[slot],
+                                                           reg_read(c, a + (u32)bindless));
+            u32 queried[4] = {spv_emit_vec4_extract(&c->emit, c->u32_type, dimensions, 0),
+                              spv_emit_vec4_extract(&c->emit, c->u32_type, dimensions, 1),
+                              third ? spv_emit_vec4_extract(&c->emit, c->u32_type, dimensions, 2) : shader_u32(c, 1),
+                              spv_emit_image_query_levels(&c->emit, c->u32_type, c->sampled_type[slot],
+                                                          c->sampler[slot])};
+            if (qtype == 1 && needs_texel_scale) shader_scaled_size(c, push, slot, &queried[0], &queried[1]);
+            u32 match = choose ? handle_pick_match(&pick) : 0;
+            for (u32 k = 0; k < 4; k++) {
+                if (!(mask & (1u << k))) continue;
+                if (!choose) values[k] = queried[k];
+                else {
+                    u32 none = cand ? values[k] : spv_emit_constant_u32(&c->emit, c->u32_type, 0);
+                    values[k] = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->u32_type, match, queried[k], none);
+                }
             }
         }
-        if (textures[slot].flags & SNX_TEX_INDEXED) shader_direct_swap_element(c, slot);
-        /* a 3D texture's depth, or an array's layers, is the third component; a 1D texture is bound as a 2D one of
-           height 1, a cube's faces are no layers */
-        int third = qtype == 2 || qarray;
-        u32 dimensions = spv_emit_image_query_size_lod(&c->emit, third ? vec3_u32 : vec2_u32, c->sampled_type[slot],
-                                                       c->sampler[slot], reg_read(c, a + (u32)bindless));
-        u32 values[4] = {spv_emit_vec4_extract(&c->emit, c->u32_type, dimensions, 0),
-                         spv_emit_vec4_extract(&c->emit, c->u32_type, dimensions, 1),
-                         third ? spv_emit_vec4_extract(&c->emit, c->u32_type, dimensions, 2) : shader_u32(c, 1),
-                         spv_emit_image_query_levels(&c->emit, c->u32_type, c->sampled_type[slot], c->sampler[slot])};
-        if (qtype == 1 && needs_texel_scale) shader_scaled_size(c, push, slot, &values[0], &values[1]);
         u32 dst = d;
         for (u32 k = 0; k < 4; k++)
-            if (B(w, 31 + k, 1)) {
+            if (mask & (1u << k)) {
                 reg_write(c, dst, values[k]);
                 if (dst < 255) dst++;
             }
@@ -1098,33 +1193,58 @@ void emit_texture(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
         int handle_count =
             bindless ? shader_direct_track_image_handle_pair(t->flow, i, b, &bank, &off, &bank2, &off2, 0) : 0;
         if (handle_count == 1) indexed = shader_direct_indexed_handle(t->flow, i, b, stage, &ldc);
-        int slot = bindless && !handle_count ? direct_memh_emit_slot(t, i, b, type, array, 0, 0) : -1;
-        if (slot < 0)
-            slot = shader_direct_typed_slot(textures, texture_count, off, type, array, 0, 0, bindless, bank,
-                                            handle_count, bank2, off2, indexed, ldc);
-        if (textures[slot].flags & SNX_TEX_INDEXED) shader_direct_swap_element(c, slot);
-        /* a 1D texture is bound as a 2D one of height 1 */
-        u32 x = reg_read_as(c, a + array, c->f32_type);
-        u32 y =
-            type == 0 ? spv_emit_constant_f32(&c->emit, c->f32_type, 0.5f) : reg_read_as(c, a + array + 1, c->f32_type);
-        if (rect_slots >> slot & 1)
-            shader_rect_coords(c, push, stage == ST_FS, slot, vec2_u32, i32_type, &x, &y, NULL, NULL);
-        u32 coords = type < 2
-                         ? spv_emit_vec2_construct(&c->emit, vec2, x, y)
+        int memory_slot = bindless && !handle_count ? direct_memh_emit_slot(t, i, b, type, array, 0, 0) : -1;
+        int choose = bindless && !handle_count && memory_slot < 0;
+        ShHandleChoice choice = {0};
+        int candidates = choose ? shader_direct_handle_choice(t->flow, i, b, &choice) : 1;
+        if (!candidates) choose = 0;
+        ShHandlePick pick = {0};
+        if (choose) handle_pick_begin(&pick, c, reg_read(c, b), c->u32_type);
+        u32 mask = B(w, 31, 4), values[2] = {c->zero, c->zero};
+        for (int cand = 0; cand < candidates; cand++) {
+            if (choose) {
+                handle_pick_candidate(&pick, &choice, cand);
+                bank = choice.bank[cand];
+                off = choice.off[cand];
+                bank2 = choice.bank2[cand];
+                off2 = choice.off2[cand];
+            }
+            int slot = memory_slot >= 0
+                           ? memory_slot
+                           : shader_direct_typed_slot(textures, texture_count, off, type, array, 0, 0, bindless, bank,
+                                                      choose ? choice.words[cand] : handle_count, bank2, off2, indexed,
+                                                      ldc);
+            if (textures[slot].flags & SNX_TEX_INDEXED) shader_direct_swap_element(c, slot);
+            /* a 1D texture is bound as a 2D one of height 1 */
+            u32 x = reg_read_as(c, a + array, c->f32_type);
+            u32 y = type == 0 ? spv_emit_constant_f32(&c->emit, c->f32_type, 0.5f)
+                              : reg_read_as(c, a + array + 1, c->f32_type);
+            if (rect_slots >> slot & 1)
+                shader_rect_coords(c, push, stage == ST_FS, slot, vec2_u32, i32_type, &x, &y, NULL, NULL);
+            u32 coords =
+                type < 2 ? spv_emit_vec2_construct(&c->emit, vec2, x, y)
                          : spv_emit_vec3_construct(&c->emit, vec3, x, y, reg_read_as(c, a + array + 2, c->f32_type));
-        u32 lod = spv_emit_image_query_lod(&c->emit, vec2, c->sampled_type[slot], c->sampler[slot], coords);
-        u32 mask = B(w, 31, 4), dst = d;
-        for (u32 component = 0; component < 4; component++) {
-            if (!(mask & (1u << component))) continue;
-            u32 value = c->zero;
-            if (component < 2) {
+            u32 lod = spv_emit_image_query_lod(&c->emit, vec2, c->sampled_type[slot], c->sampler[slot], coords);
+            u32 match = choose ? handle_pick_match(&pick) : 0;
+            for (u32 component = 0; component < 2; component++) {
+                if (!(mask & (1u << component))) continue;
                 u32 f = spv_emit_vec4_extract(&c->emit, c->f32_type, lod, 1 - component);
                 f = spv_emit_binary(&c->emit, SPV_OP_F_MUL, c->f32_type, f,
                                     spv_emit_constant_f32(&c->emit, c->f32_type, 256.0f));
-                value = spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->u32_type,
-                                       spv_emit_unary(&c->emit, SPV_OP_CONVERT_F_TO_S, i32_type, f));
+                u32 value = spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->u32_type,
+                                           spv_emit_unary(&c->emit, SPV_OP_CONVERT_F_TO_S, i32_type, f));
+                if (choose) {
+                    u32 none = cand ? values[component] : spv_emit_constant_u32(&c->emit, c->u32_type, 0);
+                    values[component] = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->u32_type, match, value, none);
+                } else {
+                    values[component] = value;
+                }
             }
-            reg_write(c, dst, value);
+        }
+        u32 dst = d;
+        for (u32 component = 0; component < 4; component++) {
+            if (!(mask & (1u << component))) continue;
+            reg_write(c, dst, component < 2 ? values[component] : c->zero);
             if (dst < 255) dst++;
         }
     } else if (op == O_TLD4S || op == O_TLD4 || op == O_TLD4_B) {
@@ -1137,104 +1257,125 @@ void emit_texture(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
         u32 ty = op == O_TLD4S ? 2 : B(w, 28, 3);
         u32 type = ty >> 1, array = ty & 1;
         u32 shadow = B(w, 50, 1);
-        int slot = bindless && !handle_count ? direct_memh_emit_slot(t, i, b, type, array, shadow, 0) : -1;
-        if (slot < 0) {
-            slot = 0;
-            while (slot < texture_count &&
-                   (textures[slot].cbuf_off != off || textures[slot].type != type || textures[slot].array != array ||
-                    textures[slot].shadow != shadow || textures[slot].bindless != bindless ||
-                    (bindless &&
-                     !shader_direct_bindless_matches(&textures[slot], bank, handle_count, bank2, off2, indexed, ldc))))
-                slot++;
-        }
-        if (textures[slot].flags & SNX_TEX_INDEXED) shader_direct_swap_element(c, slot);
-        u32 x = reg_read_as(c, a + array, c->f32_type);
-        u32 y = type == 0 ? spv_emit_constant_f32(&c->emit, c->f32_type, 0.5f)
-                          : reg_read_as(c, op == O_TLD4S && !shadow && !B(w, 51, 1) ? b : a + array + 1, c->f32_type);
-        if (rect_slots >> slot & 1)
-            shader_rect_coords(c, push, stage == ST_FS, slot, vec2_u32, i32_type, &x, &y, NULL, NULL);
-        u32 coords;
-        if (!array && type != 3)
-            coords = spv_emit_vec2_construct(&c->emit, vec2, x, y);
-        else {
-            u32 z = type == 3 ? reg_read_as(c, a + array + 2, c->f32_type) : shader_array_layer(c, a);
-            if (type == 3 && array) {
-                u32 four[4];
-                four[0] = x;
-                four[1] = y;
-                four[2] = z;
-                four[3] = shader_array_layer(c, a);
-                coords = spv_emit_vec4_construct(&c->emit, vec4, four);
-            } else
-                coords = spv_emit_vec3_construct(&c->emit, vec3, x, y, z);
-        }
-        u32 component = shader_u32(c, B(w, op == O_TLD4S ? 52 : bindless ? 38 : 56, 2));
-        u32 offset = 0, dref = 0;
-        int per_tap_offset = 0;
-        u32 ptp_source = 0;
-        if (op != O_TLD4S) {
-            u32 source = b + bindless;
-            u32 offset_mode = B(w, bindless ? 36 : 54, 2);
-            if (offset_mode == 1) {
-                /* a 1D texture is a 2D one a texel high, which doesn't move in y */
-                offset = shader_direct_gather_offset(c, reg_read(c, source++), 0, type == 0, i32_type, vec2_i32);
-            } else if (offset_mode == 2) {
-                per_tap_offset = 1;
-                ptp_source = source;
-                source += 2;
-            }
-            if (shadow) dref = reg_read_as(c, source, c->f32_type);
-        } else {
-            if (B(w, 51, 1)) { offset = shader_direct_gather_offset(c, reg_read(c, b), 0, 0, i32_type, vec2_i32); }
-            if (shadow) dref = reg_read_as(c, b + B(w, 51, 1), c->f32_type);
-        }
-        /* a compare gather of a color texture gathers its first components and compares them in the shader */
-        int indexed_dc = dref && shadow && (textures[slot].flags & SNX_TEX_INDEXED);
-        int dc_func = indexed_dc ? 3 : dref ? shader_dc_color_func(si, slot) : -1;
-        if (dc_func >= 0) component = c->zero;
+        int memory_slot = bindless && !handle_count ? direct_memh_emit_slot(t, i, b, type, array, shadow, 0) : -1;
+        int choose = bindless && !handle_count && memory_slot < 0;
+        ShHandleChoice choice = {0};
+        int candidates = choose ? shader_direct_handle_choice(t->flow, i, b, &choice) : 1;
+        if (!candidates) choose = 0;
+        ShHandlePick pick = {0};
+        if (choose) handle_pick_begin(&pick, c, reg_read(c, b), vec4_u32);
+        int slot = 0;
         u32 gathered;
-        if (per_tap_offset) {
-            u32 taps[4];
-            /* tap k's offset is (x, y) in bytes 2(k % 2) and 2(k % 2) + 1 of register k / 2, and its texel is the
-               i0j0 one of a gather at that offset, its w */
-            for (u32 tap = 0; tap < 4; tap++) {
-                u32 tap_offset = shader_direct_gather_offset(c, reg_read(c, ptp_source + tap / 2), (tap & 1) * 16,
-                                                             type == 0, i32_type, vec2_i32);
-                u32 sampled =
-                    spv_emit_image_gather_ex(&c->emit, texture_vec4[slot], c->sampled_type[slot], c->sampler[slot],
-                                             coords, component, dc_func < 0 ? dref : 0, tap_offset);
-                taps[tap] = spv_emit_vec4_extract(&c->emit, texture_scalar[slot], sampled, 3);
-                if (dc_func >= 0)
-                    taps[tap] = indexed_dc ? shader_dc_compare_indexed(c, slot, dref, taps[tap])
-                                           : shader_dc_compare(c, dc_func, dref, taps[tap]);
-                if (indexed_dc) {
-                    u32 depth = spv_emit_image_gather_ex(&c->emit, texture_vec4[slot], c->depth_type, c->depth_sampler,
-                                                         coords, component, dref, tap_offset);
-                    taps[tap] = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->f32_type, shader_indexed_is_depth(c, slot),
-                                                 spv_emit_vec4_extract(&c->emit, c->f32_type, depth, 3), taps[tap]);
+        for (int cand = 0; cand < candidates; cand++) {
+            if (choose) {
+                handle_pick_candidate(&pick, &choice, cand);
+                bank = choice.bank[cand];
+                off = choice.off[cand];
+                bank2 = choice.bank2[cand];
+                off2 = choice.off2[cand];
+            }
+            int handle_words = choose ? choice.words[cand] : handle_count;
+            slot = memory_slot;
+            if (slot < 0) {
+                slot = 0;
+                while (slot < texture_count &&
+                       (textures[slot].cbuf_off != off || textures[slot].type != type ||
+                        textures[slot].array != array || textures[slot].shadow != shadow ||
+                        textures[slot].bindless != bindless ||
+                        (bindless && !shader_direct_bindless_matches(&textures[slot], bank, handle_words, bank2, off2,
+                                                                     indexed, ldc))))
+                    slot++;
+            }
+            if (textures[slot].flags & SNX_TEX_INDEXED) shader_direct_swap_element(c, slot);
+            u32 x = reg_read_as(c, a + array, c->f32_type);
+            u32 y = type == 0 ? spv_emit_constant_f32(&c->emit, c->f32_type, 0.5f)
+                              : reg_read_as(c, op == O_TLD4S && !shadow && !B(w, 51, 1) ? b : a + array + 1, c->f32_type);
+            if (rect_slots >> slot & 1)
+                shader_rect_coords(c, push, stage == ST_FS, slot, vec2_u32, i32_type, &x, &y, NULL, NULL);
+            u32 coords;
+            if (!array && type != 3)
+                coords = spv_emit_vec2_construct(&c->emit, vec2, x, y);
+            else {
+                u32 z = type == 3 ? reg_read_as(c, a + array + 2, c->f32_type) : shader_array_layer(c, a);
+                if (type == 3 && array) {
+                    u32 four[4];
+                    four[0] = x;
+                    four[1] = y;
+                    four[2] = z;
+                    four[3] = shader_array_layer(c, a);
+                    coords = spv_emit_vec4_construct(&c->emit, vec4, four);
+                } else
+                    coords = spv_emit_vec3_construct(&c->emit, vec3, x, y, z);
+            }
+            u32 component = shader_u32(c, B(w, op == O_TLD4S ? 52 : bindless ? 38 : 56, 2));
+            u32 offset = 0, dref = 0;
+            int per_tap_offset = 0;
+            u32 ptp_source = 0;
+            if (op != O_TLD4S) {
+                u32 source = b + bindless;
+                u32 offset_mode = B(w, bindless ? 36 : 54, 2);
+                if (offset_mode == 1) {
+                    /* a 1D texture is a 2D one a texel high, which doesn't move in y */
+                    offset = shader_direct_gather_offset(c, reg_read(c, source++), 0, type == 0, i32_type, vec2_i32);
+                } else if (offset_mode == 2) {
+                    per_tap_offset = 1;
+                    ptp_source = source;
+                    source += 2;
+                }
+                if (shadow) dref = reg_read_as(c, source, c->f32_type);
+            } else {
+                if (B(w, 51, 1)) { offset = shader_direct_gather_offset(c, reg_read(c, b), 0, 0, i32_type, vec2_i32); }
+                if (shadow) dref = reg_read_as(c, b + B(w, 51, 1), c->f32_type);
+            }
+            /* a compare gather of a color texture gathers its first components and compares them in the shader */
+            int indexed_dc = dref && shadow && (textures[slot].flags & SNX_TEX_INDEXED);
+            int dc_func = indexed_dc ? 3 : dref ? shader_dc_color_func(si, slot) : -1;
+            if (dc_func >= 0) component = c->zero;
+            if (per_tap_offset) {
+                u32 taps[4];
+                /* tap k's offset is (x, y) in bytes 2(k % 2) and 2(k % 2) + 1 of register k / 2, and its texel is the
+                   i0j0 one of a gather at that offset, its w */
+                for (u32 tap = 0; tap < 4; tap++) {
+                    u32 tap_offset = shader_direct_gather_offset(c, reg_read(c, ptp_source + tap / 2), (tap & 1) * 16,
+                                                                 type == 0, i32_type, vec2_i32);
+                    u32 sampled =
+                        spv_emit_image_gather_ex(&c->emit, texture_vec4[slot], c->sampled_type[slot], c->sampler[slot],
+                                                 coords, component, dc_func < 0 ? dref : 0, tap_offset);
+                    taps[tap] = spv_emit_vec4_extract(&c->emit, texture_scalar[slot], sampled, 3);
+                    if (dc_func >= 0)
+                        taps[tap] = indexed_dc ? shader_dc_compare_indexed(c, slot, dref, taps[tap])
+                                               : shader_dc_compare(c, dc_func, dref, taps[tap]);
+                    if (indexed_dc) {
+                        u32 depth = spv_emit_image_gather_ex(&c->emit, texture_vec4[slot], c->depth_type, c->depth_sampler,
+                                                             coords, component, dref, tap_offset);
+                        taps[tap] = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->f32_type, shader_indexed_is_depth(c, slot),
+                                                     spv_emit_vec4_extract(&c->emit, c->f32_type, depth, 3), taps[tap]);
+                    }
+                }
+                gathered = spv_emit_vec4_construct(&c->emit, texture_vec4[slot], taps);
+            } else {
+                gathered = spv_emit_image_gather_ex(&c->emit, texture_vec4[slot], c->sampled_type[slot], c->sampler[slot],
+                                                    coords, component, dc_func < 0 ? dref : 0, offset);
+                if (dc_func >= 0) { /* each gathered first component against the reference */
+                    u32 lanes[4];
+                    for (u32 lane = 0; lane < 4; lane++)
+                        lanes[lane] = indexed_dc
+                                          ? shader_dc_compare_indexed(
+                                                c, slot, dref, spv_emit_vec4_extract(&c->emit, c->f32_type, gathered, lane))
+                                          : shader_dc_compare(c, dc_func, dref,
+                                                              spv_emit_vec4_extract(&c->emit, c->f32_type, gathered, lane));
+                    gathered = spv_emit_vec4_construct(&c->emit, texture_vec4[slot], lanes);
                 }
             }
-            gathered = spv_emit_vec4_construct(&c->emit, texture_vec4[slot], taps);
-        } else {
-            gathered = spv_emit_image_gather_ex(&c->emit, texture_vec4[slot], c->sampled_type[slot], c->sampler[slot],
-                                                coords, component, dc_func < 0 ? dref : 0, offset);
-            if (dc_func >= 0) { /* each gathered first component against the reference */
-                u32 lanes[4];
-                for (u32 lane = 0; lane < 4; lane++)
-                    lanes[lane] = indexed_dc
-                                      ? shader_dc_compare_indexed(
-                                            c, slot, dref, spv_emit_vec4_extract(&c->emit, c->f32_type, gathered, lane))
-                                      : shader_dc_compare(c, dc_func, dref,
-                                                          spv_emit_vec4_extract(&c->emit, c->f32_type, gathered, lane));
-                gathered = spv_emit_vec4_construct(&c->emit, texture_vec4[slot], lanes);
+            if (indexed_dc && !per_tap_offset) {
+                u32 depth = spv_emit_image_gather_ex(&c->emit, texture_vec4[slot], c->depth_type, c->depth_sampler, coords,
+                                                     component, dref, offset);
+                gathered = spv_emit_ternary(&c->emit, SPV_OP_SELECT, texture_vec4[slot], shader_indexed_is_depth(c, slot),
+                                            depth, gathered);
             }
+            if (choose) handle_pick_add(&pick, slot, gathered, texture_vec4[slot] == vec4_u32, vec4_u32);
         }
-        if (indexed_dc && !per_tap_offset) {
-            u32 depth = spv_emit_image_gather_ex(&c->emit, texture_vec4[slot], c->depth_type, c->depth_sampler, coords,
-                                                 component, dref, offset);
-            gathered = spv_emit_ternary(&c->emit, SPV_OP_SELECT, texture_vec4[slot], shader_indexed_is_depth(c, slot),
-                                        depth, gathered);
-        }
+        if (choose) gathered = handle_pick_end(&pick, &slot);
         if (op == O_TLD4S) {
             u32 db = B(w, 28, 8);
             if (B(w, 55, 1)) {
@@ -1254,7 +1395,7 @@ void emit_texture(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b) {
             u32 mask = B(w, 31, 4), dst = d;
             for (u32 k = 0; k < 4; k++)
                 if (mask & (1u << k)) {
-                    shader_texture_write(c, dst, gathered, texture_scalar[slot], k);
+                    shader_texture_write(c, dst, gathered, choose ? c->u32_type : texture_scalar[slot], k);
                     if (dst < 255) dst++;
                 }
         }

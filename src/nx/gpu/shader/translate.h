@@ -246,12 +246,26 @@ int shader_direct_track_cbuf_word(const ShFlow* f, u32 index, u32 reg, u32* bank
 int shader_direct_track_image_handle(const ShFlow* f, u32 index, u32 reg, u32* bank, u32* off, int depth);
 int shader_direct_track_image_handle_pair(const ShFlow* f, u32 index, u32 reg, u32* bank, u32* off, u32* bank2,
                                           u32* off2, int depth);
-/* the most constant buffer handles one TEX.B chooses among (shader_direct_handle_candidates) */
+/* the most constant buffer handles one register-handle bind chooses among (shader_direct_handle_choice) */
 #define SH_HANDLE_CANDIDATES 4
 int shader_direct_handle_candidates(const ShFlow* f, u32 index, u32 reg, u32* banks, u32* offs, int max);
 /* Two-word and mixed candidates for a predicated write in the use's own block. */
 int shader_direct_handle_candidates_pair(const ShFlow* f, u32 index, u32 reg, u32* banks, u32* offs, u32* bank2s,
                                          u32* off2s, u8* words, int max);
+/* The constant buffer words a runtime handle register holds, from the writes the use sees: one per path a predicated
+   write selects between. The bind samples or queries each candidate's texture and selects by the runtime word; a use
+   whose paths do not all name a handle keeps the untracked refusal. */
+typedef struct ShHandleChoice {
+    int count;
+    u32 bank[SH_HANDLE_CANDIDATES], off[SH_HANDLE_CANDIDATES];
+    u32 bank2[SH_HANDLE_CANDIDATES], off2[SH_HANDLE_CANDIDATES];
+    u8 words[SH_HANDLE_CANDIDATES];
+} ShHandleChoice;
+int shader_direct_handle_choice(const ShFlow* f, u32 index, u32 reg, ShHandleChoice* choice);
+/* The one line the runtime logs for the first program that chooses its texture: the bind, its use site, the register,
+   and each candidate's constant buffer word. */
+void shader_direct_handle_note(char* why, size_t size, const char* bind, u32 index, u32 reg,
+                               const ShHandleChoice* choice);
 int shader_al2p_predicate_unseen(const ShFlow* f, u32 at);
 u32 shader_direct_indexed_handle(const ShFlow* f, u32 index, u32 reg, int stage, u32* ldc);
 int shader_direct_bindless_matches(const ShTex* t, u32 bank, int handle_count, u32 bank2, u32 off2, u32 indexed,

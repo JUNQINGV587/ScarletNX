@@ -1350,15 +1350,29 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                 read_slot = direct_memh_slot(flow, si, memh_at, &nmemh, textures, &texture_count, i, b, type, array,
                                              0, multisample);
             if (read_slot == -2) return direct_reject(si, "texture descriptor count");
-            if (bindless && !handle_count && read_slot < 0)
-                return shader_untracked_handle(si, "texture", insn, i, b);
-            if (read_slot < 0)
-                read_slot = shader_direct_add_typed_slot(textures, &texture_count, off, type, array, 0,
-                                                         multisample ? 2 : 0, bindless, bank, handle_count, bank2,
-                                                         off2, indexed, ldc);
-            if (read_slot < 0) return direct_reject(si, "texture descriptor count");
-            tex_read |= 1ull << read_slot;
-            if (op->id == O_TLD ? !shader_direct_own_pixel_fetch(flow, i) : 1) tex_elsewhere |= 1ull << read_slot;
+            int choose = bindless && !handle_count && read_slot < 0;
+            ShHandleChoice choice = {0};
+            int candidates = choose ? shader_direct_handle_choice(flow, i, b, &choice) : 1;
+            if (!candidates) return shader_untracked_handle(si, "texture", insn, i, b);
+            if (choose && chosen_tex++ == 0)
+                shader_direct_handle_note(chosen_why, sizeof chosen_why, "TLD.B", i, b, &choice);
+            for (int cand = 0; cand < candidates; cand++) {
+                if (choose) {
+                    bank = choice.bank[cand];
+                    off = choice.off[cand];
+                    bank2 = choice.bank2[cand];
+                    off2 = choice.off2[cand];
+                }
+                int slot = read_slot >= 0
+                               ? read_slot
+                               : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, 0,
+                                                              multisample ? 2 : 0, bindless, bank,
+                                                              choose ? choice.words[cand] : handle_count, bank2, off2,
+                                                              indexed, ldc);
+                if (slot < 0) return direct_reject(si, "texture descriptor count");
+                tex_read |= 1ull << slot;
+                if (op->id == O_TLD ? !shader_direct_own_pixel_fetch(flow, i) : 1) tex_elsewhere |= 1ull << slot;
+            }
             u32 coordinate_count = (type == 0 ? 1u : type == 1 ? 2u : 3u) + (u32)array;
             for (u32 k = 0; k < coordinate_count; k++)
                 if (a + k < 255) used[a + k] = 1;
@@ -1591,46 +1605,30 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                                   : -1;
             if (memory_slot == -2) return direct_reject(si, "texture descriptor count");
             /* a handle the writes don't agree on: each constant buffer handle that can reach it, chosen when it runs */
-            u32 cand_bank[SH_HANDLE_CANDIDATES], cand_off[SH_HANDLE_CANDIDATES];
-            u32 cand_bank2[SH_HANDLE_CANDIDATES], cand_off2[SH_HANDLE_CANDIDATES];
-            u8 cand_words[SH_HANDLE_CANDIDATES];
-            int pair_candidates = 0;
-            int candidates = bindless && !handle_count && memory_slot < 0
-                                 ? shader_direct_handle_candidates(flow, i, b, cand_bank, cand_off,
-                                                                   SH_HANDLE_CANDIDATES)
-                                 : 1;
-            if (!candidates && bindless && !handle_count && memory_slot < 0) {
-                candidates = shader_direct_handle_candidates_pair(flow, i, b, cand_bank, cand_off, cand_bank2,
-                                                                  cand_off2, cand_words, SH_HANDLE_CANDIDATES);
-                pair_candidates = candidates > 0;
-            }
+            int choose = bindless && !handle_count && memory_slot < 0;
+            ShHandleChoice choice = {0};
+            int candidates = choose ? shader_direct_handle_choice(flow, i, b, &choice) : 1;
             if (!candidates) return shader_untracked_handle(si, "texture", insn, i, b);
-            if (bindless && !handle_count && memory_slot < 0 && chosen_tex++ == 0) {
-                int at = snprintf(chosen_why, sizeof chosen_why, "TEX.B at %x, R%u:", i * 8, b);
-                for (int cand = 0; cand < candidates && at > 0 && (size_t)at < sizeof chosen_why; cand++)
-                    at += snprintf(chosen_why + at, sizeof chosen_why - (size_t)at, "%s c[%u][0x%x]", cand ? "," : "",
-                                   cand_bank[cand], cand_off[cand] * 4);
-            }
+            if (choose && chosen_tex++ == 0)
+                shader_direct_handle_note(chosen_why, sizeof chosen_why, "TEX.B", i, b, &choice);
             int read_slot = -1;
             for (int cand = 0; cand < candidates; cand++) {
                 if (memory_slot >= 0) {
                     read_slot = memory_slot;
                 } else {
-                    if (bindless && !handle_count) {
-                        bank = cand_bank[cand];
-                        off = cand_off[cand];
-                        if (pair_candidates) {
-                            bank2 = cand_bank2[cand];
-                            off2 = cand_off2[cand];
-                        }
+                    if (choose) {
+                        bank = choice.bank[cand];
+                        off = choice.off[cand];
+                        bank2 = choice.bank2[cand];
+                        off2 = choice.off2[cand];
                     }
-                    int handle_words = pair_candidates ? cand_words[cand] : (handle_count ? handle_count : 1);
+                    int handle_words = choose ? choice.words[cand] : (handle_count ? handle_count : 1);
                     read_slot = shader_direct_add_typed_slot(textures, &texture_count, off, type, array, shadow, 0,
                                                              bindless, bank, handle_words, bank2, off2, indexed, ldc);
                 }
                 if (read_slot < 0) return direct_reject(si, "texture descriptor count");
                 tex_read |= 1ull << read_slot;
-                if (!handle_count && bindless && memory_slot < 0) tex_elsewhere |= 1ull << read_slot;
+                if (choose) tex_elsewhere |= 1ull << read_slot;
             }
             u32 coordinate = a + (array || clamp), dimensions = type == 0 ? 1 : type >= 2 ? 3 : 2;
             int plain = type == 1 && !array && !shadow && !offset_enabled && !clamp && mode <= 1;
@@ -1668,15 +1666,28 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                                                      array, 0, 0)
                                   : -1;
             if (memory_slot == -2) return direct_reject(si, "texture descriptor count");
-            if (bindless && !handle_count && memory_slot < 0)
-                return shader_untracked_handle(si, "texture", insn, i, b);
             if (handle_count == 1) indexed = shader_direct_indexed_handle(flow, i, b, stage, &ldc);
-            int asked_slot = memory_slot >= 0
-                                 ? memory_slot
-                                 : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, 0, 0,
-                                                                bindless, bank, handle_count, bank2, off2, indexed, ldc);
-            if (asked_slot < 0) return direct_reject(si, "texture descriptor count");
-            tex_asked |= 1ull << asked_slot;
+            int choose = bindless && !handle_count && memory_slot < 0;
+            ShHandleChoice choice = {0};
+            int candidates = choose ? shader_direct_handle_choice(flow, i, b, &choice) : 1;
+            if (!candidates) return shader_untracked_handle(si, "texture", insn, i, b);
+            if (choose && chosen_tex++ == 0)
+                shader_direct_handle_note(chosen_why, sizeof chosen_why, "TMML.B", i, b, &choice);
+            for (int cand = 0; cand < candidates; cand++) {
+                if (choose) {
+                    bank = choice.bank[cand];
+                    off = choice.off[cand];
+                    bank2 = choice.bank2[cand];
+                    off2 = choice.off2[cand];
+                }
+                int slot = memory_slot >= 0
+                               ? memory_slot
+                               : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, 0, 0,
+                                                              bindless, bank, choose ? choice.words[cand] : handle_count,
+                                                              bank2, off2, indexed, ldc);
+                if (slot < 0) return direct_reject(si, "texture descriptor count");
+                tex_asked |= 1ull << slot;
+            }
             for (u32 k = 0; k < array + (type == 0 ? 1 : type == 1 ? 2 : 3); k++)
                 if (a + k < 255) used[a + k] = 1;
             if (bindless && b < 255) used[b] = 1;
@@ -1699,16 +1710,29 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                                                      array, 0, 0)
                                   : -1;
             if (memory_slot == -2) return direct_reject(si, "texture descriptor count");
-            if (bindless && !handle_count && memory_slot < 0)
-                return shader_untracked_handle(si, "texture", insn, i, a);
             if (handle_count == 1) indexed = shader_direct_indexed_handle(flow, i, a, stage, &ldc);
-            int read_slot = memory_slot >= 0
-                                ? memory_slot
-                                : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, 0, 0,
-                                                               bindless, bank, handle_count, bank2, off2, indexed, ldc);
-            if (read_slot < 0) return direct_reject(si, "texture descriptor count");
-            tex_read |= 1ull << read_slot;
-            tex_elsewhere |= 1ull << read_slot;
+            int choose = bindless && !handle_count && memory_slot < 0;
+            ShHandleChoice choice = {0};
+            int candidates = choose ? shader_direct_handle_choice(flow, i, a, &choice) : 1;
+            if (!candidates) return shader_untracked_handle(si, "texture", insn, i, a);
+            if (choose && chosen_tex++ == 0)
+                shader_direct_handle_note(chosen_why, sizeof chosen_why, "TXD.B", i, a, &choice);
+            for (int cand = 0; cand < candidates; cand++) {
+                if (choose) {
+                    bank = choice.bank[cand];
+                    off = choice.off[cand];
+                    bank2 = choice.bank2[cand];
+                    off2 = choice.off2[cand];
+                }
+                int slot = memory_slot >= 0
+                               ? memory_slot
+                               : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, 0, 0,
+                                                              bindless, bank, choose ? choice.words[cand] : handle_count,
+                                                              bank2, off2, indexed, ldc);
+                if (slot < 0) return direct_reject(si, "texture descriptor count");
+                tex_read |= 1ull << slot;
+                tex_elsewhere |= 1ull << slot;
+            }
             u32 coord = a + (u32)bindless, aoffi = B(insn[i], 35, 1);
             for (u32 k = 0; k < count + (array || aoffi); k++)
                 if (a + k + (u32)bindless < 255) used[coord + k] = 1;
@@ -1729,42 +1753,70 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             u32 memory_probe = bindless && !handle_count
                                    ? shader_direct_memory_handle(flow, si, memh_at, &nmemh, i, a)
                                    : SH_PROBE_NONE;
-            if (bindless && !handle_count && memory_probe == SH_PROBE_NONE)
-                return shader_untracked_handle(si, "texture", insn, i, a);
-            u32 qtype = 1, qarray = 0;
-            int guessed = 0, qslot, have_type = 0;
-            if (memory_probe != SH_PROBE_NONE) {
-                for (int k = 0; k < texture_count; k++) {
-                    if ((textures[k].flags & SNX_TEX_MEMORY) && textures[k].cbuf_off == memory_probe) {
-                        qtype = textures[k].type;
-                        qarray = textures[k].array;
-                        have_type = 1;
-                        break;
+            int choose = bindless && !handle_count && memory_probe == SH_PROBE_NONE;
+            ShHandleChoice choice = {0};
+            int candidates = choose ? shader_direct_handle_choice(flow, i, a, &choice) : 1;
+            if (!candidates) return shader_untracked_handle(si, "texture", insn, i, a);
+            if (choose && chosen_tex++ == 0)
+                shader_direct_handle_note(chosen_why, sizeof chosen_why, "TXQ.B", i, a, &choice);
+            if (choose) {
+                for (int cand = 0; cand < candidates; cand++) {
+                    u32 qtype = 1, qarray = 0;
+                    int guessed = 0;
+                    if (!indexed &&
+                        !shader_direct_query_type(flow, bindless, choice.bank[cand], choice.off[cand], &qtype, &qarray)) {
+                        /* as below: a texture nothing else in the program reads takes the header's dimension once the
+                           renderer has bound it, and 2D before that */
+                        u8 hint = texture_count < SH_MAXTEX ? si->tex_query_hint[texture_count] : 0;
+                        if (hint) {
+                            qtype = (hint - 1) & 3;
+                            qarray = (hint - 1) >> 2 & 1;
+                        }
+                        guessed = 1;
                     }
+                    int qslot = shader_direct_add_typed_slot(textures, &texture_count, choice.off[cand], qtype, qarray,
+                                                             0, 0, bindless, choice.bank[cand], choice.words[cand],
+                                                             choice.bank2[cand], choice.off2[cand], indexed, ldc);
+                    if (qslot < 0) return direct_reject(si, "texture descriptor count");
+                    if (guessed) tex_query |= 1ull << qslot;
+                    tex_asked |= 1ull << qslot;
                 }
-            } else if (indexed || shader_direct_query_type(flow, bindless, bank, off, &qtype, &qarray)) {
-                have_type = 1;
-            }
-            if (!have_type) {
-                /* nothing else in the program reads that texture (one game queries a volume through a bound handle
-                   and fetches it through a bindless one, which no tracking joins): the header's dimension, from the
-                   key, once the renderer has bound it; 2D before that */
-                u8 hint = texture_count < SH_MAXTEX ? si->tex_query_hint[texture_count] : 0;
-                if (hint) {
-                    qtype = (hint - 1) & 3;
-                    qarray = (hint - 1) >> 2 & 1;
+            } else {
+                u32 qtype = 1, qarray = 0;
+                int guessed = 0, qslot, have_type = 0;
+                if (memory_probe != SH_PROBE_NONE) {
+                    for (int k = 0; k < texture_count; k++) {
+                        if ((textures[k].flags & SNX_TEX_MEMORY) && textures[k].cbuf_off == memory_probe) {
+                            qtype = textures[k].type;
+                            qarray = textures[k].array;
+                            have_type = 1;
+                            break;
+                        }
+                    }
+                } else if (indexed || shader_direct_query_type(flow, bindless, bank, off, &qtype, &qarray)) {
+                    have_type = 1;
                 }
-                guessed = 1;
+                if (!have_type) {
+                    /* nothing else in the program reads that texture (one game queries a volume through a bound
+                       handle and fetches it through a bindless one, which no tracking joins): the header's dimension,
+                       from the key, once the renderer has bound it; 2D before that */
+                    u8 hint = texture_count < SH_MAXTEX ? si->tex_query_hint[texture_count] : 0;
+                    if (hint) {
+                        qtype = (hint - 1) & 3;
+                        qarray = (hint - 1) >> 2 & 1;
+                    }
+                    guessed = 1;
+                }
+                qslot = memory_probe != SH_PROBE_NONE
+                            ? direct_memh_slot(flow, si, memh_at, &nmemh, textures, &texture_count, i, a, qtype,
+                                               qarray, 0, 0)
+                            : shader_direct_add_typed_slot(textures, &texture_count, off, qtype, qarray, 0, 0,
+                                                           bindless, bank, handle_count, bank2, off2, indexed, ldc);
+                if (qslot == -2) return direct_reject(si, "texture descriptor count");
+                if (qslot < 0) return direct_reject(si, "texture descriptor count");
+                if (guessed) tex_query |= 1ull << qslot;
+                tex_asked |= 1ull << qslot;
             }
-            qslot = memory_probe != SH_PROBE_NONE
-                        ? direct_memh_slot(flow, si, memh_at, &nmemh, textures, &texture_count, i, a, qtype, qarray,
-                                           0, 0)
-                        : shader_direct_add_typed_slot(textures, &texture_count, off, qtype, qarray, 0, 0, bindless,
-                                                       bank, handle_count, bank2, off2, indexed, ldc);
-            if (qslot == -2) return direct_reject(si, "texture descriptor count");
-            if (qslot < 0) return direct_reject(si, "texture descriptor count");
-            if (guessed) tex_query |= 1ull << qslot;
-            tex_asked |= 1ull << qslot;
             needs_image_query = 1;
             if (a < 255) used[a] = 1;
             if (bindless && a + 1 < 255) used[a + 1] = 1;
@@ -1790,15 +1842,28 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                                                      array, shadow, 0)
                                   : -1;
             if (memory_slot == -2) return direct_reject(si, "texture descriptor count");
-            if (bindless && !handle_count && memory_slot < 0)
-                return shader_untracked_handle(si, "texture", insn, i, b);
-            int read_slot = memory_slot >= 0
-                                ? memory_slot
-                                : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, shadow, 0,
-                                                               bindless, bank, handle_count, bank2, off2, indexed, ldc);
-            if (read_slot < 0) return direct_reject(si, "texture descriptor count");
-            tex_read |= 1ull << read_slot;
-            tex_elsewhere |= 1ull << read_slot;
+            int choose = bindless && !handle_count && memory_slot < 0;
+            ShHandleChoice choice = {0};
+            int candidates = choose ? shader_direct_handle_choice(flow, i, b, &choice) : 1;
+            if (!candidates) return shader_untracked_handle(si, "texture", insn, i, b);
+            if (choose && chosen_tex++ == 0)
+                shader_direct_handle_note(chosen_why, sizeof chosen_why, "TLD4.B", i, b, &choice);
+            for (int cand = 0; cand < candidates; cand++) {
+                if (choose) {
+                    bank = choice.bank[cand];
+                    off = choice.off[cand];
+                    bank2 = choice.bank2[cand];
+                    off2 = choice.off2[cand];
+                }
+                int slot = memory_slot >= 0
+                               ? memory_slot
+                               : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, shadow, 0,
+                                                              bindless, bank, choose ? choice.words[cand] : handle_count,
+                                                              bank2, off2, indexed, ldc);
+                if (slot < 0) return direct_reject(si, "texture descriptor count");
+                tex_read |= 1ull << slot;
+                tex_elsewhere |= 1ull << slot;
+            }
             if (a < 255) used[a] = 1;
             if (op->id == O_TLD4S) {
                 if (b < 255) used[b] = 1;

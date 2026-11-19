@@ -5749,7 +5749,7 @@ static u64 fsetp_cbuf3(u32 predicate, u32 word) {
    none was chosen. c2 is bank 2's first words, c3 bank 3's (the predicates' constants), int_mask the slots of
    integer textures (ShaderInfo.tex_int_mask) */
 static int chosen_sample(const u64* program, int count, const u32 c2[4], const u32 c3[4], u64 int_mask,
-                         ShaderInfo* info, float* x, const char** why) {
+                         ShaderInfo* info, float* x, u32* xbits, const char** why) {
     size_t words = 0, slots;
     u64* code = guest_program(program, count, NULL, &slots);
     *why = "out of memory";
@@ -5779,11 +5779,16 @@ static int chosen_sample(const u64* program, int count, const u32 c2[4], const u
     for (int slot = 0; slot < info->ntex && SNX_VKB_TEX + slot < 64; slot++) {
         float texel = 1.0f + (float)info->tex[slot].cbuf_off;
         memcpy(&env.texel[SNX_VKB_TEX + slot][0], &texel, 4);
+        for (int component = 0; component < 4; component++)
+            for (int k = 0; k < 4; k++)
+                memcpy(&env.gather[SNX_VKB_TEX + slot][component][k], &texel, 4);
+        for (int k = 0; k < 3; k++) env.image_size[SNX_VKB_TEX + slot][k] = 1 + info->tex[slot].cbuf_off;
     }
     env.steps_max = 100000;
     *why = spv_eval(spv, words, &env);
     free(spv);
     memcpy(x, &env.out[0][0], 4);
+    if (xbits) memcpy(xbits, &env.out[0][0], 4);
     return !*why;
 }
 /* A predicated LOP.OR can be the only handle definition that reaches an unguarded TEX.B. Bind its texture and sampler
@@ -5802,7 +5807,7 @@ static void tex_b_predicated_handle_pair(void) {
         ShaderInfo info;
         const char* why;
         float x = -1.0f;
-        int ran = chosen_sample(program, 5, c2, c3, 0, &info, &x, &why);
+        int ran = chosen_sample(program, 5, c2, c3, 0, &info, &x, NULL, &why);
         if (!ran || x != (on == 1 ? 1.0f : 0.0f))
             fprintf(stderr, "predicated split handle, case %u: %s, %d slots, x %g\n", on, ran ? "ran" : why,
                     info.ntex, (double)x);
@@ -5814,6 +5819,133 @@ static void tex_b_predicated_handle_pair(void) {
             check(info.tex[0].bl_cbuf == 2 && info.tex[0].cbuf_off == 0 && info.tex[0].bl2 &&
                       info.tex[0].bl2_cbuf == 3 && info.tex[0].bl2_off == 1,
                   "a chosen split handle retains both constant buffer sources");
+    }
+}
+
+/* The other binds that take a handle in a register choose among the constant buffer handles that reach them, as TEX.B
+   does: a predicated pair of writes, one texture word and one sampler word, must give one texture whose slot the
+   runtime word selects. A form that the translator cannot choose still refuses: see bindless_multisample_order. */
+static void predicated_handle_pair_forms(void) {
+    const u64 load = 0x4c98078800070007ull; /* MOV R7, c[2][0]: the texture half */
+    const u64 pair_or = 0x4c47020800070006ull | (7ull << 8); /* LOP.OR R6, R7, c[2][...] */
+    const u64 under_p0 = ~(0xfull << 16);
+    const u64 sampler1 = (pair_or & under_p0 & ~(0x3fffull << 20)) | (1ull << 34) | (1ull << 20);
+    const u32 c2[4] = {0x00100001u, 0x00200002u, 0, 0};
+    const u32 c3[4] = {0x3f800000u, 0x00200000u, 0, 0};
+    {
+        /* TLD.B's handle is Rb, so Rb = R6 and the coordinates stay in R2 and R3 */
+        const u64 tld_b = (0xdd3a0007a0070200ull & ~(0xffull << 20)) | (6ull << 20);
+        const u64 program[] = {fsetp_cbuf3(0, 0), load, mov32i(6, 0x777), sampler1, tld_b};
+        ShaderInfo info;
+        const char* why;
+        float x = -1.0f;
+        int ran = chosen_sample(program, 5, c2, c3, 0, &info, &x, NULL, &why);
+        if (!ran || x != 1.0f)
+            fprintf(stderr, "predicated split handle TLD.B: %s, %d slots, x %g\n", ran ? "ran" : why, info.ntex,
+                    (double)x);
+        check(ran && info.ntex == 1 && x == 1.0f, "TLD.B selects the texture of a predicated split handle");
+        if (ran)
+            check(info.tex[0].bl_cbuf == 2 && info.tex[0].cbuf_off == 0 && info.tex[0].bl2 &&
+                      info.tex[0].bl2_cbuf == 3 && info.tex[0].bl2_off == 1,
+                  "a chosen TLD.B split handle retains both constant buffer sources");
+        if (ran) check(strstr(info.chosen_why, "TLD.B at ") != NULL, "the choice log names TLD.B and its use site");
+    }
+    {
+        /* a handle no candidate proves still refuses, and the refusal names the bind and where the register came from */
+        const u64 tld_b = (0xdd3a0007a0070200ull & ~(0xffull << 20)) | (6ull << 20);
+        const u64 program[] = {mov32i(6, 0x00100105u), tld_b};
+        ShaderInfo info;
+        size_t words = 0;
+        u32* code = translate(program, 2, ST_FS, &info, &words, 1);
+        if (code || !info.unsupported || strncmp(info.first_unsupported, "untracked texture handle R6 of TLD.B", sizeof "untracked texture handle R6 of TLD.B" - 1) ||
+            !strstr(info.first_unsupported, "MOV32I") || !strstr(info.first_unsupported, "0x100105"))
+            fprintf(stderr, "TLD.B refusal: '%s'\n", info.first_unsupported);
+        check(!code && info.unsupported && !strncmp(info.first_unsupported, "untracked texture handle R6 of TLD.B", sizeof "untracked texture handle R6 of TLD.B" - 1) &&
+                  strstr(info.first_unsupported, "MOV32I") && strstr(info.first_unsupported, "0x100105"),
+              "a TLD.B whose handle no candidate proves refuses, naming the bind and the write");
+        free(code);
+    }
+    static const struct {
+        const char* form;
+        u64 insn;
+        int runtime; /* 1 a float sample, 2 a size query, 3 a LOD query */
+    } forms[] = {
+        {"TXD.B", 0xde40000000000000ull | 7ull << 51 | 0xfull << 31 | 2ull << 28 | 12ull << 20 | 7ull << 16 | 6ull << 8, 1},
+        {"TLD4.B", 0xdec0000000000000ull | 7ull << 51 | 0xfull << 31 | 2ull << 28 | 6ull << 20 | 7ull << 16 | 2ull << 8, 1},
+        {"TMML.B", 0xdf60000000000000ull | 3ull << 31 | 2ull << 28 | 6ull << 20 | 7ull << 16 | 8ull << 8, 3},
+    };
+    for (size_t k = 0; k < sizeof forms / sizeof forms[0]; k++) {
+        const u64 program[] = {fsetp_cbuf3(0, 0), load, mov32i(6, 0x777), sampler1, forms[k].insn};
+        ShaderInfo info;
+        size_t words = 0;
+        u32* code = translate(program, 5, ST_FS, &info, &words, 1);
+        char what[96];
+        snprintf(what, sizeof what, "%s selects the texture of a predicated split handle", forms[k].form);
+        check_translated(code, &info, what);
+        check(code && info.ntex == 1 && info.tex[0].cbuf_off == 0 && info.tex[0].bl_cbuf == 2 && info.tex[0].bl2 &&
+                  info.tex[0].bl2_cbuf == 3 && info.tex[0].bl2_off == 1,
+              "a chosen split handle retains both constant buffer sources");
+        check(code && count_opcode(code, words, 169, 0xffffffffu) >= 1 &&
+                  count_opcode(code, words, 170, 0xffffffffu) >= 1,
+              "a chosen split handle compares the runtime word and selects by it");
+        snprintf(what, sizeof what, "the choice log names %s and its use site", forms[k].form);
+        check(code && strstr(info.chosen_why, forms[k].form) != NULL, what);
+        free(code);
+        /* the runtime word selects the candidate's value, and a word no candidate makes reads zero */
+        const u32 c3b[4] = {0, 0x00200000u, 0, 0}; /* P0 off: the predicated write does not reach the use */
+        for (int match = 0; match < 2; match++) {
+            ShaderInfo ran_info;
+            const char* ran_why;
+            float x = -1.0f;
+            u32 bits = 0xffffffffu;
+            int ran = chosen_sample(program, 5, c2, match ? c3 : c3b, 0, &ran_info, &x, &bits, &ran_why);
+            u32 want = match ? (forms[k].runtime == 1 ? 0x3f800000u : forms[k].runtime == 2 ? 1u : 256u) : 0u;
+            u32 got = forms[k].runtime == 1 ? bits : bits;
+            if (!ran) {
+                fprintf(stderr, "%s runtime case %d: %s\n", forms[k].form, match, ran_why);
+            } else if (forms[k].runtime == 1 && x != (match ? 1.0f : 0.0f)) {
+                fprintf(stderr, "%s runtime case %d: x %g\n", forms[k].form, match, (double)x);
+            } else if (forms[k].runtime != 1 && got != want) {
+                fprintf(stderr, "%s runtime case %d: 0x%x (0x%x expected)\n", forms[k].form, match, got, want);
+            }
+            check(ran && (forms[k].runtime == 1 ? x == (match ? 1.0f : 0.0f) : got == want),
+                  match ? "the runtime word selects the candidate's value" : "a word no candidate makes reads zero");
+        }
+    }
+    {
+        /* TXQ.B's handle is Ra, and only an earlier fetch names the texture's type: the query comes first, so the log
+           names TXQ.B, and the fetch after it binds the same slot. The type scan joins a handle that reaches a fetch
+           without a predicate, so an unpredicated split handle reads the same texture */
+        const u64 pair8 = (sampler1 & ~(0xfull << 16) & ~0xffull) | (7ull << 16) | 8;
+        const u64 tld8 = (0xdd3a0007a0070200ull & ~(0xffull << 20)) | (8ull << 20);
+        const u64 txq_b = (0xdf50000180470400ull & ~(0xffull << 8) & ~(0xfull << 31)) | (6ull << 8) | 0xfull << 31;
+        const u64 program[] = {fsetp_cbuf3(0, 0), load, sampler1, txq_b, pair8, tld8};
+        ShaderInfo info;
+        size_t words = 0;
+        u32* code = translate(program, 6, ST_FS, &info, &words, 1);
+        check_translated(code, &info, "TXQ.B selects the texture of a predicated split handle");
+        check(code && info.ntex == 1 && info.tex[0].bl2 && info.tex[0].bl2_cbuf == 3 && info.tex[0].bl2_off == 1,
+              "a chosen TXQ.B split handle retains both constant buffer sources");
+        check(code && count_opcode(code, words, 103, 0xffffffffu) >= 1,
+              "a chosen TXQ.B split handle queries the size of the chosen texture");
+        check(code && count_opcode(code, words, 169, 0xffffffffu) >= 4,
+              "a chosen TXQ.B split handle selects each queried component by the runtime word");
+        check(code && strstr(info.chosen_why, "TXQ.B") != NULL, "the choice log names TXQ.B and its use site");
+        free(code);
+        /* run it: the selected slot's size, 1, when the word matches, and 0 when it does not */
+        const u64 runtime[] = {fsetp_cbuf3(0, 0), load, pair8, tld8, sampler1, txq_b};
+        const u32 c3b[4] = {0, 0x00200000u, 0, 0};
+        for (int match = 0; match < 2; match++) {
+            ShaderInfo ran_info;
+            const char* ran_why;
+            float x = -1.0f;
+            u32 bits = 0xffffffffu;
+            int ran = chosen_sample(runtime, 6, c2, match ? c3 : c3b, 0, &ran_info, &x, &bits, &ran_why);
+            if (!ran || bits != (match ? 1u : 0u))
+                fprintf(stderr, "TXQ.B runtime case %d: %s, 0x%x\n", match, ran ? "ran" : ran_why, bits);
+            check(ran && bits == (match ? 1u : 0u),
+                  match ? "TXQ.B queries the size of the chosen texture" : "a TXQ.B word no candidate makes queries nothing");
+        }
     }
 }
 
@@ -5886,7 +6018,7 @@ static void tex_b_chosen_handle(void) {
         ShaderInfo info;
         const char* why;
         float x = -1.0f;
-        int ran = chosen_sample(program, 6, cases[i].c2, cases[i].c3, cases[i].int_mask, &info, &x, &why);
+        int ran = chosen_sample(program, 6, cases[i].c2, cases[i].c3, cases[i].int_mask, &info, &x, NULL, &why);
         if (!ran || x != cases[i].x)
             fprintf(stderr, "TEX.B chosen handle case %zu: %s, %d slots, x %g (%g expected)\n", i, ran ? "ran" : why,
                     info.ntex, (double)x, (double)cases[i].x);
@@ -5900,8 +6032,8 @@ static void tex_b_chosen_handle(void) {
         const char* why;
         float x;
         const char* note = one ? "" : "TEX.B at 88, R6: c[2][0x0], c[2][0x4]";
-        int ran = one ? chosen_sample(one_handle, 2, cases[0].c2, cases[0].c3, 0, &info, &x, &why)
-                      : chosen_sample(program, 6, cases[0].c2, cases[0].c3, 0, &info, &x, &why);
+        int ran = one ? chosen_sample(one_handle, 2, cases[0].c2, cases[0].c3, 0, &info, &x, NULL, &why)
+                      : chosen_sample(program, 6, cases[0].c2, cases[0].c3, 0, &info, &x, NULL, &why);
         if (!ran || info.chosen_tex != (u32)!one || strcmp(info.chosen_why, note))
             fprintf(stderr, "TEX.B note: %s, %u choosing, \"%s\" (\"%s\" expected)\n", ran ? "ran" : why,
                     info.chosen_tex, info.chosen_why, note);
@@ -5922,7 +6054,7 @@ static void tex_b_chosen_handle(void) {
         ShaderInfo info;
         const char* why;
         float x = -1.0f;
-        int ran = chosen_sample(looped, 9, words3, c3, 0, &info, &x, &why);
+        int ran = chosen_sample(looped, 9, words3, c3, 0, &info, &x, NULL, &why);
         if (!ran || x != 3.0f || info.ntex != 3)
             fprintf(stderr, "TEX.B in a loop with P0 %u: %s, %d slots, x %g after the second round (3 expected)\n", p0,
                     ran ? "ran" : why, info.ntex, (double)x);
@@ -5938,7 +6070,7 @@ static void tex_b_chosen_handle(void) {
     ShaderInfo info;
     const char* why;
     float x = -1.0f;
-    int ran = chosen_sample(after, 7, words3, c3, 0, &info, &x, &why);
+    int ran = chosen_sample(after, 7, words3, c3, 0, &info, &x, NULL, &why);
     if (!ran || x != 1.0f || info.ntex != 2)
         fprintf(stderr, "TEX.B before a BRK: %s, %d slots, x %g (1 expected)\n", ran ? "ran" : why, info.ntex,
                 (double)x);
@@ -6763,6 +6895,7 @@ int main(int argc, char** argv) {
     fragment_quad_reads();
     fragment_flow_derivatives();
     tex_b_predicated_handle_pair();
+    predicated_handle_pair_forms();
     tex_b_chosen_handle();
     bindless_multisample_order();
     helper_loop_exit();

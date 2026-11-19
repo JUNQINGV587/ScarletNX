@@ -448,6 +448,7 @@ static const char* run(Ev* e) {
                 break;
             case 87:   /* OpImageSampleImplicitLod */
             case 88:   /* OpImageSampleExplicitLod */
+            case 89:   /* OpImageSampleGrad */
             case 95: { /* OpImageFetch */
                 uint64_t b = e->ids[in[3]].v.c[0];
                 if (!b || b > 64) return "a sample of an image with no binding";
@@ -466,6 +467,14 @@ static const char* run(Ev* e) {
                 r->type = t;
                 r->v = (Val){{0}};
                 for (uint32_t k = 0; k < 4; k++) r->v.c[k] = e->env->gather[b - 1][component][k];
+                break;
+            }
+            case 105: { /* OpImageQueryLod: the test's two components are the image's texel */
+                uint64_t b = e->ids[in[3]].v.c[0];
+                if (!b || b > 64) return "a LOD query of an image with no binding";
+                r->kind = K_VALUE;
+                r->type = t;
+                r->v = (Val){{e->env->texel[b - 1][0], e->env->texel[b - 1][0], 0, 0}};
                 break;
             }
             case 103:   /* OpImageQuerySizeLod */
