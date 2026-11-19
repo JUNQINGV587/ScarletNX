@@ -1399,6 +1399,19 @@ static void memo_miss_log(u64 presents) {
         LOG("vulkan: draw_state_check=1: %llu textures kept over a target differed from those resolved again\n",
             (unsigned long long)d[MEMO_OVER_DIFFERS]);
 }
+/* fs_key's answers a present (VkDrawCounts.fs) */
+static void fs_count_log(const VkDrawCounts* n, const VkDrawCounts* w, u64 presents) {
+    double d[VK_FS_N];
+    for (int i = 0; i < VK_FS_N; i++) d[i] = (double)(n->fs[i] - w->fs[i]) / (double)presents;
+    LOG("vulkan: fragment keys a present: %.1f the draw before's, made again for %.1f none kept, %.1f another program "
+        "or state, %.1f other pools, %.1f a GPU write, %.1f a "
+        "result added, %.1f a storage image added, %.1f a target taken, %.1f the surface table, %.1f an epoch, %.1f a "
+        "present, %.1f other handles, %.1f a texture not quiet; not kept for %.1f programs with images and %.1f "
+        "textures the memo doesn't keep\n",
+        d[VK_FS_KEPT], d[VK_FS_NONE], d[VK_FS_PROGRAM], d[VK_FS_POOLS], d[VK_FS_GPU], d[VK_FS_RESULTS], d[VK_FS_IMAGES],
+        d[VK_FS_TAKE], d[VK_FS_SURFACES], d[VK_FS_EPOCH], d[VK_FS_PRESENT], d[VK_FS_HANDLES], d[VK_FS_QUIET],
+        d[VK_FS_UNKEPT_IMAGES], d[VK_FS_UNKEPT_TEXTURES]);
+}
 void vk_render_stats_log(void) {
     const VkDrawCounts* n = &g_stats.n;
     const VkDrawCounts* w = &g_stats.was;
@@ -1411,6 +1424,7 @@ void vk_render_stats_log(void) {
     u32 epoch = vk_ww_epoch();
     if (!presents) presents = 1;
     memo_miss_log(presents);
+    fs_count_log(n, w, presents);
     LOG("vulkan: draw states in the last %llu presents: %llu draws, %llu kept an earlier draw's (%llu the last "
         "draw's, %llu one from the table), %llu found one that a later check made again; %llu kept in the table "
         "(%llu putting another out), %llu groups hashed. A present: %.1f submissions (%.1f periodic), %.1f write "
@@ -2031,8 +2045,10 @@ static void rt_int_targets(const DsTargets* tg, u32* rm, u32* rs) {
    of one game's draws read other handle words than the draw before, and a sixth run another program. The key
    holds for most of the rest. Only where each slot's texture is one the memo keeps, not over a target (whose target's
    draws move none of these stamps), and each texture is quiet in this present and epoch, as vk_tex_recheck's quiet
-   check asks (a texture that isn't takes a full check at each lookup). Not while compute results are pending
-   (vk_tex_recheck orders the texture after them) nor with draw_state_check=1 */
+   check asks (a texture that isn't takes a full check at each lookup). A compute result pending over a slot's texture
+   or headers is one added since the key was made, which moves the results added (the stamp tex_resolve keeps a
+   texture by, pending_pages.c's count_add): those made the key land the results over them first. With
+   draw_state_check=1 the key is made again in full and compared (fs_key_check) */
 typedef struct {
     const DsState* ds;
     const VkSh* s0;
@@ -2064,6 +2080,19 @@ static int fs_last_keepable(const TexRes* res, int nt) {
     }
     return 1;
 }
+static void draw_differs(const char* what);
+/* draw_state_check=1: the last draw's key, which this draw would have kept, against the one made again in full: the
+   same variant and, slot by slot, the same headers and texture, or the difference is counted and warned of */
+static void fs_key_check(const FsLast* kept, const TexRes* res, int nt, const FsKey* fk) {
+    const FsKey* k = &kept->fk;
+    int same = k->tm == fk->tm && k->ts == fk->ts && k->dm == fk->dm && k->rect == fk->rect && k->rm == fk->rm &&
+               k->rs == fk->rs && k->df == fk->df && k->unfed == fk->unfed && k->minmax == fk->minmax &&
+               k->queried == fk->queried && !memcmp(k->query, fk->query, sizeof k->query);
+    for (int i = 0; i < nt && same; i++)
+        same = kept->res[i].t == res[i].t && !memcmp(kept->res[i].tic, res[i].tic, sizeof res[i].tic) &&
+               !memcmp(kept->res[i].tsc, res[i].tsc, sizeof res[i].tsc);
+    if (!same) draw_differs("fragment key or texture kept from the draw before");
+}
 /* resolves the textures of s0, the fragment program, into res (SH_MAXTEX entries, for stage_set), and fills fk with
    the variant they and the targets (rt_int, rt_sint) key. last_out: the generic outputs the stage before rasterization
    writes */
@@ -2079,15 +2108,29 @@ static void fs_key(const DsState* ds, const VkSh* s0, TexRes* res, u32 last_out,
               adds = atomic_load_explicit(&g_pend_any.adds, memory_order_relaxed) + vk_uma_writes(),
               img_adds = vk_gfx_image_adds(), take = vk_rt_take_gen();
     const u32 surf_epoch = atomic_load_explicit(&g_vk_surf_epoch, memory_order_relaxed), ww_epoch = vk_ww_epoch();
-    if (g_fs_last.valid && !atomic_load_explicit(&g_cs_any, memory_order_relaxed) && !g_settings.draw_state_check &&
-        g_fs_last.ds == ds && g_fs_last.s0 == s0 && g_fs_last.nt == nt && g_fs_last.last_out == last_out &&
-        g_fs_last.rt_int == rt_int && g_fs_last.rt_sint == rt_sint && g_fs_last.tex_pool == b->tex_pool &&
-        g_fs_last.smp_pool == b->smp_pool && g_fs_last.tex_max == b->tex_max && g_fs_last.smp_max == b->smp_max &&
-        g_fs_last.smp_mode == b->smp_mode && g_fs_last.tex_bank == b->tex_bank && g_fs_last.gw == gw &&
-        g_fs_last.adds == adds && g_fs_last.img_adds == img_adds && g_fs_last.take == take &&
-        g_fs_last.surf_epoch == surf_epoch && g_fs_last.ww_epoch == ww_epoch && g_fs_last.present == g_vk_present &&
-        !memcmp(g_fs_last.handles, handles, (size_t)nt * sizeof *handles) &&
-        fs_last_holds(g_fs_last.res, nt, ww_epoch)) {
+    const int why = !g_fs_last.valid ? VK_FS_NONE
+                    : g_fs_last.ds != ds || g_fs_last.s0 != s0 || g_fs_last.nt != nt ||
+                            g_fs_last.last_out != last_out || g_fs_last.rt_int != rt_int || g_fs_last.rt_sint != rt_sint
+                        ? VK_FS_PROGRAM
+                    : g_fs_last.tex_pool != b->tex_pool || g_fs_last.smp_pool != b->smp_pool ||
+                            g_fs_last.tex_max != b->tex_max || g_fs_last.smp_max != b->smp_max ||
+                            g_fs_last.smp_mode != b->smp_mode || g_fs_last.tex_bank != b->tex_bank
+                        ? VK_FS_POOLS
+                    : g_fs_last.gw != gw                                               ? VK_FS_GPU
+                    : g_fs_last.adds != adds                                           ? VK_FS_RESULTS
+                    : g_fs_last.img_adds != img_adds                                   ? VK_FS_IMAGES
+                    : g_fs_last.take != take                                           ? VK_FS_TAKE
+                    : g_fs_last.surf_epoch != surf_epoch                               ? VK_FS_SURFACES
+                    : g_fs_last.ww_epoch != ww_epoch                                   ? VK_FS_EPOCH
+                    : g_fs_last.present != g_vk_present                                ? VK_FS_PRESENT
+                    : memcmp(g_fs_last.handles, handles, (size_t)nt * sizeof *handles) ? VK_FS_HANDLES
+                    : !fs_last_holds(g_fs_last.res, nt, ww_epoch)                      ? VK_FS_QUIET
+                                                                                       : VK_FS_KEPT;
+    g_stats.n.fs[why]++;
+    const int check = why == VK_FS_KEPT && g_settings.draw_state_check;
+    FsLast kept;
+    if (check) kept = g_fs_last;
+    if (why == VK_FS_KEPT && !check) {
         for (int i = 0; i < nt; i++) {
             res[i] = g_fs_last.res[i];
             /* a target read whole is noted read on each draw, as tex_resolve's hit does. Not a crop of one (a copy
@@ -2154,9 +2197,13 @@ static void fs_key(const DsState* ds, const VkSh* s0, TexRes* res, u32 last_out,
     u32 signed_images;
     fk->rm |= image_variant(ds, 4, s0, &signed_images) << 8;
     fk->rs |= signed_images << 8;
+    if (check) fs_key_check(&kept, res, nt, fk);
     g_fs_last = (FsLast){0};
     /* image_variant reads the image bindings, which the key doesn't hold: a program with images is keyed each draw */
-    if (s0->si.nimg || !fs_last_keepable(res, nt)) return;
+    if (s0->si.nimg || !fs_last_keepable(res, nt)) {
+        g_stats.n.fs[s0->si.nimg ? VK_FS_UNKEPT_IMAGES : VK_FS_UNKEPT_TEXTURES]++;
+        return;
+    }
     g_fs_last.ds = ds;
     g_fs_last.s0 = s0;
     g_fs_last.nt = nt;
@@ -2420,7 +2467,6 @@ VkSampler vk_tex_bind_sampler(const u32* tsc, const u32* tic, const ShTex* st, i
     return vk_sampler(tc, raise, num != 0);
 }
 
-static void draw_differs(const char* what);
 /* the way of g_tex_memo that x's headers were kept in, while it still keeps them: NULL for none */
 static TexMemo* tex_memo_of(const TexRes* x) {
     if (!x->memo || x->memo > TEX_MEMO_WAYS << TEX_MEMO_SET_BITS) return NULL;
