@@ -52,6 +52,29 @@ mkdir "$appdir"
 cp -a --reflink=auto "$port/." "$appdir/"
 rm -f "$appdir"/*.log "$appdir"/*.jitcache
 
+# Pin the settings a port needs in the game's .ini. The runtime writes this file back with
+# defaults, and a default of English, or of the other face button labels, would undo the
+# launcher's arguments. Chinese (Simplified) is language=15.
+ini=$appdir/$id.ini
+[ -f "$ini" ] || printf '[Game]\n' >"$ini"
+pins='language=15
+gamepad_face_labels=1
+extract=1
+emulated_cores=0
+touch_in_tv=1
+docked=1
+resolution=3
+screen_fit=0
+fps_limit=240'
+awk -v pins="$pins" '
+BEGIN{n=split(pins,p,"\n"); for(i=1;i<=n;i++){split(p[i],kv,"="); want[kv[1]]=kv[2]; order[i]=kv[1]}}
+{ lines[NR]=$0; if ($0=="[Game]" && !game) game=NR }
+END{
+  for(i=1;i<=NR;i++){ for(j=1;j<=n;j++){ k=order[j]; if (index(lines[i], k "=")==1){ lines[i]=k "=" want[k]; seen[k]=1 } } }
+  for(i=1;i<=NR;i++){ print lines[i]; if(i==game) for(j=1;j<=n;j++){ k=order[j]; if(!(k in seen)){ print k "=" want[k]; seen[k]=1 } } }
+  for(j=1;j<=n;j++){ k=order[j]; if(!(k in seen)) print k "=" want[k] }
+}' "$ini" >"$ini.new" && mv "$ini.new" "$ini"
+
 cat > "$appdir/play-$slug.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail

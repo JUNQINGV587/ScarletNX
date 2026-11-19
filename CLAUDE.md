@@ -120,6 +120,13 @@ returns no add-on at all for a name that is not one, so a port named after the g
 AppImage, the launcher and the desktop entry carry the display name; `scripts/make-port-appimage.sh` builds them from
 a folder that follows this.
 
+A port starts in Chinese (Simplified). A game reads its language from the console, so the port's `.ini` names
+`language=15`, the setting value for Chinese (Simplified). `scripts/make-port-appimage.sh` pins that setting, and the
+rest that a port needs, in the `.ini` it puts in the AppImage: the Switch face button labels (`gamepad_face_labels=1`),
+`extract=1`, `emulated_cores=0`, `touch_in_tv=1`, `docked=1`, `resolution=3`, `screen_fit=0` and `fps_limit=240`. The
+runtime writes the file back with defaults, so a port that leaves these out comes up in English with the other face
+buttons, whatever its launcher passes.
+
 On a Bazzite handheld InputPlumber takes the built-in pad for itself: it matches the pad's evdev joystick property and
 grabs the node, and version 0.84.0 on a Claw A8 then forwards nothing to the virtual pad it publishes, so a game that
 reads the pad through SDL sees a connected controller that reports no button. Hide that one node from InputPlumber
