@@ -179,18 +179,14 @@ int snx_extracted_game(const char* path) {
     }
     return found;
 }
-int snx_switch_dump_name(const char* name) {
-    static const char* const dumps[] = {".xci", ".nsp", ".dxci", ".dnsp", ".xcz", ".nsz"};
-    size_t i;
-    for (i = 0; i < sizeof dumps / sizeof *dumps; i++)
-        if (snx_ends_with_nocase(name, dumps[i])) return 1;
-    return 0;
-}
 const char* snx_source_kind(const char* source) {
+    static const char* const dumps[] = {".xci", ".nsp", ".dxci", ".dnsp", ".nro"};
+    size_t i;
     if (!source || snx_is_dir(source)) return "folder";
     if (snx_is_file(source)) return "dump";
-    /* not there: by its name */
-    return snx_switch_dump_name(source) || snx_ends_with_nocase(source, ".nro") ? "dump" : "folder";
+    for (i = 0; i < sizeof dumps / sizeof *dumps; i++) /* not there: by its name */
+        if (snx_ends_with_nocase(source, dumps[i])) return "dump";
+    return "folder";
 }
 SnxRomfs snx_romfs_state(const char* folder, const char* name) {
     char *data = snx_format("%s/%s_data", folder, name), *part;
