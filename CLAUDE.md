@@ -110,8 +110,9 @@ the port is complete, make the AppImage, install it, and run that copy from then
 game's `_code.so`, the game's extracted folder and each add-on's `system/archives/<TITLE ID>.romfs`, so the handheld
 copies a single file over and runs it: the first run installs that payload beside `~/Applications/ScarletNX/` and
 starts the game from there, later runs go straight to the installed copy. A port that leaves an add-on out is not
-finished. A port reads extracted data only under `--extract-container`, so the launcher the AppImage installs passes
-it.
+finished. The AppImage also carries the game's icon (its data's `icon.jpg` as `<Game>.png`), and the launcher it
+installs gives the desktop entry that icon. A port reads extracted data only under `--extract-container`, so the
+launcher the AppImage installs passes it.
 
 
 - The Bash tool runs **zsh**. `$t:s` is a zsh modifier, so write `"${t}:s"`. The scripts in the repo use bash
