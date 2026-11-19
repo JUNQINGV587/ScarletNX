@@ -157,6 +157,11 @@
         "url": "https://raw.githubusercontent.com/scarletnx/ScarletNX/777f377013806bc4cdbbc0306eca6e7e9c835df2/dist/fonts/NotoSansTC-Subset.ttf",
         "version": "777f377013806bc4cdbbc0306eca6e7e9c835df2"
     },
+    "online-retro": {
+        "hash": "b67db6754bdade46a88dcb0d811c307a2b0176be33c074f1bab5abba88e0eb25ff0a2cc813772aef34c53cc7a83340b1afcb992aeedfd582a93d913810fdc9e0",
+        "repo": "scarletnx/online-retro",
+        "version": "v0.1.0"
+    },
     "openssl": {
         "artifact": "%VERSION%.tar.gz",
         "hash": "cc424e5f8470a47e2c7345e95516a6a0e2a5eee0fe4feef3de3d39b75071b1f42f4a2388d1c8926652bba4082108b7050ddc30b274543b62937c46bdcad3b3c0",

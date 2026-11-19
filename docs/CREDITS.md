@@ -50,6 +50,7 @@ Generated modules include runtime ABI code. Game assets, keys and firmware are e
 | Tracy (the profiler client, built only with `SNX_TRACY`) | BSD-3-Clause |
 | [CPMUtil](https://git.crueter.xyz/CMake/CPMUtil), crueter's, with its trimmed CPM.cmake (`cmake/cpmutil`, as Eden carries them, with four changes of ours: the configure fetches the third-party packages through it, not shipped) | LGPL-3.0-or-later ([text](../cmake/cpmutil/LICENSE)), CPM.cmake's MIT (in `cmake/cpmutil/CPM.cmake`) |
 | ENet / zstd (an Eden room's connection and its datagrams, `src/common/network/net_room.c`) | MIT / BSD-3-Clause |
+| [online-retro](https://github.com/scarletnx/online-retro) 0.1.0 (the DS's WFC services and its firmware's connection slot, `src/nds/hle/pxi.c`) | GPL-3.0-or-later |
 | miniz 3.1.2 (the zip around the launcher's Share Log, `src/gui/logzip.c`) | MIT |
 | libdeflate 1.26 (every deflate: Share Log's, the Vita driver's VPKs and eboot segments, the Android driver's APKs) | MIT |
 | HarfBuzz 15.0.0 (the Android driver's text shaping, `src/android/hwui/text.c`) | MIT ("Old MIT") |

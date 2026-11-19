@@ -125,6 +125,23 @@ if(SNX_BUILD_NX OR SNX_BUILD_3DS OR BUILD_TESTING)
     endif()
 endif()
 
+# online-retro (GPL-3.0-or-later, scarletnx/online-retro): the online services of the DS and the 3DS through their
+# communities' replacements, the DS's WFC services and its firmware's connection slot, the 3DS's NASC login on Pretendo
+# Network. Its sources built here as the other packages' are; a copy of it elsewhere builds in its place with
+# -Donline-retro_CUSTOM_DIR=PATH (CPMUtil's)
+if(SNX_BUILD_NDS OR SNX_BUILD_3DS OR BUILD_TESTING)
+    AddJsonPackage(NAME online-retro DOWNLOAD_ONLY FORCE_BUNDLED_PACKAGE ON)
+    file(GLOB snx_online_retro_sources "${online-retro_SOURCE_DIR}/src/*.c")
+    add_library(snx_online_retro STATIC ${snx_online_retro_sources})
+    target_include_directories(snx_online_retro PUBLIC "${online-retro_SOURCE_DIR}/include")
+    set_target_properties(snx_online_retro PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
+                                                      POSITION_INDEPENDENT_CODE ON)
+    if(WIN32)
+        target_link_libraries(snx_online_retro PUBLIC ws2_32)
+    endif()
+    snx_quiet(snx_online_retro)
+endif()
+
 # the Vita driver (src/vita), which the root CMakeLists.txt adds when it is built and the build isn't tools-only: its
 # loader's OpenSSL, its renderer's Vulkan headers and volk, its movies' FFmpeg and its window's SDL3
 if(SNX_BUILD_VITA AND NOT SNX_TOOLS_ONLY)
