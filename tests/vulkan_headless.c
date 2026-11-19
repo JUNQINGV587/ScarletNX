@@ -8438,6 +8438,7 @@ static int run_headless(int argc, char** argv) {
         if (!strcmp(name, "publish") && ++ran) CHECK(!check_uma_publish());
         if (!strcmp(name, "publish_notraps") && ++ran) CHECK(!check_uma_publish_notraps());
         if (!strcmp(name, "dispatch") && ++ran) CHECK(!check_uma_dispatch());
+        if (!strcmp(name, "dispatch_atlas") && ++ran) CHECK(!check_uma_dispatch_atlas());
         if (!strcmp(name, "dispatch_open") && ++ran) CHECK(!check_uma_dispatch_open());
         if (!strcmp(name, "texture_pending") && ++ran) CHECK(!check_uma_texture_pending());
         if (!strcmp(name, "dispatch_constants") && ++ran) CHECK(!check_uma_dispatch_constants());
@@ -8491,6 +8492,7 @@ static int run_headless(int argc, char** argv) {
         CHECK(!check_uma_publish());
         CHECK(!check_uma_publish_notraps());
         CHECK(!check_uma_dispatch());
+        CHECK(!check_uma_dispatch_atlas());
         CHECK(!check_uma_dispatch_open());
         CHECK(!check_uma_texture_pending());
         CHECK(!check_uma_dispatch_constants());
@@ -8754,6 +8756,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_uma_publish());
     CHECK(!check_uma_publish_notraps());
     CHECK(!check_uma_dispatch());
+    CHECK(!check_uma_dispatch_atlas());
     CHECK(!check_uma_dispatch_open());
     CHECK(!check_uma_texture_pending());
     CHECK(!check_uma_dispatch_constants());
