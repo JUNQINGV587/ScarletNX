@@ -64,7 +64,7 @@ extract=1
 emulated_cores=0
 touch_in_tv=1
 docked=1
-resolution=3
+resolution=1
 screen_fit=0
 fps_limit=240'
 # A virtual pad that repeats the handheld's own (InputPlumber's, Steam Input's) connects first, and takes player 1
@@ -85,7 +85,7 @@ cat > "$appdir/play-$slug.sh" <<EOF
 set -euo pipefail
 HERE="\$(cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")" && pwd)"
 export LD_LIBRARY_PATH="\$HERE/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-exec "\$HERE/$id" --extract-container --fullscreen=1 --resolution=3 --docked=1 --fps-limit=240 --gamepad-face-labels=1 --screen-fit=0 --emulated-cores=0 --touch-in-tv=1 "\$@"
+exec "\$HERE/$id" --extract-container --fullscreen=1 --resolution=1 --docked=1 --fps-limit=240 --gamepad-face-labels=1 --screen-fit=0 --emulated-cores=0 --touch-in-tv=1 "\$@"
 EOF
 chmod +x "$appdir/play-$slug.sh"
 

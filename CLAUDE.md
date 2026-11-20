@@ -83,13 +83,15 @@ rules that sessions get wrong, and it points to the skills that hold the procedu
 
 ### The standard a port of a Switch game runs at
 
-A port runs with the TV mode's display and a handheld's input. The guest frame is 1920x1080. The internal
-resolution is 3x that, 5760x3240, and `screen_fit` keeps the bars a 16:10 screen shows around it. The runtime also
-tells the game it is in handheld mode, so its touch screen reaches it. The launcher passes `--docked=1 --resolution=3`.
-The runtime defaults are `docked=1` and `touch_in_tv=1`, so a game without a launcher gets the same.
+A port runs with the TV mode's display and a handheld's input. The guest frame is 1920x1080. The launcher passes
+`--docked=1 --resolution=1`, so the game draws at the console's own shape, and `screen_fit` keeps the bars that a
+16:10 screen shows around it. The runtime also tells the game it is in handheld mode, so its touch screen reaches
+it. The runtime defaults are `docked=1` and `touch_in_tv=1`, so a game without a launcher gets the same.
 
-Two settings give the console's own answer when a game needs it. `touch_in_tv=0` gives the game TV mode without a
-touch screen. `--resolution=1` gives the console's 1080p picture. A port that changes either one states why, in its
+A higher `resolution` is an option, not the standard. 2 is four times the pixels and 3 is nine times. A port that
+asks for more states why, in its launcher and in the note on that port.
+
+`touch_in_tv=0` gives a game that needs it TV mode without a touch screen. A port that sets it states why, in its
 launcher and in the note on that port.
 
 ### How a port is shipped
@@ -124,9 +126,17 @@ from a folder that follows this rule.
 A port starts in Chinese (Simplified). A game reads its language from the console, so the port's `.ini` names
 `language=15`, the value for Chinese (Simplified). `scripts/make-port-appimage.sh` pins that setting in the `.ini`
 that it puts in the AppImage. It pins the rest that a port needs there too: the Switch face button labels
-(`gamepad_face_labels=1`), `extract=1`, `emulated_cores=0`, `touch_in_tv=1`, `docked=1`, `resolution=3`,
+(`gamepad_face_labels=1`), `extract=1`, `emulated_cores=0`, `touch_in_tv=1`, `docked=1`, `resolution=1`,
 `screen_fit=0` and `fps_limit=240`. The runtime writes the file back with defaults. A port that leaves these out
 comes up in English with the other face buttons, whatever its launcher passes.
+
+`resolution` is the shape of the game's rendering, not a display mode. 1 is the console's own shape, 2 is twice
+across and down (four times the pixels), and 3 is nine times the pixels. A port pins 1. One scene of a game drew
+16.3 FPS at 3 and 30.3 at 1, with the same driver.
+
+No port pins a frame limit of `game`, or any limit under 240. `game` is the pace of the console's own version, which
+is 30 for a game made for 30. `fps_limit=240` lets a game go as fast as it asks. A game that holds itself to 30
+keeps 30, whatever the limit. One game stayed at 30.3 frames a second with `fps_limit=0` and `vsync=0`.
 
 On a Bazzite handheld InputPlumber takes the built-in pad for itself. It matches the pad's evdev joystick property
 and grabs the node. Version 0.84.0 on a Claw A8 then forwards nothing to the virtual pad that it publishes. A game
