@@ -455,8 +455,8 @@ static void test_dropped_keys_old(void) {
         CHECK(strstr(text, line) && strstr(text, "\n[Deprecated]\n") < strstr(text, line));
     }
     CHECK(strstr(g_test.said, "keeps 11 keys this version does not use (nvn_direct, nvn_verify, nvn_trace, mme_hle, "
-                              "mme_jit, mme_verify, astc_background_threads, press, press_at, mesh_draws, hmma_astat), under "
-                              "[Deprecated]"));
+                              "mme_jit, mme_verify, astc_background_threads, press, press_at, mesh_draws, "
+                              "hmma_astat), under [Deprecated]"));
     free(text);
     g_test.write = 0;
 }

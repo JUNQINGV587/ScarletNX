@@ -107,42 +107,46 @@ While a port is in debug, it runs from `~/Applications/ScarletNX/scarletnx-abi19
 the port is complete, make the AppImage, install it, and run that copy from then on.
 
 **An installed port is one AppImage that carries the game and every add-on.** The AppImage holds the runtime, the
-game's `_code.so`, the game's extracted folder and each add-on's `system/archives/<TITLE ID>.romfs`, so the handheld
-copies a single file over and runs it: the first run installs that payload beside `~/Applications/ScarletNX/` and
-starts the game from there, later runs go straight to the installed copy. A port that leaves an add-on out is not
-finished. The AppImage also carries the game's icon (its data's `icon.jpg` as `<Game>.png`), and the launcher it
-installs gives the desktop entry that icon. A port reads extracted data only under `--extract-container`, so the
-launcher the AppImage installs passes it.
+game's `_code.so`, the game's extracted folder and each add-on's `system/archives/<TITLE ID>.romfs`. The handheld
+copies one file over and runs it. The first run installs that payload beside `~/Applications/ScarletNX/` and starts
+the game from there. Later runs go straight to the installed copy. A port that leaves out an add-on does not pass.
 
-The program keeps the game's title ID as its name, and so do its `_code.so`, `_data`, `<TITLE ID>_<ADD ON>_data`
-folders and `.ini`: `snx_addons_parse()` (common/utilities/game_ini.c) reads the game's own title ID from the name and
-returns no add-on at all for a name that is not one, so a port named after the game plays without any DLC. Only the
-AppImage, the launcher and the desktop entry carry the display name; `scripts/make-port-appimage.sh` builds them from
-a folder that follows this.
+The AppImage also carries the game's icon (its data's `icon.jpg` as `<Game>.png`). The launcher that it installs
+gives the desktop entry that icon. A port reads extracted data only under `--extract-container`, so the installed
+launcher passes it.
+
+The program keeps the game's title ID as its name. Its `_code.so`, `_data`, `<TITLE ID>_<ADD ON>_data` folders and
+`.ini` do the same. `snx_addons_parse()` (common/utilities/game_ini.c) reads the game's own title ID from the name.
+It returns no add-on for a name that is not one, so a port named after the game plays without any DLC. Only the
+AppImage, the launcher and the desktop entry carry the display name. `scripts/make-port-appimage.sh` builds them
+from a folder that follows this rule.
 
 A port starts in Chinese (Simplified). A game reads its language from the console, so the port's `.ini` names
-`language=15`, the setting value for Chinese (Simplified). `scripts/make-port-appimage.sh` pins that setting, and the
-rest that a port needs, in the `.ini` it puts in the AppImage: the Switch face button labels (`gamepad_face_labels=1`),
-`extract=1`, `emulated_cores=0`, `touch_in_tv=1`, `docked=1`, `resolution=3`, `screen_fit=0` and `fps_limit=240`. The
-runtime writes the file back with defaults, so a port that leaves these out comes up in English with the other face
-buttons, whatever its launcher passes.
+`language=15`, the value for Chinese (Simplified). `scripts/make-port-appimage.sh` pins that setting in the `.ini`
+that it puts in the AppImage. It pins the rest that a port needs there too: the Switch face button labels
+(`gamepad_face_labels=1`), `extract=1`, `emulated_cores=0`, `touch_in_tv=1`, `docked=1`, `resolution=3`,
+`screen_fit=0` and `fps_limit=240`. The runtime writes the file back with defaults. A port that leaves these out
+comes up in English with the other face buttons, whatever its launcher passes.
 
-On a Bazzite handheld InputPlumber takes the built-in pad for itself: it matches the pad's evdev joystick property and
-grabs the node, and version 0.84.0 on a Claw A8 then forwards nothing to the virtual pad it publishes, so a game that
-reads the pad through SDL sees a connected controller that reports no button. Hide that one node from InputPlumber
-instead of stopping it: `scripts/pad-udev-rule.sh` (run as root on the handheld) writes a udev rule that clears
-`ID_INPUT_JOYSTICK` for the pad, which keeps InputPlumber's mouse, keyboard and touchpad devices in place while SDL,
-which does not need the property, reads the pad directly.
+On a Bazzite handheld InputPlumber takes the built-in pad for itself. It matches the pad's evdev joystick property
+and grabs the node. Version 0.84.0 on a Claw A8 then forwards nothing to the virtual pad that it publishes. A game
+that reads the pad through SDL sees a connected controller with no button. Hide that one node from InputPlumber
+rather than stop it. `scripts/pad-udev-rule.sh` (run as root on the handheld) writes a udev rule that clears
+`ID_INPUT_JOYSTICK` for the pad.
+
+InputPlumber keeps its mouse, keyboard and touchpad devices. SDL does not need the property, and it reads the pad
+directly.
 
 The same handhelds publish a virtual pad that repeats the one they have (InputPlumber's `Microsoft X-Box One Elite 2
-pad`, Steam Input's), and SDL lists the virtual one first. With `gamepad_assign=1` (the console's: each controller that
-connects takes the lowest free player) **the virtual pad takes player 1**, and the presses the game's menu reads go out
-as player 2: every button does nothing, and the log says why. `input: P1 (Xbox One Elite 2 Controller) ... input: P2
-(Micro Star International Xbox360 Controller for Windows)` means the hardware pad is P2. A port pins player 1 to the
-pad it has: `gamepad_assign=0` (Manual: each player's controller as `gamepad_p<N>_device` names it, the next to connect
-where it names none) and `gamepad_p1_device=<the GUID the log prints>`. `scripts/make-port-appimage.sh` pins
-`gamepad_assign=0`, and `SNX_PORT_PAD=<GUID>` pins player 1's. When a game ignores every press, check `input: P1` in its
-log before anything else: the pad is usually connected and reading fine, as the wrong player.
+pad`, Steam Input's). SDL lists the virtual one first. With `gamepad_assign=1` (the console's: each controller that
+connects takes the lowest free player) **the virtual pad takes player 1**. The presses that the game's menu reads
+then go out as player 2, so every button does nothing. `input: P1 (Xbox One Elite 2 Controller) ... input: P2 (Micro
+Star International Xbox360 Controller for Windows)` means the hardware pad is P2.
+
+A port pins player 1 to the pad that it has. Two settings do it: `gamepad_assign=0` (Manual: each player's
+controller as `gamepad_p<N>_device` names it) and `gamepad_p1_device=<the GUID the log prints>`.
+`scripts/make-port-appimage.sh` pins `gamepad_assign=0`, and `SNX_PORT_PAD=<GUID>` pins player 1's. When a game
+ignores every press, check `input: P1` in its log first.
 
 
 - The Bash tool runs **zsh**. `$t:s` is a zsh modifier, so write `"${t}:s"`. The scripts in the repo use bash
@@ -297,16 +301,16 @@ flourishes. This rule does not apply to code comments. The Claude files follow A
 ## Lessons that cost a session
 
 - A game's menu ignores every press while its log shows the pad connected: check `input: P1` first. On a handheld a
-  virtual pad (InputPlumber's, Steam Input's) connects before the built-in one and takes player 1, so the presses the
-  menu reads arrive as player 2. "How a port is shipped" gives the pin that keeps player 1 with the pad.
-- A menu pressed from a session with no window focus never sees the press, and a scripted pad sends its d-pad the
-  wrong way. Both look like a game whose input is broken. Start the game with `SDL_VIDEODRIVER=x11` and activate its
-  window (`xdotool search --name "Civilization VI" windowactivate --sync`) before pressing anything: SDL drops gamepad
-  events of an unfocused window unless `gamepad_background=1`, and mouse clicks on a Wayland window only highlight.
-  Then make the scripted pad the pad of player 1 (`gamepad_assign=0` and `gamepad_p1_device` of its GUID, see "How a
-  port is shipped"), because player 2 reaches the menu of a game that assigns its controllers to one player. A d-pad
-  read through SDL's `dpdown:h0.4` is the hat axis: send `EV_ABS`/`ABS_HAT0Y` = 1, not `BTN_DPAD_DOWN`, or the menu
-  never moves while every other button works.
+  virtual pad (InputPlumber's, Steam Input's) connects before the built-in one and takes player 1. The presses the
+  menu reads then arrive as player 2. The port section above gives the pin that keeps player 1 with the pad.
+- A menu fed from a session with no window focus never sees the press. A scripted pad sends its d-pad the wrong
+  way. Both look like a game whose input is broken. Start the game with `SDL_VIDEODRIVER=x11` and activate its
+  window (`xdotool search --name "Civilization VI" windowactivate --sync`) before the first press. SDL drops gamepad
+  events of an unfocused window unless `gamepad_background=1`. A mouse click on a Wayland window only highlights.
+- A d-pad read through SDL's `dpdown:h0.4` is the hat axis: send `EV_ABS`/`ABS_HAT0Y` = 1, not `BTN_DPAD_DOWN`.
+  Otherwise the menu never moves while every other button works. For a scripted pad, give it the player 1 pad:
+  `gamepad_assign=0` and `gamepad_p1_device` of its GUID (see the port section above). Player 2 reaches no menu of a
+  game that assigns its controllers to one player.
 - A driver that crashes on a call of the runtime reports no frame of the runtime, only its own. Run the game with
   `vk_validation=1`, and the validation layer names the call and the rule it breaks. It found a pipeline library part
   made on a device without `VK_EXT_graphics_pipeline_library`, which no log line named.
@@ -362,14 +366,3 @@ flourishes. This rule does not apply to code comments. The Claude files follow A
   set of each shader's own bindings did not stop it, and neither did `MVK_CONFIG_USE_METAL_ARGUMENT_BUFFERS=0`
   (`docs/hosts/apple.md` has the rates). Count the draws that a run skips before you trust a workaround. The runs that did
   not lock up skipped the over-limit draws. Measure an intermittent GPU fault over 8 runs of one route on one save.
-- An Ounce game does not use Maxwell shaders. Its shaders are SM86 SASS, with 128-bit instructions.
-  A previous session matched Maxwell tables against the wrong bytes. It recorded "Maxwell SASS" as a fact, and that
-  was wrong.
-
-  Before you trust a match of an ISA, find the end of a program in the bytes. On SM86, EXIT is `0x794d`, and a BRA
-  to itself comes after it. `docs/platforms/nx/ounce.md` has the facts of the Ounce that the captures prove.
-- `g_frames` counts presents, not frames with content. A hash that changes does not show that a frame has content.
-  Look at the count of draws and skipped draws in the log, or take a screenshot.
-- An Ounce game calls about 170 NVN functions that the Switch does not have. `tools/nvn_missing.py work/Game`
-  lists the functions that `nvn.hook` does not implement for the API version of the game. Read the body of each
-  function in the driver before you write its handler. Many are setters that store at a fixed offset.

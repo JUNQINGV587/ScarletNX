@@ -7,7 +7,12 @@
 #include "nx/runtime/cli.h"
 #include "nx/runtime/ini.h"
 #include "nx/runtime/options.h"
+#include "common/gpu/gl/gl_program.h"
+#include "common/gpu/gl/gl_state.h"
+#include "glslc/glslc.h"
+#include "nx/gpu/gl/gl_host_program.h"
 #include "nx/gpu/maxwell/draw_state.h"
+#include "nx/gpu/vk/host_program.h"
 #include "nx/gpu/guest_textures.h"
 #include "nx/gpu/renderer.h"
 #include "common/gpu/vk/vk_common.h"
@@ -5320,7 +5325,7 @@ static int check_resident_texture_in_flight(void) {
    rings stay far below what the copies took in all; the last copy's bytes land */
 static int check_snapshot_uploads(void) {
     enum { LINE = 4096, LINES = 128, COPIES = 512 };
-    GpuDmaOp o;
+    GpuDmaOp o = {0};
     u8* bytes = malloc((size_t)LINE * LINES);
     u64 before, most = 0, saved_budget;
     CHECK(bytes);
@@ -5328,7 +5333,6 @@ static int check_snapshot_uploads(void) {
     vk_frame_next();
     saved_budget = vk_mem_budget_cap(64u << 20);
     before = vk_ring_bytes();
-    memset(&o, 0, sizeof o);
     o.width = o.line_in = o.line_out = LINE;
     o.lines = LINES;
     o.src = pitch_side(0, LINE);
@@ -7437,6 +7441,7 @@ static void results_copied(u64 cpu, u64 len) { vk_own_cpu_touched(cpu, len); }
 #include "vulkan_shared_clamp.inc"
 #include "vulkan_compute_arena.inc"
 #include "vulkan_rt_aside.inc"
+#include "vulkan_so_note.inc"
 #include "vulkan_index_draws.inc"
 #include "vulkan_polygon_lines.inc"
 #include "vulkan_pass_breaks.inc"
@@ -7682,6 +7687,7 @@ static int check_hmma_file_key(void) {
 #include "vulkan_nvn_copy_conversions.inc"
 #include "vulkan_nvn_xfb.inc"
 #include "vulkan_nvn_state.inc"
+#include "vulkan_host_program.inc"
 #include "vulkan_maxwell_fixed.inc"
 #include "vulkan_nvn_events.inc"
 #include "vulkan_nvn_subroutines.inc"
@@ -7838,6 +7844,15 @@ static int check_vk12_way(void) {
     CHECK(vk_api_setting("auto", &cap, why, sizeof why) && cap == 0);
     CHECK(vk_api_setting("1.2", &cap, why, sizeof why) && cap == VK_API_VERSION_1_2);
     CHECK(!vk_api_setting("1.3", &cap, why, sizeof why) && !strcmp(why, "vk_api=1.3 is not auto or 1.2"));
+    /* a swapchain the driver could not make, said with the device, its driver and the result's name and number */
+    {
+        char said[300];
+        vk_swapchain_failure(said, sizeof said, "Mali-G720 MC7", "panvk", VK_ERROR_INVALID_EXTERNAL_HANDLE);
+        CHECK(!strcmp(said, "the swapchain could not be made on Mali-G720 MC7 (panvk): "
+                            "VK_ERROR_INVALID_EXTERNAL_HANDLE (-1000072003)"));
+        vk_swapchain_failure(said, sizeof said, "Mali-G720 MC7", "", VK_ERROR_SURFACE_LOST_KHR);
+        CHECK(strstr(said, "(its driver): VK_ERROR_SURFACE_LOST_KHR (-1000000000)") != NULL);
+    }
     CHECK(!g_vk.api_cap == !strcmp(g_settings.vulkan_api, "auto"));
     if (g_vk.api_cap) {
         CHECK(!strcmp(g_settings.vulkan_api, "1.2"));
@@ -8754,6 +8769,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_nvn_stencil_masks());
     CHECK(!check_nvn_xfb());
     CHECK(!check_nvn_fixed_state());
+    CHECK(!check_host_program());
     CHECK(!check_maxwell_point_size());
     CHECK(!check_maxwell_depth_bounds());
     CHECK(!check_maxwell_depth_range());
@@ -8876,6 +8892,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_dma_bands());
     CHECK(!check_rt_superseded());
     CHECK(!check_rt_aside());
+    CHECK(!check_so_note());
     CHECK(!check_dma_bands_frames());
     CHECK(!check_flush_parts());
     CHECK(!check_publish_bands());
@@ -8966,6 +8983,17 @@ static int run_headless(int argc, char** argv) {
           snx_vk_pipeline_workers(0, 64) == 12);
     CHECK(snx_vk_pipeline_workers(5, 12) == 5 && snx_vk_pipeline_workers(32, 4) == 32 &&
           snx_vk_pipeline_workers(1, 64) == 1);
+    /* how a draw reads a target it writes at its own pixel: the interlock's capture on NVIDIA's and AMD's GPUs that
+       have all it needs, else two draws with dynamic rendering local read, else in place */
+    CHECK(vk_feedback_choice(0x10DE, 1, 1, 1, 1) == VK_FEEDBACK_INTERLOCK &&
+          vk_feedback_choice(0x1002, 1, 1, 1, 1) == VK_FEEDBACK_INTERLOCK &&
+          vk_feedback_choice(0x1002, 1, 1, 1, 0) == VK_FEEDBACK_INTERLOCK);
+    CHECK(vk_feedback_choice(0x8086, 1, 1, 1, 1) == VK_FEEDBACK_PREDRAW &&
+          vk_feedback_choice(0x1002, 1, 0, 1, 1) == VK_FEEDBACK_PREDRAW &&
+          vk_feedback_choice(0x1002, 0, 1, 1, 1) == VK_FEEDBACK_PREDRAW &&
+          vk_feedback_choice(0x10DE, 1, 1, 0, 1) == VK_FEEDBACK_PREDRAW);
+    CHECK(vk_feedback_choice(0x8086, 1, 1, 1, 0) == VK_FEEDBACK_IN_PLACE &&
+          vk_feedback_choice(0x1002, 1, 0, 1, 0) == VK_FEEDBACK_IN_PLACE);
 #if defined(__linux__)
     if (vk_rec_threaded()) { /* the workers started with the first draws': two at the main thread's nice, the rest low */
         int n = snx_vk_pipeline_workers(g_settings.pipeline_threads, plat_cpu_count()), low, normal, other;

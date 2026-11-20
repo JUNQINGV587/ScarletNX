@@ -346,7 +346,8 @@ runtime must not mix with another LLVM build.
 cmake --build build
 ```
 
-Default: Ninja + Clang, `RelWithDebInfo` (`-O2 -g`). Runtime relinks deploy `recompiled/Game/Game[.exe]` beside
+Default: Ninja + Clang, `RelWithDebInfo` (`-O2 -g`), without ThinLTO
+([`SNX_LTO`](#build-variants), which the nightlies use). Runtime relinks deploy `recompiled/Game/Game[.exe]` beside
 matching `Game_code.so/.dll`, in the data folder's `recompiled/` ([Usage](../user/usage.md#folders)); no-op builds skip deployment. Recompiler/ABI edits require [module rebuilds](development.md).
 
 CPMUtil downloads each package [cpmfile.json](../../cpmfile.json) pins once into a shared `.cache/cpm` cache, at
@@ -443,6 +444,21 @@ cmake --preset default -B build -DSNX_FFMPEG_ASM=OFF && cmake --build build
 ```
 
 - `-DSNX_FFMPEG_ASM=OFF`: omit x86-64 NASM assembly; slower FFmpeg decoding.
+- `-DSNX_LTO=ON`: link with ThinLTO ([cmake/lto.cmake](../../cmake/lto.cmake)). OFF by default, as the builds of
+  development and of pull requests run many times a day. The nightlies and releases turn it on for Linux x86-64,
+  Windows and Android's arm64-v8a. It is used in the Release, RelWithDebInfo and MinSizeRel builds, never in a Debug
+  one, where CMake's `CheckIPOSupported` links a test project with it: Linux, FreeBSD, Windows (Clang with lld:
+  MSYS2's CLANG64, llvm-mingw, the `windows-cross` preset) and Android. It does not work on macOS and iOS, where CMake
+  has no IPO for the apps' Swift, and the Linux and NetBSD cross builds' check does not test their preset's linker. It
+  stays off with `SNX_TEST_SANITIZERS` unless the linker is lld: ASan gives each object a common symbol, and GNU ld's LTO plugin
+  then takes every archive member that has one, with references that nothing defines. The objects
+  compile to LLVM bitcode, and the link optimizes across files: on a Steam Deck, the GPU thread's time for each frame
+  fell by 6.3%. The links take longer, the test programs' too. On an 8-thread Linux desktop a clean build took 440 s,
+  against 316 s without it. The link keeps each module's machine code in the build folder's `thinlto-cache/` (2 GB at
+  most, with lld or GNU ld's gold plugin), so a build after an edit to one file of the renderer took 18 s, against
+  50 s without the cache and 4 s without ThinLTO. The installed `scarletnx-recompiler` archive and the parts it is made
+  of always build without it, as machine code ([Library](library.md)), and the game modules' runtime library is
+  compiled with its own flags, which it does not change.
 - `-DSDL3_FORCE_BUNDLED=ON`: build the pinned SDL3 instead of using a system SDL3 development package
   (`-DCPM_DOWNLOAD_SDL3=ON` before CPMUtil, read as this).
 - `-DSNX_DEPLOY=OFF`: disable runtime deployment.
@@ -485,6 +501,9 @@ Test options, read when `BUILD_TESTING` is on (CTest's default), all OFF by defa
   `LSAN_OPTIONS=use_stacks=0:use_registers=0:suppressions=$PWD/tests/lsan.supp` so the leak check finds the same leaks
   on every machine, and none of the system's libraries' own (SDL's ALSA backend never frees ALSA's device hints).
 - `-DSNX_TEST_VULKAN=ON`: add the offscreen Vulkan integration tests, see below.
+- `-DSNX_TEST_ONLINE_LIVE=ON`: add `online_presets_live`, which asks each WFC service's DNS server over the
+  internet (labels `external` and `network`): how a service that stopped answering is found
+  ([src/common/online](../../src/common/online/README.md)).
 - `-DSNX_TEST_EDENPROBE=/path/to/edenprobe.nro`: add `edenprobe_vk_memory_1` and `edenprobe_vk_memory_2`, which run
   edenprobe as CI does against its baseline, with guest buffers copied and read in place (docs/dev/edenprobe.md).
 - `-DSNX_TEST_VP9_VECTORS=ON`: add the `nvdec_vp9_*` tests, which run NVDEC's VP9 jobs on libvpx's test vectors;

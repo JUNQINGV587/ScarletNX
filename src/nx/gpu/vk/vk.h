@@ -340,6 +340,8 @@ typedef enum { VK_CLOCK_NONE, VK_CLOCK_WAIT, VK_CLOCK_WAIT2, VK_CLOCK_GOOGLE } V
 int vk_init(void);
 /* why vk_init found no device it runs on, with each device's Vulkan version; "" when it did not say */
 const char* vk_start_failure(void);
+/* why a swapchain could not be made, into out: the device, its driver ("" for its driver) and r with its number */
+void vk_swapchain_failure(char* out, size_t size, const char* device, const char* driver, VkResult r);
 /* how many of the extensions a Vulkan 1.2 device runs the renderer with (1.3's, device.c) e lacks, their names in out
    (size bytes, may be 0) comma separated */
 u32 vk_1_2_missing(const SnxVkExtensions* e, char* out, size_t size);
@@ -2526,7 +2528,6 @@ typedef struct {
    stages, geometry, fragment (ST_VS to ST_FS), then an Ounce's task and mesh stages (DS_TASK, DS_MESH) */
 #define VK_DRAW_STAGES DS_GFX_STAGES
 typedef struct {
-    VkDrawGbuf b[VK_DRAW_STAGES][16];
     int n[VK_DRAW_STAGES];
     VkBuffer map_buf[VK_DRAW_STAGES];
     u64 map_off[VK_DRAW_STAGES], map_size[VK_DRAW_STAGES];
@@ -2535,6 +2536,9 @@ typedef struct {
        the draw's vertex streams */
     u32 attr[32][4];
     u32 divisor[32];
+    /* last: a draw clears what is above and the n[stage] buffers each stage has (render.c's draw_storage_read), not
+       the 5 KiB of all of them. Nothing reads a stage's buffers past its count */
+    VkDrawGbuf b[VK_DRAW_STAGES][16];
 } VkDrawStorage;
 /* whether any stage of the draw reads or writes global memory */
 static inline int vk_draw_storage_any(const VkDrawStorage* draw) {
@@ -3268,6 +3272,44 @@ extern u64 g_vk_targets_kept;
    through a copy instead (gpu/vk/render.c); the times a target's pixels were copied into a copy of it, for those draws
    and for textures that read a target as another size or format (gpu/vk/texture.c) */
 extern u64 g_vk_fb_draws, g_vk_fb_barriers, g_vk_fb_restarts, g_vk_rt_copies, g_vk_rt_copy_writes;
+/* Why a render target's pixels were copied into another image: a texture reads its bytes as another color format of
+   the same texel size, a corner of it, or both (texture.c rt_crop); a draw samples the target it renders to where no
+   feedback loop takes it (vk_rt_snapshot); a program that counts texels reads a scaled target at the guest's size
+   (rt_guest); a target taking an address starts from the pixels of the one in another format that it parks there
+   (surface.c rt_take_pixels). Which of them a view of the target could replace, and what each costs a frame in copies
+   and in rendering passes ended, decides whether targets take other formats' views */
+enum {
+    VK_RT_COPY_FORMAT,
+    VK_RT_COPY_CROP,
+    VK_RT_COPY_FORMAT_CROP,
+    VK_RT_COPY_FEEDBACK,
+    VK_RT_COPY_GUEST,
+    VK_RT_COPY_TAKE,
+    VK_RT_COPY_N
+};
+#define VK_RT_COPY_PAIRS 8
+typedef struct {
+    u64 written[VK_RT_COPY_N]; /* copies whose pixels were copied (a copy reused as it is counts nothing) */
+    u64 ended[VK_RT_COPY_N];   /* of those, the ones whose barriers ended a rendering pass with work in it */
+    u64 bytes[VK_RT_COPY_N];   /* their texels' bytes, every sample and layer */
+    /* copies made after another with no draw or dispatch recorded between them (one draw's textures), and of those the
+       ones that ended a pass: one pass ended for several copies is already the case where this is 0 */
+    u64 again, again_ended;
+    u64 presents;         /* presents counted in (vk_tex_frame) */
+    u64 most, most_ended; /* the most copies, and passes they ended, of one present */
+    /* the formats the copies that read another one went between (from the target's, to the copy's), the first
+       VK_RT_COPY_PAIRS seen with their counts, and the copies of the pairs past them */
+    struct {
+        u32 from, to; /* VkFormat */
+        u64 n;
+    } pair[VK_RT_COPY_PAIRS];
+    u64 pairs_past;
+} VkRtCopyCounts;
+/* a copy for why (VK_RT_COPY_*) written: ended, its barriers ended a pass with work in it (vk_render_begun before them
+   and not after); bytes its texels'; from and to the formats it went between */
+void vk_rt_copy_count(int why, int ended, u64 bytes, VkFormat from, VkFormat to);
+void vk_rt_copy_counts(VkRtCopyCounts* out); /* since the last stats line */
+void vk_rt_copy_log(void);                   /* a stats line of them, a present, then counted again from 0 */
 /* statistics: the guest's full barriers not recorded, as no command came after the one before them in the submission
    (renderer.c vkr_method_barrier) */
 extern u64 g_vk_barriers_merged;
@@ -3279,6 +3321,12 @@ extern u64 g_vk_barriers_in_pass;
 #define VK_FEEDBACK_IN_PLACE  0
 #define VK_FEEDBACK_PREDRAW   1
 #define VK_FEEDBACK_INTERLOCK 2
+/* The mode a device takes: the capture on NVIDIA's and AMD's GPUs (vendor) that have the fragment interlock with
+   attachment feedback loops and fragment stores, the two draws on the others with dynamic rendering local read */
+static inline int vk_feedback_choice(u32 vendor, int feedback, int interlock, int stores, int local_read) {
+    const int capture = (vendor == 0x10DE || vendor == 0x1002) && feedback && interlock && stores;
+    return capture ? VK_FEEDBACK_INTERLOCK : local_read ? VK_FEEDBACK_PREDRAW : VK_FEEDBACK_IN_PLACE;
+}
 extern u64 g_vk_predraws;        /* feedback draws drawn two times (render.c predraw_run) */
 extern u64 g_vk_predraw_refused; /* and those that stayed in place, which the log says why of */
 void vk_predraw_report(void);   /* logs the counts of each reason (render.c) */

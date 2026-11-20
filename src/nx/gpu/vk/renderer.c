@@ -27,6 +27,7 @@
 #include "nx/runtime/platform/overlay.h"
 #include "nx/runtime/platform/prepare_screen.h"
 #include "nx/runtime/guest_stats.h"
+#include "nx/gpu/vk/host_program.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/shader_objects.h"
 #include "nx/gpu/vk/ledger.h"
@@ -269,6 +270,12 @@ static void vkr_draw(const DsState* ds, const DrawCall* dc, DrawOwner* o) {
     vk_lock();
     vk_render_draw(ds, dc, o);
     vk_unlock();
+}
+static u32 vkr_host_program(int stage, const u32* spirv, size_t words, const ShaderInfo* si) {
+    vk_lock();
+    u32 id = vk_host_program(stage, spirv, words, si);
+    vk_unlock();
+    return id;
 }
 static void vkr_samples_reset(u32 owner) {
     vk_lock();
@@ -1106,6 +1113,7 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
                 (unsigned long long)g_vk_rt_copies, (unsigned long long)g_vk_rt_copy_writes,
                 (unsigned long long)g_vk_barriers_merged, (unsigned long long)g_vk_barriers_in_pass);
             vk_predraw_report();
+            vk_rt_copy_log();
             if (g_vk_capture_draws || g_vk_capture_capped)
                 LOG("vulkan: %llu draws captured a primitive at a time (%llu primitives), %llu skipped past %u "
                     "primitives\n",
@@ -1568,6 +1576,7 @@ const Renderer vk_renderer = {
     .ready = vk_frame_ready,
     .clear = vkr_clear,
     .draw_texture = vkr_draw_texture,
+    .host_program = vkr_host_program,
     .discard = vkr_discard,
     .draw = vkr_draw,
     .xfb_control = vkr_xfb_control,

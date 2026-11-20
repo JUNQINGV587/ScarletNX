@@ -1662,6 +1662,19 @@ static void narrow_program(Prog* p, int subword) {
     emit(p, ri(0x024, 6, 2, 32 * 4, 255)); /* IMAD R6, R2, 128, RZ: the lane's 32 output words */
     for (u32 k = 0; k < 32; k++) store(p, k, 40 + k);
     epilogue(p);
+/* ---- the HMMA bench (SNX_HMMA_BENCH=ROUNDS: only it runs) ----
+   shader.h's HMMA bench program, as hmma_mode's Auto times it (vk/hmma_pick.c), by hand: SNX_HMMA_BENCH_GROUPS
+   workgroups (BENCH_GROUPS where unset), in subgroups of 32 where the device lets a pipeline require them, as
+   vk/compute.c asks for programs that read other lanes, else in the device's own (64 on Adreno, two warps a subgroup,
+   as the renderer runs them there). Each round times each form of hmma in turn, 30 dispatches of which the first 10
+   only bring the GPU's clock up from an idle device's (an RX 6700 XT ran the first ones several times slower), the
+   forms' order alternating, and prints the median of each as an HMMA_BENCH line, then the way Auto picks from them */
+#define BENCH_GROUPS 65536u
+#define BENCH_LOCAL  SH_HMMA_BENCH_LOCAL
+static void bench_program(Prog* p) {
+    p->outputs = 1;
+    p->approx_from = 1;
+    p->n = shader_hmma_bench_program(p->code) / 16;
 }
 static int narrow_value(Gpu* g) {
     static u32 in[32 * 16], got[2][2][32 * 32]; /* subword store, narrow */
