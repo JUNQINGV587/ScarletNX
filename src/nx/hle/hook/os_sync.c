@@ -88,6 +88,8 @@ void os_sleep_thread(CPU* c, i64 ns) {
         return;
     }
     if (ns < 0) return;
+    if (ns >= 5000000 && g_settings.shorter_frame_waits > 0 && g_settings.shorter_frame_waits < 100)
+        ns = ns * g_settings.shorter_frame_waits / 100;
     hook_wait_begin();
     plat_sleep_ns(ns);
     hook_wait_end();

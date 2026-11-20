@@ -134,6 +134,11 @@ comes up in English with the other face buttons, whatever its launcher passes.
 across and down (four times the pixels), and 3 is nine times the pixels. A port pins 1. One scene of a game drew
 16.3 FPS at 3 and 30.3 at 1, with the same driver.
 
+A game that holds itself to 30 frames a second sleeps for its own frame. `frame_wait_percent=50` halves those
+sleeps, and the game then reaches about 55 frames a second. Every other wait of the game keeps that share too. A
+port that sets it says why in its launcher and in its note. `scripts/make-port-appimage.sh` takes the value from
+`SNX_PORT_FRAME_WAIT`, and pins nothing when that is empty.
+
 No port pins a frame limit of `game`, or any limit under 240. `game` is the pace of the console's own version, which
 is 30 for a game made for 30. `fps_limit=240` lets a game go as fast as it asks. A game that holds itself to 30
 keeps 30, whatever the limit. One game stayed at 30.3 frames a second with `fps_limit=0` and `vsync=0`.

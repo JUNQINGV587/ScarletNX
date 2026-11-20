@@ -71,6 +71,10 @@ fps_limit=240'
 # from it: name the pad player 1 has, as the log names its GUID (SNX_PORT_PAD=0300d628b00d00000119000014030000).
 [ -n "${SNX_PORT_PAD:-}" ] && pins="$pins
 gamepad_p1_device=$SNX_PORT_PAD"
+# A game that holds itself to 30 frames a second sleeps for its own frame: shorten those waits for the port
+# (SNX_PORT_FRAME_WAIT=50). Other waits of the game keep that share too, so the port says why.
+[ -n "${SNX_PORT_FRAME_WAIT:-}" ] && pins="$pins
+frame_wait_percent=$SNX_PORT_FRAME_WAIT"
 awk -v pins="$pins" '
 BEGIN{n=split(pins,p,"\n"); for(i=1;i<=n;i++){split(p[i],kv,"="); want[kv[1]]=kv[2]; order[i]=kv[1]}}
 { lines[NR]=$0; if ($0=="[Game]" && !game) game=NR }

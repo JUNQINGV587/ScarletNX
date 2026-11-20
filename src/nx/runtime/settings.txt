@@ -567,6 +567,15 @@ setting FPS limit
     help game = the pace the game asks for, as on the console (60 FPS, or 30 for a game made for 30); 0 = no limit;
     help 10 to 1000 = that many frames a second. The display's vsync follows a limit other than game, so a game that
     help counts vsyncs as its time runs faster or slower with it. F4 turns the limit off and on
+
+setting Shorter frame waits
+    key frame_wait_percent
+    int 0 100
+    default 0
+    help 0 = off. 1 to 100 = a sleep of 5 ms or more lasts that percent as long. A game that sleeps to hold 30
+    help frames a second reaches 60 with 50. Every other wait of the game keeps that share too, so a port that sets
+    help it says why in its launcher and in its note
+
 setting Memory (GB)
     key memory_gb
     int 0 12
