@@ -59,6 +59,7 @@ ini=$appdir/$id.ini
 [ -f "$ini" ] || printf '[Game]\n' >"$ini"
 pins='language=15
 gamepad_face_labels=1
+gamepad_assign=0
 extract=1
 emulated_cores=0
 touch_in_tv=1
@@ -66,6 +67,10 @@ docked=1
 resolution=3
 screen_fit=0
 fps_limit=240'
+# A virtual pad that repeats the handheld's own (InputPlumber's, Steam Input's) connects first, and takes player 1
+# from it: name the pad player 1 has, as the log names its GUID (SNX_PORT_PAD=0300d628b00d00000119000014030000).
+[ -n "${SNX_PORT_PAD:-}" ] && pins="$pins
+gamepad_p1_device=$SNX_PORT_PAD"
 awk -v pins="$pins" '
 BEGIN{n=split(pins,p,"\n"); for(i=1;i<=n;i++){split(p[i],kv,"="); want[kv[1]]=kv[2]; order[i]=kv[1]}}
 { lines[NR]=$0; if ($0=="[Game]" && !game) game=NR }
