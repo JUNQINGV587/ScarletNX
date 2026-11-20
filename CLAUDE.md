@@ -296,6 +296,9 @@ flourishes. This rule does not apply to code comments. The Claude files follow A
 
 ## Lessons that cost a session
 
+- A game's menu ignores every press while its log shows the pad connected: check `input: P1` first. On a handheld a
+  virtual pad (InputPlumber's, Steam Input's) connects before the built-in one and takes player 1, so the presses the
+  menu reads arrive as player 2. "How a port is shipped" gives the pin that keeps player 1 with the pad.
 - A driver that crashes on a call of the runtime reports no frame of the runtime, only its own. Run the game with
   `vk_validation=1`, and the validation layer names the call and the rule it breaks. It found a pipeline library part
   made on a device without `VK_EXT_graphics_pipeline_library`, which no log line named.
