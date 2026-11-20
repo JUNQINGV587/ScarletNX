@@ -299,6 +299,14 @@ flourishes. This rule does not apply to code comments. The Claude files follow A
 - A game's menu ignores every press while its log shows the pad connected: check `input: P1` first. On a handheld a
   virtual pad (InputPlumber's, Steam Input's) connects before the built-in one and takes player 1, so the presses the
   menu reads arrive as player 2. "How a port is shipped" gives the pin that keeps player 1 with the pad.
+- A menu pressed from a session with no window focus never sees the press, and a scripted pad sends its d-pad the
+  wrong way. Both look like a game whose input is broken. Start the game with `SDL_VIDEODRIVER=x11` and activate its
+  window (`xdotool search --name "Civilization VI" windowactivate --sync`) before pressing anything: SDL drops gamepad
+  events of an unfocused window unless `gamepad_background=1`, and mouse clicks on a Wayland window only highlight.
+  Then make the scripted pad the pad of player 1 (`gamepad_assign=0` and `gamepad_p1_device` of its GUID, see "How a
+  port is shipped"), because player 2 reaches the menu of a game that assigns its controllers to one player. A d-pad
+  read through SDL's `dpdown:h0.4` is the hat axis: send `EV_ABS`/`ABS_HAT0Y` = 1, not `BTN_DPAD_DOWN`, or the menu
+  never moves while every other button works.
 - A driver that crashes on a call of the runtime reports no frame of the runtime, only its own. Run the game with
   `vk_validation=1`, and the validation layer names the call and the rule it breaks. It found a pipeline library part
   made on a device without `VK_EXT_graphics_pipeline_library`, which no log line named.
