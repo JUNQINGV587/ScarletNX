@@ -134,6 +134,16 @@ instead of stopping it: `scripts/pad-udev-rule.sh` (run as root on the handheld)
 `ID_INPUT_JOYSTICK` for the pad, which keeps InputPlumber's mouse, keyboard and touchpad devices in place while SDL,
 which does not need the property, reads the pad directly.
 
+The same handhelds publish a virtual pad that repeats the one they have (InputPlumber's `Microsoft X-Box One Elite 2
+pad`, Steam Input's), and SDL lists the virtual one first. With `gamepad_assign=1` (the console's: each controller that
+connects takes the lowest free player) **the virtual pad takes player 1**, and the presses the game's menu reads go out
+as player 2: every button does nothing, and the log says why. `input: P1 (Xbox One Elite 2 Controller) ... input: P2
+(Micro Star International Xbox360 Controller for Windows)` means the hardware pad is P2. A port pins player 1 to the
+pad it has: `gamepad_assign=0` (Manual: each player's controller as `gamepad_p<N>_device` names it, the next to connect
+where it names none) and `gamepad_p1_device=<the GUID the log prints>`. `scripts/make-port-appimage.sh` pins
+`gamepad_assign=0`, and `SNX_PORT_PAD=<GUID>` pins player 1's. When a game ignores every press, check `input: P1` in its
+log before anything else: the pad is usually connected and reading fine, as the wrong player.
+
 
 - The Bash tool runs **zsh**. `$t:s` is a zsh modifier, so write `"${t}:s"`. The scripts in the repo use bash
   shebangs.
