@@ -400,6 +400,20 @@ static void vkr_method_barrier(int kind)
 	vk_buf_ordered();
 	vk_unlock();
 }
+/* the name a CPU resource category has in the log */
+static const char* res_name(u32 k) {
+    static const char* const names[VK_RESOURCE_N] = {
+        [VK_RESOURCE_IMAGE_QUERY] = "image requirements",
+        [VK_RESOURCE_IMAGE_CREATE] = "image allocation",
+        [VK_RESOURCE_IMAGE_DESTROY] = "image destruction",
+        [VK_RESOURCE_SURFACE_CREATE] = "target setup",
+        [VK_RESOURCE_RT_RELOAD] = "target reload",
+        [VK_RESOURCE_SURFACE_RECLAIM] = "surface reclaim",
+        [VK_RESOURCE_BUFFER_MAINTENANCE] = "buffer maintenance",
+        [VK_RESOURCE_BUFFER_CACHE_BUILD] = "buffer cache build",
+        [VK_RESOURCE_CMD_RESET] = "command resets"};
+    return k < VK_RESOURCE_N && names[k] ? names[k] : "?";
+}
 static int vkr_blit(const Surf2D* s, const Surf2D* d, int dx, int dy, int dw, int dh, double sx, double sy, double sdx,
                     double sdy) {
     vk_lock();
@@ -608,17 +622,6 @@ static void flip_src(VkImageBlit* b, u32 transform) {
 #define FRAME_IMAGE_W 320
 #define FRAME_IMAGE_H 180
 static void frame_image(void); /* after surf_read, whose readback it asks for */
-/* One name for each resource category, for the slow-frame log. The plots below name the same categories in their
-   own table, since a plot's name is the full text the profiler shows. */
-static const char* const g_resource_name[VK_RESOURCE_N] = {
-    [VK_RESOURCE_IMAGE_QUERY] = "image requirements",
-    [VK_RESOURCE_IMAGE_CREATE] = "image allocation",
-    [VK_RESOURCE_IMAGE_DESTROY] = "image destruction",
-    [VK_RESOURCE_SURFACE_CREATE] = "target setup",
-    [VK_RESOURCE_RT_RELOAD] = "target reload",
-    [VK_RESOURCE_SURFACE_RECLAIM] = "surface reclaim",
-    [VK_RESOURCE_BUFFER_MAINTENANCE] = "buffer maintenance",
-    [VK_RESOURCE_BUFFER_CACHE_BUILD] = "buffer cache build"};
 #if defined(SNX_TRACY)
 /* The heap the caches manage, as vk_mem_use reads it for their own trimming, in bytes (the plot is a Memory one). */
 static void gpu_memory_plots(void) {
@@ -847,12 +850,24 @@ static void show(Surf* src, const SnxHdrFrame* hdr, u32 fw, u32 fh, u32 transfor
                 for (u32 k = 0; k < VK_RESOURCE_N; k++) {
                     u64 ns = resource_is.ns[k] - resource_was.ns[k];
                     if (ns >= 1000000)
-                        LOG_LIMIT(400, "vulkan: frame resource CPU: %s %llu ms (%llu calls)\n", g_resource_name[k],
+                        LOG_LIMIT(400, "vulkan: frame resource CPU: %s %llu ms (%llu calls)\n", res_name(k),
                                   (unsigned long long)(ns / 1000000),
                                   (unsigned long long)(resource_is.calls[k] - resource_was.calls[k]));
                 }
             }
             if (d > slowest_ns) slowest_ns = d;
+        }
+        /* log_level 3: the CPU work a resource category takes over 600 presents, which is where a steady scene's
+           time goes: a slow frame's line only says what one frame did */
+        if (g_settings.log_level >= 3 && g_vk_present % 600 == 599) {
+            static VkResourceStats res_was;
+            for (u32 k = 0; k < VK_RESOURCE_N; k++) {
+                u64 ns = resource_is.ns[k] - res_was.ns[k], n = resource_is.calls[k] - res_was.calls[k];
+                if (ns < 10000000 || !n) continue;
+                LOG("vulkan: CPU a frame over 600 presents: %s %.2f ms (%llu calls, %.3f ms each)\n",
+                    res_name(k), (double)ns / 1e6 / 600.0, (unsigned long long)n, (double)ns / 1e6 / (double)n);
+            }
+            res_was = resource_is;
         }
         memcpy(was, is, sizeof was);
         resource_was = resource_is;
