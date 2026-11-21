@@ -126,8 +126,8 @@ from a folder that follows this rule.
 A port starts in Chinese (Simplified). A game reads its language from the console, so the port's `.ini` names
 `language=15`, the value for Chinese (Simplified). `scripts/make-port-appimage.sh` pins that setting in the `.ini`
 that it puts in the AppImage. It pins the rest that a port needs there too: the Switch face button labels
-(`gamepad_face_labels=1`), `extract=1`, `emulated_cores=0`, `touch_in_tv=1`, `docked=1`, `resolution=1`,
-`screen_fit=0` and `fps_limit=240`. The runtime writes the file back with defaults. A port that leaves these out
+(`gamepad_face_labels=1`), `fullscreen=1`, `extract=1`, `emulated_cores=0`, `touch_in_tv=1`, `docked=1`,
+`resolution=1`, `screen_fit=0` and `fps_limit=240`. The runtime writes the file back with defaults. A port that leaves these out
 comes up in English with the other face buttons, whatever its launcher passes.
 
 `resolution` is the shape of the game's rendering, not a display mode. 1 is the console's own shape, 2 is twice

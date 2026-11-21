@@ -58,6 +58,7 @@ rm -f "$appdir"/*.log "$appdir"/*.jitcache
 ini=$appdir/$id.ini
 [ -f "$ini" ] || printf '[Game]\n' >"$ini"
 pins='language=15
+fullscreen=1
 gamepad_face_labels=1
 gamepad_assign=0
 extract=1
