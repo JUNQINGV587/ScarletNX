@@ -204,10 +204,11 @@ void crash_report(void* host_pc, void* fault, int sig) {
         WARN("  %s\n", place);
     }
     report_place(host_pc);
-    /* the low pages are never mapped: a pointer the game failed to get (an allocation it ran out of memory for) plus
-       a field's offset lands there */
+    /* the low pages are never mapped: a small value that a game takes for a pointer (a null from an allocation that
+       failed, or a field of a table it read wrong) lands there once the field's offset is added */
     if (fault && in_guest && guest < ((u64)16 << 20) && mem_short_hint(hint, sizeof hint))
-        WARN("  a null pointer plus an offset: a game short of memory does this. %s\n", hint);
+        WARN("  a small value plus a field's offset: a pointer a game read wrong, or one it failed to get, does this. %s\n",
+             hint);
     fs_save_report(); /* a save a newer version wrote, which a game often crashes on */
     if (t) {
         WARN("  thread %llu (%s)\n", (unsigned long long)t->id, t->name);

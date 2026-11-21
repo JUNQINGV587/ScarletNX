@@ -139,9 +139,9 @@ u64 mem_fit_budget(u64 available, u64 footprint);
 /* Says in the log, for an Ounce game the player gave a memory_gb other than its default 0, that the key does not
    change what the game is told, and the amount it is told. After mem_fit, whose measure that amount follows */
 void mem_gb_said(void);
-/* For a crash that looks like a game out of memory: what the game was told, where that amount came from and the key
-   that tells it more, in out; 0, and an empty out, when no key does (an Ounce game told all of its pool, memory_gb
-   at 6 or more) */
+/* For a crash in the low pages (a small value used as a pointer plus a field's offset): what the game was told, where
+   that amount came from and the key that tells it more, in out; 0, and an empty out, when no key does (an Ounce game
+   told all of its pool, memory_gb at 6 or more) */
 int mem_short_hint(char* out, size_t size);
 u32 h_new(KObj* o); /* a new handle to o, which takes a reference */
 /* an object as a number, which a save state can hold: its type and its slot in its type's pool, 0 for none. kobj_at

@@ -207,13 +207,19 @@ static u32 mem_result(int r) {
            : r == MEM_BADSTATE ? SNX_RC_SVC_INVALID_CURRENT_MEMORY
                                : 0;
 }
-/* for the crash report: read without the memory lock, which the crashed thread may hold */
+/* For the crash report: the heap the game set, the amount it was told and the settings that set that amount. Read
+   without the memory lock, which the crashed thread may hold.
+   The SDK sets one heap to nearly all of what GetInfo reports, less the images, the main thread's stack and the system
+   resource, and it does that once as it starts. So a heap at the total is how every game of the SDK starts, and the
+   line must not read as memory that ran out: used_memory() counts the whole heap as used the moment it is set */
 void mem_report(char* out, int n) {
-    snprintf(out, (size_t)n, "heap %llu MiB, physical %llu MiB, code %llu MiB, %llu of %llu MiB used",
+    snprintf(out, (size_t)n,
+             "heap %llu MiB the game set of the %llu MiB it was told (memory_gb=%d, memory_fit_mode=%d), physical %llu MiB, "
+             "code %llu MiB",
              (unsigned long long)(atomic_load_explicit(&g_heap_size, memory_order_relaxed) >> 20),
+             (unsigned long long)(mem_total() >> 20), g_settings.memory_gb, g_settings.memory_fit_mode,
              (unsigned long long)(atomic_load_explicit(&g_phys_mapped, memory_order_relaxed) >> 20),
-             (unsigned long long)(g_code_memory >> 20), (unsigned long long)(used_memory() >> 20),
-             (unsigned long long)(mem_total() >> 20));
+             (unsigned long long)(g_code_memory >> 20));
 }
 
 /* ============================================================ the heap and physical memory */
