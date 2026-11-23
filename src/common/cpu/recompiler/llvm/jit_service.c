@@ -1035,6 +1035,27 @@ static void images_release(SnxJitService* s, SnxCodeImage* images, const unsigne
     free(images);
 }
 
+/* Two hashes of the instructions a batch was compiled from, read again from the images. Memory that changed while a
+   batch compiled only costs its compile again when the code the batch itself read differs: a batch can be a second of
+   the game's time, and a game that rewrites code somewhere else must not make it repeat. 0 when an address has left
+   the images since. */
+static int code_fingerprint(const SnxCodeImage* images, size_t image_count, const SnxCodegen* codegen, SnxU64* h1,
+                            SnxU64* h2) {
+    SnxU64 a = SNX_VARIANT_H1_BASIS, b = SNX_VARIANT_H2_BASIS;
+    for (size_t i = 0; i < codegen->function_count; ++i) {
+        const SnxFunction* f = &codegen->functions[i];
+        SnxU64 address = snx_function_address(f, 0);
+        for (size_t j = 0; j < f->count; ++j, address += 4) {
+            SnxU32 word;
+            if (image_word(images, image_count, address, &word)) return 0;
+            snx_variant_mix(&a, &b, address, word);
+        }
+    }
+    *h1 = a;
+    *h2 = b;
+    return 1;
+}
+
 static void compile(SnxJitService* s, const SnxU64* pcs, size_t count, SnxU64 stamp, int queue) {
     SnxCodegen codegen;
     SnxJitReport report = {0};
@@ -1107,6 +1128,8 @@ static void compile(SnxJitService* s, const SnxU64* pcs, size_t count, SnxU64 st
                     : -1;
     if (!images) codegen = (SnxCodegen){0};
     int discovered = !rc;
+    SnxU64 fp1 = 0, fp2 = 0;
+    int fingerprinted = discovered && code_fingerprint(images, image_count, &codegen, &fp1, &fp2);
     if (rc) snprintf(error, sizeof(error), "no guest code to compile at %llx", (unsigned long long)pcs[0]);
     for (size_t i = 0; !rc && i < codegen.function_count; ++i) report.instructions += codegen.functions[i].count;
     report.functions = codegen.function_count;
@@ -1148,7 +1171,15 @@ static void compile(SnxJitService* s, const SnxU64* pcs, size_t count, SnxU64 st
        so a thread that loads the address (relaxed, cpu.h: x86-64 keeps loads in order) reaches the code and data
        written before it. A slot something else filled meanwhile (another batch, a wrapper) keeps what it holds */
     lock(&s->lock);
-    if (epoch == s->epoch) {
+    /* the code the batch read may be exactly what it was even though memory changed meanwhile: then the compile
+       stands, and only a change in the code it read is a drop. Memory elsewhere changing is what a game does all the
+       time, and a batch can be a second of its time */
+    int fresh = epoch == s->epoch;
+    if (!fresh && fingerprinted) {
+        SnxU64 now1 = 0, now2 = 0;
+        if (code_fingerprint(images, image_count, &codegen, &now1, &now2) && now1 == fp1 && now2 == fp2) fresh = 1;
+    }
+    if (fresh) {
         for (size_t i = 0; !rc && i < codegen.function_count; ++i) {
             const SnxFunction* f = &codegen.functions[i];
             GuestFn code = unit_function(table, i);
@@ -1174,7 +1205,7 @@ static void compile(SnxJitService* s, const SnxU64* pcs, size_t count, SnxU64 st
         }
         if (!rc) span_of_batch(s, &codegen, table);
     }
-    int dropped = epoch != s->epoch;
+    int dropped = !fresh;
     for (size_t i = 0; i < count; ++i) {
         Entry* e = find(s, pcs[i]);
         const SnxFunction* f = rc ? NULL : snx_codegen_entry(&codegen, pcs[i]);
