@@ -50,7 +50,13 @@ appdir=$work/AppDir
 mkdir "$appdir"
 # A reflink copy: a hard link would make the runtime refuse the folder it indexes (a file of two names).
 cp -a --reflink=auto "$port/." "$appdir/"
-rm -f "$appdir"/*.log "$appdir"/*.jitcache
+rm -f "$appdir"/*.log
+# The JIT cache a port's play session left beside the program goes in the image: a fresh install then starts with the
+# game's code compiled, where a cold one spends its first minutes at 2 frames a second compiling it (96 MB, and the
+# runtime drops it by itself when the build, the host or the game's code no longer match). SNX_PORT_KEEP_CACHE=0
+# leaves it out, for an image that should not carry a session's cache.
+[ "${SNX_PORT_KEEP_CACHE:-1}" = 0 ] && rm -f "$appdir"/*.jitcache
+true
 
 # Pin the settings a port needs in the game's .ini. The runtime writes this file back with
 # defaults, and a default of English, or of the other face button labels, would undo the
