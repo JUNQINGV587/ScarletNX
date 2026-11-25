@@ -405,7 +405,7 @@ static const char* run(Ev* e) {
             case 61: { /* OpLoad */
                 Val v;
                 const Id* pt = &e->ids[t];
-                if (pt->kind == K_TYPE && (pt->op == 25 || pt->op == 27)) { /* an image: its binding */
+                if (pt->kind == K_TYPE && (pt->op == 25 || pt->op == 26 || pt->op == 27)) { /* an image, a sampler */
                     r->kind = K_VALUE;
                     r->type = t;
                     r->v = (Val){{e->ids[in[3]].binding}};
@@ -420,10 +420,29 @@ static const char* run(Ev* e) {
             case 62: /* OpStore */
                 if (!store(e, e->ids[e->ids[in[1]].type].a, e->ids[in[1]].v.c[0], &e->ids[in[2]].v)) return "store";
                 break;
+            case 239: { /* OpAtomicUMax: one invocation, so its result is what it read */
+                uint32_t pointee = e->ids[e->ids[in[3]].type].a;
+                Val was;
+                if (!load(e, t, e->ids[in[3]].v.c[0], &was)) return "atomic load";
+                if (e->ids[in[6]].v.c[0] > was.c[0] &&
+                    !store(e, pointee, e->ids[in[3]].v.c[0], &e->ids[in[6]].v))
+                    return "atomic store";
+                r->kind = K_VALUE;
+                r->type = t;
+                r->v = was;
+                break;
+            }
             case 65:
             case 66: { /* OpAccessChain */
                 uint64_t ptr = e->ids[in[3]].v.c[0];
                 uint32_t cur = e->ids[e->ids[in[3]].type].a;
+                /* an element of an array of images or samplers: its binding, and the element taken */
+                const Id* elem = e->ids[cur].op == 28 || e->ids[cur].op == 29 ? &e->ids[e->ids[cur].a] : NULL;
+                if (elem && (elem->op == 25 || elem->op == 26 || elem->op == 27) && e->ids[in[3]].binding &&
+                    e->ids[in[3]].binding <= 64 && len > 4) {
+                    r->binding = e->ids[in[3]].binding;
+                    e->env->element[r->binding - 1] = (uint32_t)e->ids[in[4]].v.c[0];
+                }
                 for (uint32_t k = 4; k < len; k++) {
                     uint64_t idx = e->ids[in[k]].v.c[0];
                     const Id* y = &e->ids[cur];
@@ -757,6 +776,7 @@ static const char* run(Ev* e) {
                     if (e->env->emitted < 8 && slot < 34) memcpy(e->env->vertex[e->env->emitted][slot], b->words, words * 4);
                     if (e->env->emitted < 8 && v->builtin == 3 + 1) /* ClipDistance */
                         memcpy(e->env->vertex_clip[e->env->emitted], b->words, (b->n < 8 ? b->n : 8) * 4);
+                    if (e->env->emitted < 8 && v->builtin == 9 + 1) e->env->vertex_layer[e->env->emitted] = b->words[0];
                     /* the emit leaves every output undefined: a program that relies on one after it reads this */
                     for (uint32_t k = 0; k < b->n; k++) b->words[k] = 0xdeadbeefu;
                 }

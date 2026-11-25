@@ -321,6 +321,10 @@ struct SnxCtrProcess {
     uint32_t* aot_stale;
     SnxCtrDspService dsp;
     struct SnxCtrUds* uds;
+    struct SnxCtrSoc* soc; /* soc:U's sockets and the threads that wait on them (services/soc.c) */
+    struct SnxCtrFrd* frd; /* the friends module's account and a game's login (services/frd.c) */
+    bool ac_connected;     /* ac:u's ConnectAsync connected the console (services/ac.c) */
+    uint32_t ac_disconnect_event;
     SnxCtrY2rService y2r;
     SnxCtrIrService ir;
     uint32_t irrst_objects[2]; /* ir:rst's shared memory and its update event, made at its first GetHandles */
@@ -349,7 +353,7 @@ struct SnxCtrProcess {
     uint64_t time_update_ns; /* host monotonic deadline of the shared page's next hourly time entry */
     uint64_t sched_seq;      /* the last ready_seq/wait_seq handed out */
     /* The thread and the timer objects, in index order, for the scheduler's passes (kernel/thread.c): an object is 752
-       bytes, and a pass over all of them for their types touched 192 KiB. Made again after an object was made or freed
+       bytes, and a pass over all of them for their types touched 188 KiB. Made again after an object was made or freed
        (objects_changed counts them; sched_listed is the count they were made at). Their types are checked as they are
        read: one freed since is passed over */
     uint32_t objects_changed, sched_listed;

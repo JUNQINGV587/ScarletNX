@@ -28,6 +28,13 @@ u8* g_mem = memory; /* guest address a is memory + a */
 Settings g_settings;
 static Renderer g_none; /* a renderer with no draw: a draw only builds the state */
 const Renderer* g_renderer = &g_none;
+/* the render enable and the reports of the engines (maxwell/engines.c) */
+void gpu_render_enable_nvn(u32 owner, u32 mode, u64 a) { (void)owner, (void)mode, (void)a; }
+/* as the renderer's side runs a report (report_run): the renderer's count when the counter was reset */
+void gpu_report_samples(u32 owner, u64 a, int counted, u64 value) {
+    (void)value;
+    if (counted && g_renderer->samples_report) g_renderer->samples_report(owner, a, 16, 0);
+}
 void pm_init(PMutex* m) { (void)m; }
 int g_shader_sm86; /* shader.c's: Maxwell programs */
 int g_ounce;       /* main.c's: not an Ounce program */
@@ -403,6 +410,30 @@ static void test_storage_tables(void) {
 
 /* Sparse writes to distant stages and both inline banks must preserve every other byte. A generation changes only
    when the bytes that the renderer sees change, even if a record writes and then restores a value before the draw. */
+/* tests/support/gpu_front_stub.c: the inline ranges nvn_draw.c names for the draw records (gpu_ds_inline_changed) */
+extern void (*g_stub_inline_changed)(const DsState* ds, u64 before, u32 off, u32 len);
+static struct {
+    u64 before;
+    u32 off, len;
+} named[16];
+static u32 nnamed;
+static void name_range(const DsState* ds, u64 before, u32 off, u32 len) {
+    (void)ds;
+    if (nnamed < 16) named[nnamed].before = before, named[nnamed].off = off, named[nnamed++].len = len;
+}
+/* the inline group sent before (old, its generation gen) with the named ranges laid over it is the group now, and the
+   ranges chain: the first from gen, the others from the new generation */
+static int ranges_rebuild(const DsInline* old, u64 gen) {
+    static DsInline built;
+    built = *old;
+    int chained = nnamed > 0;
+    for (u32 i = 0; i < nnamed; i++) {
+        if (named[i].off + named[i].len > sizeof built) return 0;
+        memcpy((u8*)&built + named[i].off, (const u8*)&d.ds.inl + named[i].off, named[i].len);
+        chained &= named[i].before == (i ? d.ds.gen[DS_INLINE] : gen);
+    }
+    return chained && !memcmp(&built, &d.ds.inl, sizeof built);
+}
 static void test_inline_updates(void) {
     memset(&d, 0, sizeof d);
     nvn_draw_init(&d, 0);
@@ -438,9 +469,15 @@ static void test_inline_updates(void) {
         snx_st_le64(expected.bank0[gfx[i]] + off, b.address);
         snx_st_le32(expected.bank0[gfx[i]] + off + 8, (u32)b.size);
     }
+    static DsInline sent;
+    sent = d.ds.inl;
+    g_stub_inline_changed = name_range;
+    nnamed = 0;
     check(nvn_draw_record(&d, OP_DRAW_IDX, DRAW, sizeof r), "draw after sparse bindings accepted");
     check(!memcmp(&d.ds.inl, &expected, sizeof expected), "sparse bindings preserve every unchanged inline byte");
     check(d.ds.gen[DS_INLINE] != gen, "sparse bindings change the inline generation");
+    check(ranges_rebuild(&sent, gen), "the %u inline ranges named do not make the group from the one sent", nnamed);
+    g_stub_inline_changed = NULL;
     gen = d.ds.gen[DS_INLINE];
 
     NvnPBindTex1 t = {.stage = NVN_SHADER_STAGE_FRAGMENT, .slot = 31, .h = 0xdeadbeef};
@@ -470,9 +507,15 @@ static void test_inline_updates(void) {
     }
     u64 bank0[DS_GFX_STAGES], bank2[DS_GFX_STAGES], root = d.ds.root_gen;
     for (u32 s = 0; s < DS_GFX_STAGES; s++) bank0[s] = d.ds.inl_gen[0][s], bank2[s] = d.ds.inl_gen[1][s];
+    sent = d.ds.inl;
+    g_stub_inline_changed = name_range;
+    nnamed = 0;
     check(nvn_draw_record(&d, OP_DRAW_IDX, DRAW, sizeof r), "changed draw parameters accepted");
     check(!memcmp(&d.ds.inl, &expected, sizeof expected), "changed parameters preserve all bound handles and storage");
     check(d.ds.gen[DS_INLINE] != gen, "changed draw parameters change the inline generation");
+    check(ranges_rebuild(&sent, gen), "the %u inline ranges named for the draw's parameters do not make the group",
+          nnamed);
+    g_stub_inline_changed = NULL;
     /* each block's own generation: a new base vertex is in every stage's bank 0, and no bank 2 or root table moves */
     int moved0 = 1, kept2 = 1;
     for (u32 s = 0; s < DS_GFX_STAGES; s++) {
@@ -674,7 +717,7 @@ static void test_shading_rate(void) {
     check(g_rate.draw_rate == 0, "a draw with no image bound carries 0, not %u", g_rate.draw_rate);
 
     rate_palette(1, 0xb988888866665555ull);
-    check(g_rate.calls == 0, "a palette set with no image bound calls the renderer");
+    check(g_rate.calls == 0, "a palette set with no image bound does not call the renderer");
     rate_bind(0x123000, 0x23);
     check(g_rate.calls == 1 && g_rate.last.new_image && g_rate.last.addr == 0x123000 && g_rate.last.texel == 16,
           "the bind gives the renderer the image");
@@ -1161,6 +1204,7 @@ static void test_patch_size(void) {
 static DrawCall fixed_call;
 static u32 fixed_draws, fixed_controls, fixed_clears;
 static DrawClear fixed_clear;
+static u32 fixed_clear_x, fixed_clear_y; /* scissor 0 of the state the clear was given */
 static u32 fixed_control_owner, fixed_control_what, fixed_control_stride;
 static u64 fixed_control_address;
 static void capture_fixed_draw(const DsState* state, const DrawCall* call, DrawOwner* owner) {
@@ -1179,8 +1223,9 @@ static int capture_fixed_control(u32 owner_id, u64 control, u32 what, u32 stride
     return 1;
 }
 static void capture_fixed_clear(const DsState* state, const DrawClear* clear, const DrawOwner* owner) {
-    (void)state;
     (void)owner;
+    fixed_clear_x = state->vp.scissor_x[0];
+    fixed_clear_y = state->vp.scissor_y[0];
     fixed_clear = *clear;
     fixed_clears++;
 }
@@ -1310,6 +1355,29 @@ static void test_fixed_state(void) {
         check(fixed_clears == i + 1 && fixed_clear.aspects == (masks[i] & 255 ? 3u : 1u) &&
                   fixed_clear.stencil_preserve == ((~masks[i]) & 255) && fixed_clear.depth == 0.5f,
               "depth/stencil clear mask %#x forwards only the low stencil bits", masks[i]);
+    }
+    /* a clear takes scissor 0 as it is at the clear, with no draw between the record and it, color and depth alike */
+    const i32 rects[3][4] = {{50, 100, 50, 50}, {0, 0, 0x10000, 0x10000}, {7, 9, 20, 30}};
+    for (u32 i = 0; i < 3; i++) {
+        NvnPScissor scissor;
+        memcpy(&scissor, rects[i], sizeof scissor);
+        memcpy(GP(0xb200), &scissor, sizeof scissor);
+        nvn_draw_record(&d, OP_SCISSOR, 0xb200, sizeof scissor);
+        u32 x = (u32)rects[i][0] | (u32)(rects[i][0] + rects[i][2] > 0xffff ? 0xffff : rects[i][0] + rects[i][2]) << 16;
+        u32 y = (u32)rects[i][1] | (u32)(rects[i][1] + rects[i][3] > 0xffff ? 0xffff : rects[i][1] + rects[i][3]) << 16;
+        u32 clears = fixed_clears;
+        NvnPClearColor cc = {.mask = 15};
+        memcpy(GP(0xb300), &cc, sizeof cc);
+        nvn_draw_record(&d, OP_CLEAR_COLOR, 0xb300, sizeof cc);
+        check(fixed_clears == clears + 1 && fixed_clear.scissored == 1 && fixed_clear_x == x && fixed_clear_y == y,
+              "a color clear takes scissor rectangle %u: %08x %08x, want %08x %08x", i, fixed_clear_x, fixed_clear_y, x,
+              y);
+        NvnPClearDS cd = {.depth = 0.25f, .depth_mask = 1, .stencil_mask = 0xff};
+        memcpy(GP(0xb300), &cd, sizeof cd);
+        nvn_draw_record(&d, OP_CLEAR_DS, 0xb300, sizeof cd);
+        check(fixed_clears == clears + 2 && fixed_clear.scissored == 1 && fixed_clear_x == x && fixed_clear_y == y,
+              "a depth clear takes scissor rectangle %u: %08x %08x, want %08x %08x", i, fixed_clear_x, fixed_clear_y, x,
+              y);
     }
     g_none.draw = NULL;
     g_none.xfb_control = NULL;
@@ -1592,12 +1660,12 @@ static void test_samples_without_reset(void) {
     g_none.samples_enable = count_samples_enable;
     g_none.samples_reset = count_samples_reset;
     g_none.samples_report = count_samples_report;
-    int first = nvn_draw_samples(q, 0x5000, 7);
+    int first = nvn_draw_samples(q, 0x5000);
     check(first == 1 && g_samples.on && g_samples.enables == 1 && g_samples.resets == 1 && g_samples.reports == 1 &&
               g_samples.at == 0x5000,
           "a report before any reset: returned %d, counter on %u, %u enables, %u resets, %u reports, at %#llx", first,
           g_samples.on, g_samples.enables, g_samples.resets, g_samples.reports, (unsigned long long)g_samples.at);
-    int second = nvn_draw_samples(q, 0x5010, 8);
+    int second = nvn_draw_samples(q, 0x5010);
     check(second == 1 && g_samples.enables == 1 && g_samples.resets == 1 && g_samples.reports == 2 &&
               g_samples.at == 0x5010,
           "the next report: returned %d, %u enables, %u resets, %u reports, at %#llx", second, g_samples.enables,

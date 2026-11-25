@@ -5,8 +5,9 @@
    byte land the owner first, the CPU's bytes on a page it shares with an owner stay, a neighbour writing during the
    move into the pool loses nothing, a system call fails on owned memory until it is acquired, dropping and unmapping
    land nothing, a view of owned memory lands it first, a fault on the thread holding the producer's lock ends the
-   process, the write watch's scan skips owned spans, and threads faulting at once on many pages while owners come
-   and go read every owner's bytes. Skips (77) where the host has no traps. Debug settings come as the runtime takes
+   process, the write watch's scan skips owned spans, a thread asleep on a page that is armed again before its let_go
+   wakes and lands the new owner, and threads faulting at once on many pages while owners come and go read every
+   owner's bytes. Skips (77) where the host has no traps. Debug settings come as the runtime takes
    them, --key=value (--write_tracking=1, --memory_traps=1: the protection's paths); with memory_traps=2, or 1 and no
    pool, it checks only that the log says why there are no traps.
    On Windows (platform/plat_win32.c) the traps are page protection and a vectored exception handler on the
@@ -50,7 +51,7 @@ static void test_fail(const char* expr, int line) {
 }
 #define CHECK(expr)                                                                                                    \
     do {                                                                                                               \
-        (atomic_fetch_add_explicit(&checks, 1, memory_order_relaxed) + 1);                                             \
+        atomic_fetch_add_explicit(&checks, 1, memory_order_relaxed);                                                   \
         if (!(expr)) test_fail(#expr, __LINE__);                                                                       \
     } while (0)
 
@@ -133,7 +134,19 @@ static void land(const OwnRange* r, u8* const* dst, u32 n, int by) {
     }
     atomic_fetch_add_explicit(&g_lands, 1, memory_order_relaxed);
 }
-static void retain(void* res) { atomic_fetch_add_explicit(&((Res*)res)->refs, 1, memory_order_relaxed); }
+/* test_move_scan's: a scan of [at, at + size) by each retain, the pages it reports a bit each */
+static struct {
+    u64 at, size, pages;
+    int failed;
+} g_move;
+static void on_move_scan(u8* p, u64 size) {
+    for (u64 a = (u64)(p - g_mem), e = a + size; a < e; a += 0x1000)
+        if (a >= g_move.at && a < g_move.at + g_move.size) g_move.pages |= 1ull << ((a - g_move.at) >> 12);
+}
+static void retain(void* res) {
+    atomic_fetch_add_explicit(&((Res*)res)->refs, 1, memory_order_relaxed);
+    if (g_move.size && plat_ww_scan(GP(g_move.at), g_move.size, on_move_scan)) g_move.failed = 1;
+}
 static u64 g_release_touch; /* a guest address the release reads, 0 for none: test_release_order's */
 static int g_release_read;
 static void release(void* res) {
@@ -146,11 +159,35 @@ static u32 busy_tid(void) { return g_busy_tid; }
 static _Atomic int g_resolves; /* atomic */
 static void* g_resolve_res;
 static u64 g_resolve_lo, g_resolve_size;
+static _Atomic int g_resolve_gate, g_resolve_faults; /* atomic: test_rearm_sleeper's */
+static _Atomic int g_producer_waiting;               /* atomic: threads in producer_lock that don't hold it yet */
 static void resolve(u64 addr, u64 size) {
     (void)addr;
     (void)size;
     atomic_fetch_add_explicit(&g_resolves, 1, memory_order_relaxed);
+    /* test_rearm_sleeper: the trap thread has taken the reader's fault and waits for the producer's lock */
+    for (int waited_ms = 0; atomic_load_explicit(&g_resolve_gate, memory_order_acquire) &&
+                            (own_faults() == (u64)atomic_load_explicit(&g_resolve_faults, memory_order_acquire) ||
+                             !atomic_load_explicit(&g_producer_waiting, memory_order_acquire));
+         waited_ms++) {
+        if (waited_ms == 10000) test_fail("the reader's fault waited for the producer's lock within 10 s", __LINE__);
+        plat_sleep_ns(1000000);
+    }
+    atomic_store_explicit(&g_resolve_gate, 0, memory_order_release);
     if (g_resolve_res) CHECK(own_begin(g_resolve_lo, g_resolve_size, g_resolve_res, 0) == 0);
+}
+/* the producer's opening of a watch over a GPU's buffer (OwnHooks' open): the last one's pages and their place in the
+   buffer's view, the watch on them when it is asked */
+static _Atomic int g_opens; /* atomic */
+static u64 g_open_lo, g_open_hi;
+static const u8* g_open_bytes;
+static void open_pages(u64 lo, u64 hi, const u8* bytes, void (*go)(void* ctx), void* ctx) {
+    atomic_fetch_add_explicit(&g_opens, 1, memory_order_relaxed);
+    g_open_lo = lo;
+    g_open_hi = hi;
+    g_open_bytes = bytes;
+    CHECK(own_trapped(lo, hi - lo));
+    go(ctx);
 }
 /* the producer's answer before owners land (OwnHooks' refresh): g_refresh_res published over
    [g_refresh_lo, + g_refresh_size), or nothing when it is NULL */
@@ -163,12 +200,23 @@ static void refresh(u64 addr, u64 size) {
     atomic_fetch_add_explicit(&g_refreshes, 1, memory_order_relaxed);
     if (g_refresh_res) CHECK(own_begin(g_refresh_lo, g_refresh_size, g_refresh_res, 0) == 0);
 }
-/* the producer's lock: recursive, as the renderer's */
+/* the producer's lock: recursive, as the renderer's. test_rearm_sleeper's waits look at who waits for it and who
+   lets it go */
 static pthread_mutex_t g_producer;
-static void producer_lock(void) { pthread_mutex_lock(&g_producer); }
+static _Atomic u32 g_sleeper_tid[2];   /* atomic: test_rearm_sleeper's acquiring thread and main thread */
+static _Atomic int g_sleeper_unlocked; /* atomic: a third thread (the trap thread's landing) let go of the lock */
+static void producer_lock(void) {
+    atomic_fetch_add_explicit(&g_producer_waiting, 1, memory_order_acq_rel);
+    pthread_mutex_lock(&g_producer);
+    atomic_fetch_sub_explicit(&g_producer_waiting, 1, memory_order_acq_rel);
+}
 static void producer_unlock(void) {
     u32 self = plat_tid();
     pthread_mutex_unlock(&g_producer);
+    if (atomic_load_explicit(&g_sleeper_tid[0], memory_order_acquire) &&
+        self != atomic_load_explicit(&g_sleeper_tid[0], memory_order_acquire) &&
+        self != atomic_load_explicit(&g_sleeper_tid[1], memory_order_acquire))
+        atomic_store_explicit(&g_sleeper_unlocked, 1, memory_order_release);
     if (!atomic_compare_exchange_strong_explicit(&g_hold_tid, &self, 0, memory_order_acq_rel, memory_order_acquire))
         return;
     for (int waited_ms = 0; !atomic_load_explicit(&g_republished, memory_order_acquire); waited_ms++) {
@@ -493,6 +541,48 @@ static void test_stage_dropped(void) {
     res_free(r);
 }
 
+/* staging a range of many pages with owners far apart: the runs of pages between them (copied whole) and the pages
+   an owner is on (one at a time) give the CPU's bytes everywhere but the owned parts, which stay for the caller's
+   copy, including bytes the CPU wrote on pages far from any owner, a byte before an owner on its page, and the bytes
+   of the range's last page before an owner at its end */
+static void test_stage_runs(void) {
+    const u64 size = 0x40000;
+    u64 a = region(R0 + 0x1400000, size), i;
+    Res* r0 = res_new(0x800, 0x71);
+    Res* r1 = res_new(0x1000, 0x72);
+    Res* r2 = res_new(0x200, 0x73);
+    static u8 dst[0x40000 - 0x800];
+    OwnRange o[4];
+    GP(a)[0x103ff] = 0xa2; /* just before the first owner, on its page: before it, as a write there would land it */
+    GP(a)[size - 0x201] = 0xa4; /* so before the last owner */
+    CHECK(own_begin(a + 0x10400, 0x800, r0, 0) == 0);        /* inside page 0x10 */
+    CHECK(own_begin(a + 0x31000, 0x1000, r1, 0) == 0);       /* page 0x31 whole */
+    CHECK(own_begin(a + size - 0x200, 0x200, r2, 0) == 0);   /* the range's end */
+    GP(a)[0x2345] = 0xa1;                                    /* written by the CPU, far from all */
+    GP(a)[0x20000] = 0xa3;
+    int lands = g_lands;
+    memset(dst, 0xee, sizeof dst);
+    CHECK(own_stage(a + 0x800, size - 0x800, dst, o, 4) == 3 && g_lands == lands);
+    CHECK(o[0].addr == a + 0x10400 && o[0].size == 0x800 && o[1].addr == a + 0x31000 && o[1].size == 0x1000);
+    CHECK(o[2].addr == a + size - 0x200 && o[2].size == 0x200 && o[2].res == r2);
+    int ok = 1;
+    for (i = 0x800; i < size; i++) {
+        u8 want = (i >= 0x10400 && i < 0x10c00) || (i >= 0x31000 && i < 0x32000) || i >= size - 0x200
+                      ? 0xee /* the owners': left for the caller's copy */
+                  : i == 0x2345        ? 0xa1
+                  : i == 0x103ff       ? 0xa2
+                  : i == 0x20000       ? 0xa3
+                  : i == size - 0x201  ? 0xa4
+                                       : (u8)(0x11 + i);
+        ok &= dst[i - 0x800] == want;
+    }
+    CHECK(ok);
+    CHECK(mem_unmap(a, size) == 0 && refs(r0) == 0 && refs(r1) == 0 && refs(r2) == 0);
+    res_free(r0);
+    res_free(r1);
+    res_free(r2);
+}
+
 /* a second mapping of owned memory lands it first: owned memory has one */
 static void test_view(void) {
     u64 a = region(R0 + 0x400000, 0x4000), v = STACK_BASE + 0x100000;
@@ -522,6 +612,70 @@ static void test_view(void) {
     mem_alias_end(a, 0x4000);
     CHECK(mem_unmap(a, 0x4000) == 0);
     res_free(r);
+}
+
+/* A watch over a GPU buffer's pages (a memfd's, where the renderer moved guest memory: mem_migrate) traps them where
+   they are (own_watch_in_place): no page moves into the pool, so a dma-buf of the memfd keeps the pages the CPU then
+   reads. own_stage reads the CPU's bytes through the buffer's view. A write to the buffer meanwhile (the GPU's copy
+   in place, here through the view) is what the CPU's first read finds, after one resolve. Not over memory of another
+   kind */
+#define IN_PLACE_BYTE(i) ((u8)(0x11 + (i) + ((i) >> 12) * 29)) /* a page's bytes are no other page's */
+static void test_watch_in_place(void) {
+    int fd = -1;
+    void* handle = NULL;
+    if (plat_gpu_buffer(0x10000, &fd, &handle)) { /* a memfd and a mapping of it: Linux's */
+        puts("memory_own: no GPU buffer of a memfd on this host: the watch over one skipped");
+        return;
+    }
+    u64 a = region(R0 + 0x1300000, 0x10000), other = region(R0 + 0x1400000, 0x4000), off = 0;
+    OwnRange o[4];
+    u8 buf[0x4000];
+    u8* view = (u8*)handle;
+    for (u32 i = 0; i < 0x10000; i++) GP(a)[i] = IN_PLACE_BYTE(i);
+    CHECK(mem_migrate(a, 0x10000, fd, view) == 0 && view[0x1234] == IN_PLACE_BYTE(0x1234));
+    int resolves = g_resolves, lands = g_lands, opens = g_opens;
+    CHECK(own_watch_in_place(other, 0x1000) == -1 && !own_trapped(other, 0x4000));
+    CHECK(own_watch_in_place(a + 0x1100, 0x2000) == 0);
+    CHECK(own_watched(a + 0x1100, 0x2000) && own_trapped(a + 0x1000, 0x3000) && !own_trapped(a + 0x4000, 0x1000));
+    CHECK(mem_pool_offset(a + 0x1000, &off) != 0); /* still the buffer's pages */
+    CHECK(own_stage(a, sizeof buf, buf, o, 4) == 0);
+    for (u32 i = 0; i < sizeof buf; i++) CHECK(buf[i] == IN_PLACE_BYTE(i));
+    CHECK(g_resolves == resolves);
+    /* the GPU's copy in place, then the CPU's read: one resolve, nothing landed, the bytes written */
+    memset(view + 0x1100, 0xA5, 0x2000);
+    CHECK(GP(a)[0x1200] == 0xA5);
+    producer_lock(); /* the landing's thread done: it holds the producer's lock until then */
+    producer_unlock();
+    CHECK(g_resolves == resolves + 1 && g_lands == lands && !own_trapped(a, 0x10000));
+    /* opened by the producer, whole, its place in the view with it */
+    CHECK(g_opens == opens + 1 && g_open_lo == a + 0x1000 && g_open_hi == a + 0x4000 && g_open_bytes == view + 0x1000);
+    CHECK(GP(a)[0x10FF] == IN_PLACE_BYTE(0x10FF) && GP(a)[0x30FF] == 0xA5 && mem_pool_offset(a + 0x1000, &off) != 0);
+    GP(a)[0x1300] = 0x77; /* the same pages as the buffer's */
+    CHECK(view[0x1300] == 0x77);
+    /* a watch that goes in parts: each part's pages, at their own place in the view */
+    producer_lock();
+    CHECK(own_watch_in_place(a + 0x4000, 0x5000) == 0);
+    own_unwatch(a + 0x6000, 0x1000); /* its middle */
+    CHECK(g_opens == opens + 2 && g_open_lo == a + 0x6000 && g_open_hi == a + 0x7000 && g_open_bytes == view + 0x6000);
+    CHECK(own_trapped(a + 0x4000, 0x2000) && !own_trapped(a + 0x6000, 0x1000) && own_trapped(a + 0x7000, 0x2000));
+    own_unwatch(a + 0x7000, 0x1000); /* the start of the upper part */
+    CHECK(g_opens == opens + 3 && g_open_bytes == view + 0x7000 && own_trapped(a + 0x8000, 0x1000));
+    own_unwatch(a, 0x10000); /* what is left: the lower part, and the upper one's end */
+    CHECK(g_opens == opens + 5 && g_open_lo == a + 0x8000 && g_open_bytes == view + 0x8000 && !own_trapped(a, 0x10000));
+    /* the buffer's pages moved back at its start and in its middle: what is left of it is read, and opened, at its own
+       place in the view */
+    CHECK(mem_unmigrate(a, 0x5000, NULL) == 0 && mem_unmigrate(a + 0xA000, 0x1000, NULL) == 0);
+    CHECK(own_watch_in_place(a + 0x4000, 0x1000) == -1 && own_watch_in_place(a + 0xA000, 0x1000) == -1);
+    for (u64 at = 0x6000; at <= 0xC000; at += 0x6000) {
+        CHECK(own_watch_in_place(a + at, 0x2000) == 0 && own_stage(a + at, 0x2000, buf, o, 4) == 0);
+        for (u32 i = 0; i < 0x2000; i++) CHECK(buf[i] == IN_PLACE_BYTE(at + i));
+        own_unwatch(a + at, 0x2000);
+        CHECK(g_open_lo == a + at && g_open_bytes == view + at && !own_trapped(a + at, 0x2000));
+    }
+    producer_unlock();
+    CHECK(mem_unmap(a, 0x10000) == 0 && mem_unmap(other, 0x4000) == 0);
+    plat_gpu_buffer_free(fd, handle, 0x10000);
+    puts("memory_own: a watch over a GPU buffer's pages traps them where they are, and reads their bytes through it");
 }
 
 /* a fault on the thread holding the producer's lock is the runtime's bug: it ends the process, not hangs. In a
@@ -802,6 +956,81 @@ static void test_two_step(void) {
     res_free(r2);
 }
 
+/* A thread asleep in a fault on a page that is armed again before the let_go that would wake it: a landing in two
+   steps (thread A, an own_acquire of a watch's first page) holds the producer's lock while its resolve publishes an
+   owner there, and the trap thread, landing the reader's fault on the watch's second page, waits for that lock. Then
+   the watch goes, its pages kept for A's let_go at its end, and with the lock let go for A's copy the trap thread
+   finds nothing on the reader's page, so it leaves the page to A. Before A's copy ends, the page is watched again:
+   arming it unregisters it, which wakes no minor fault, and A's let_go keeps it trapped for the new watch. The
+   reader's fault was taken already: unless the arming wakes it to fault again, it sleeps for good */
+static u64 g_sleeper_at;
+static _Atomic int g_sleeper_read; /* atomic: the reader's byte + 1, once it has it */
+static void* sleeper_acquire(void* unused) {
+    (void)unused;
+    atomic_store_explicit(&g_sleeper_tid[0], plat_tid(), memory_order_release);
+    own_acquire(g_sleeper_at + 0x1000, 0x100);
+    return NULL;
+}
+static void* sleeper_reader(void* unused) {
+    (void)unused;
+    atomic_store_explicit(&g_sleeper_read, GP(g_sleeper_at)[0x2100] + 1, memory_order_release);
+    return NULL;
+}
+static void test_rearm_sleeper(void) {
+    u64 a = region(R0 + 0x1200000, 0x4000);
+    Res* r = res_new(0x100, 0x50);
+    pthread_t acquirer, reader;
+    g_sleeper_at = a;
+    g_own.hooks.land_start = two_start;
+    g_own.hooks.land_end = two_end;
+    atomic_store_explicit(&g_two_in, 0, memory_order_release);
+    atomic_store_explicit(&g_two_go, 0, memory_order_release);
+    atomic_store_explicit(&g_sleeper_read, 0, memory_order_release);
+    atomic_store_explicit(&g_sleeper_unlocked, 0, memory_order_release);
+    atomic_store_explicit(&g_sleeper_tid[1], plat_tid(), memory_order_release);
+    producer_lock();
+    CHECK(own_watch(a + 0x1000, 0x2000) == 0); /* the pages a + 0x1000 and a + 0x2000 */
+    producer_unlock();
+    g_resolve_res = r; /* A's resolve publishes r over the first page's first bytes */
+    g_resolve_lo = a + 0x1000;
+    g_resolve_size = 0x100;
+    atomic_store_explicit(&g_resolve_faults, (int)own_faults(), memory_order_release);
+    int resolves = atomic_load_explicit(&g_resolves, memory_order_acquire);
+    atomic_store_explicit(&g_resolve_gate, 1, memory_order_release);
+    pthread_create(&acquirer, NULL, sleeper_acquire, NULL);
+    for (int waited_ms = 0; atomic_load_explicit(&g_resolves, memory_order_acquire) == resolves; waited_ms++) {
+        if (waited_ms == 10000) test_fail("the acquire reached its resolve within 10 s", __LINE__);
+        plat_sleep_ns(1000000);
+    }
+    pthread_create(&reader, NULL, sleeper_reader, NULL); /* faults on the watch's second page */
+    /* A's copy under way with the lock let go, and the trap thread's landing of the reader's page done with it */
+    for (int waited_ms = 0; !atomic_load_explicit(&g_two_in, memory_order_acquire) ||
+                            !atomic_load_explicit(&g_sleeper_unlocked, memory_order_acquire);
+         waited_ms++) {
+        if (waited_ms == 10000) test_fail("the two landings reached A's copy within 10 s", __LINE__);
+        plat_sleep_ns(1000000);
+    }
+    g_resolve_res = NULL; /* the new watch's resolve publishes nothing: the reader then reads the CPU's byte */
+    CHECK(!atomic_load_explicit(&g_sleeper_read, memory_order_acquire));
+    producer_lock();
+    CHECK(own_watch(a + 0x2000, 0x1000) == 0); /* the reader's page, armed again */
+    producer_unlock();
+    atomic_store_explicit(&g_two_go, 1, memory_order_release);
+    pthread_join(acquirer, NULL);
+    for (int waited_ms = 0; !atomic_load_explicit(&g_sleeper_read, memory_order_acquire); waited_ms++) {
+        if (waited_ms == 3000) test_fail("the reader woke from its fault on the page armed again within 3 s", __LINE__);
+        plat_sleep_ns(1000000);
+    }
+    pthread_join(reader, NULL);
+    atomic_store_explicit(&g_sleeper_tid[0], 0, memory_order_release);
+    g_own.hooks.land_start = NULL;
+    g_own.hooks.land_end = NULL;
+    CHECK(atomic_load_explicit(&g_sleeper_read, memory_order_acquire) == (u8)(0x11 + 0x2100) + 1);
+    CHECK(GP(a)[0x1010] == (u8)(0x50 + 0x10) && refs(r) == 0 && !own_trapped(a, 0x4000));
+    CHECK(mem_unmap(a, 0x4000) == 0);
+    res_free(r);
+}
+
 /* the producer's lock holder faulting on a page that is armed with no entry on it (a landing's, cut and not let go
    yet) goes on: nothing has to land there */
 static void test_busy_unowned(void) {
@@ -871,6 +1100,37 @@ static void test_let_go_watched(void) {
     plat_trap_disarm(GP(a), 0x1000);
     CHECK(GP(a)[0x10] == 0x39);
     CHECK(mem_unmap(a, 0x2000) == 0);
+    res_free(r);
+}
+
+/* A scan between an owner's move into the pool and its trap, as the renderer's write scanner makes on a thread of its
+   own (here the retain hook's, which own_begin calls between the two): the move wrote nothing, so the scan reports the
+   page the CPU wrote before it, which no scan had reported yet, and no other. The mapping the move makes read as
+   written whole, and the renderer marked those pages written by the CPU after the owner's result was published: a
+   storage image stored there again kept memory's bytes on them, a frame old */
+static void test_move_scan(void) {
+    u64 a = region(R0 + 0x900000, 0x10000);
+    Res* r = res_new(0x7000, 0x40);
+    if (plat_ww_scan(GP(a), 0x10000, on_scan)) { /* no write tracking here */
+        CHECK(mem_unmap(a, 0x10000) == 0);
+        res_free(r);
+        return;
+    }
+    GP(a)[0x2010] = 0x99; /* on the owner's first page, beside its bytes */
+    g_move.at = a;
+    g_move.size = 0x10000;
+    g_move.pages = 0;
+    CHECK(own_begin(a + 0x2800, 0x7000, r, 0) == 0); /* pages 2 to 9 move */
+    g_move.size = 0;
+    CHECK(!g_move.failed);
+    if (g_move.pages != 1ull << 2)
+        fprintf(stderr,
+                "move scan: a scan between the move of pages 2 to 9 into the pool and their trap reported the pages "
+                "%#llx written (a bit a page), and the CPU wrote page 2 alone (0x4)\n",
+                (unsigned long long)g_move.pages);
+    CHECK(g_move.pages == 1ull << 2);
+    CHECK(GP(a)[0x2800] == 0x40 && GP(a)[0x2010] == 0x99 && GP(a)[0x9800] == (u8)(0x11 + 0x9800));
+    CHECK(refs(r) == 0 && mem_unmap(a, 0x10000) == 0);
     res_free(r);
 }
 
@@ -1185,7 +1445,8 @@ int main(int argc, char** argv) {
                   .lock = producer_lock,
                   .unlock = producer_unlock,
                   .resolve = resolve,
-                  .refresh = refresh};
+                  .refresh = refresh,
+                  .open = open_pages};
     pthread_mutexattr_t recursive;
     pthread_mutexattr_init(&recursive);
     pthread_mutexattr_settype(&recursive, PTHREAD_MUTEX_RECURSIVE);
@@ -1234,8 +1495,10 @@ int main(int argc, char** argv) {
     test_drop();
     test_drop_sparse();
     test_stage();
+    test_stage_runs();
     test_stage_dropped();
     test_view();
+    test_watch_in_place();
 #if defined(_WIN32)
     {
         static char self[MAX_PATH];
@@ -1256,9 +1519,11 @@ int main(int argc, char** argv) {
     test_release_order();
     test_republish_after_landing();
     test_two_step();
+    test_rearm_sleeper();
     test_busy_unowned();
     test_scan_owned();
     test_let_go_watched();
+    test_move_scan();
     test_refresh();
     test_watch();
     test_watch_bound();

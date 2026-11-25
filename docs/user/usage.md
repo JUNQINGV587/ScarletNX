@@ -92,7 +92,7 @@ video, audio or gamepad subsystem, so it needs no display server and only `--scr
 
 ## Extract → AOT → run
 
-Pass a single XCI, NSP, DXCI or DNSP to recompile and play:
+Pass a single XCI, NSP, XCZ, NSZ, DXCI or DNSP to recompile and play:
 
 ```sh
 ./build/scarletnx "Game.xci"
@@ -144,7 +144,9 @@ place. `-rx` (`-r -x` on Windows) prepares it extracted, as `-r --extract-contai
 An extracted game's folder, one whose `exefs/` holds the game's `main` (beside its `romfs/` and `control.nacp` when it
 has them, as `-x` or hactool lays one out), plays and prepares as a dump does: `./build/scarletnx "Game/"`, or
 `-r "Game/"`. The game is named by the title ID of its `exefs/main.npdm`, and shown by its `control.nacp`'s name, else
-by that ID. Nothing of it is copied: the `.ini` records the folder as `source=`, and each run reads the ExeFS and
+by that ID, with the `icon.jpg` beside its `exefs/` when it has one (each run copies it into the game's data folder
+when it changed, so a cover put there later shows from the next run). Nothing else of it is copied: the `.ini` records
+the folder as `source=`, and each run reads the ExeFS and
 RomFS from it, on whatever disk it is, `--extract-container` or not (its RomFS can take gigabytes a copy doubles; what
 an older version copied into the game's data folder is taken away at the next run). `--tmpfs` copies it into tmpfs, as
 it extracts a dump; `-x --out DIR -- "Game/"` copies it alone. Moving or deleting the
@@ -194,6 +196,16 @@ be used as a base game.
 .\build\scarletnx.exe "C:\Games\Game.dxci"
 .\build\scarletnx.exe --extract "C:\Games\Game.dnsp" --update "C:\Games\Update.dnsp"
 ```
+
+XCZ and NSZ are an XCI and an NSP that [nsz](https://github.com/nicoboss/nsz) compressed: each of their NCZ files is
+read as the NCA it holds, decompressed as it is read and nothing written to disk, everywhere an NCA is (extraction,
+recompile, reading in place, an update or DLC dump). An NCZ in blocks (`nsz -B`, nsz's default for an XCZ) reads any
+part at once. One compressed as one stream (`nsz -S`, its default for an NSZ) is decoded from its start as far as a
+read reaches, and again from its start for a read behind where it got to that the 32 MB of it last read do not hold:
+an extraction says after it how many times that happened, and a game that reads one in place says each in its log
+(`fs: a read at ... decoded again from its start`), where a pause it makes shows. Extract dump, or an NSZ compressed in
+blocks, plays without that. An NCZ whose header cannot be read stops the dump's opening, naming the file in it, where
+and why.
 
 ### Experimental CPU extensions
 
@@ -362,15 +374,17 @@ Run the same command again to retry after a failure or interruption:
   using `work/Game.extracting/` while running. An incomplete staging directory is discarded on retry.
 - A complete `recompiled/<id>/<id>` (`<id>.exe` on Windows), code module and `<id>.abi` stamp naming this build's
   ABI skip recompilation. The stamp holds `SNX_ABI`: a game a build of another ABI made is recompiled
-  automatically, as is one with a missing or invalid stamp, and that recompile takes from the unit cache (below) every
-  code unit whose code is the same. One another build of the same ABI made keeps its code,
+  automatically, as is one with a missing or invalid stamp. One another build of the same ABI made keeps its code,
   and its `recompiled/<id>/<id>` is replaced by this build's runtime when the two differ, so a newer build's fixes reach
   it. Failed builds never publish a valid ABI checkpoint. A change to the recompiler that keeps `SNX_ABI` isn't
   seen: there `-r` recompiles. The stamp's last line says how the code was made, which no check reads: `made opt=2
   aot=1 found=812345 code=1003210`, the `-O`, `aot=0` for `--jit-only` (the JIT compiles it all), and of the
   instructions in the modules' code (`code`) those the analysis found and compiled ahead of time (`found`; both 0 for a
   32-bit game). The launcher's side panel shows them. A version from before it reads a stamp with it as another
-  build's, and recompiles the game once.
+  build's, and recompiles the game once. After them, ` off=llvm_batch,unit_instructions` names the recompile's
+  settings that change the code it makes and were off their default (`perf` in `settings.txt`: `llvm_batch`,
+  `unit_instructions` and LLVM Internals), which the game names over its picture as it starts
+  ([Settings](settings.md)); a line without it, an older version's too, names none.
 - Changing directory and running the game happen on every launch. A game failure never invalidates the build.
 
 Failures stop the workflow and print the failed stage and exit status or signal. On POSIX, stopping a
@@ -425,7 +439,8 @@ Remaining examples: POSIX.
   (`%USERPROFILE%\.switch` on Windows).
   Common NSP tickets supplement title keys. Fully decrypted content needs neither key file.
 - **Extraction:** defaults to the data folder's `work/<dump stem>`; `--name`/`--out DIR` override. Refuses existing
-  `exefs`. hactool runs inside the driver and reads each NCA where it lies in the XCI or NSP, so the ExeFS and RomFS
+  `exefs`. hactool runs inside the driver and reads each NCA where it lies in the XCI or NSP (an XCZ's or NSZ's NCZ
+  decompressed as it is read, [`ncz.c`](../../src/nx/runtime/driver/hactool/ncz.c)), so the ExeFS and RomFS
   are written straight into the output and nothing is unpacked beside it
   ([key filtering and cleanup](../../src/nx/runtime/driver/extract.c)).
   Sparse and compressed NCAs, updates with large relocation tables and gamecard dumps that start with the card's key
@@ -485,18 +500,12 @@ Remaining examples: POSIX.
   [common options](#common-options), which the 3DS, Vita and GBA drivers take too.
 - **Codegen:** `--no-build` stages data/INI only; `--jit-only` omits AOT functions.
   `--chunk N` (`--unit-instructions=N`) sets the instructions per code unit: 90000 by default, 20000 on Android and
-  iOS, where a smaller unit takes less memory at once. Each unit's object, a 32-bit game's blocks too, is kept in
-  `units/` of the cache folder ([Folders](#folders)), which every game's recompile shares, under the SHA-256 of the
-  unit's LLVM IR, the LLVM, the CPU and its features, the optimization level and the LLVM Internals: a unit found
-  there is not compiled again (a recompile after an `SNX_ABI` change that leaves the unit's IR alone, of a game whose
-  code changed in a few units, or one cut short, which goes on from the units it had compiled), and the last line says
-  how many were (`unit cache: 241 of 259 units reused (310.2 MB) from ...`). The module
-  descriptor and the link are made each time. A kept object that is not whole is compiled again, and said. The cache
-  always leaves a tenth of its disk free, at most 10 GB: when a new unit would take that, the units reused longest ago
-  are removed for it, and a unit there is still no room for is not cached (said once, with the disk's free bytes, the
-  unit's size and that rule, and how many units at the end; the units removed for room are summed there too).
-  `--unit-cache-gb=N` (0, no limit, by default) also holds the folder to N GB after each recompile, the units reused
-  longest ago removed first. A cache folder that cannot be made stops the recompile, saying why.
+  iOS, where a smaller unit takes less memory at once. The x86-64 back end's units are held in memory while the
+  process runs, under the SHA-256 of what each is made from, so that a unit made again in it (an NRO loaded again, the
+  launcher's next recompile) is copied rather than made: up to 1% of the machine's memory, at most
+  `--unit-cache-ceil-mb=N` (512 by default, 0 for none), the units used longest ago going first. A unit line ends in
+  `(cached)` for one taken from memory. Nothing is kept on the disk: `units/` of the cache folder, where an older
+  version kept them, is said with its size at each recompile while it is there, and deleting it frees that room.
   `--keep-ir` saves the generated code (LLVM IR) in `<outdir>/<NAME>/<NAME>_build/`.
   `--hook-direct-calls` sends calls and branches between guest functions through the dispatch table too, so the
   runtime's NVN handlers also take calls made by direct branch.
@@ -512,7 +521,7 @@ With `--out work/Game` and `--outdir games` as above (without them, see [Folders
 | `recompiled/<id>/<id>_data/`, `<id>.ini` | Data/saves (and `control.nacp`) + settings |
 | `recompiled/<id>/<id>_build/` | Generated code, only with `--keep-ir` |
 | `recompiled/<id>/shader_cache/vk_pipelines.<driver>.bin` | Vulkan pipeline cache, one per driver (`<driver>`: `d<driver ID>-<GPU vendor>-<GPU device>`, and `-<package>` for a `gpu_driver` package's), so going back to a driver finds its own |
-| `recompiled/<id>/shader_cache/<id>.<driver>.vkshaders` | One per driver: translated shaders and the pipelines made, made again at the next start, compute pipelines too (before the game starts, from their programs, so a new build or driver compiles them there); packed with zstd as they add up (`compress_shader_cache`) |
+| `recompiled/<id>/shader_cache/<id>.<driver>.vkshaders` | One per driver: translated shaders and the pipelines made, made again at the next start, compute pipelines too (before the game starts, from their programs, so a new build or driver compiles them there); held in memory while the game runs and written when it closes, packed with zstd at its highest level: a run that crashes keeps none of what it made |
 | `recompiled/<id>/shader_cache/<id>.<driver>.vkshipped` | One per driver: the shaders found in the game's own files and executables, prepared ahead of time (`prepare_shaders`), each read when the game first draws with it, each packed with zstd on its own (`compress_prepared_shaders`). Unpacked it can be large: one game's 2,700 shaders took 245 MB, another's 18,500 took 2 GB; packed, about a quarter of that |
 | `recompiled/<id>/shader_cache/<id>.vkscan` | The game's files found to hold no shaders, so that after an update of ScarletNX or the driver the files aren't all read again to look for them |
 
@@ -665,7 +674,6 @@ list). The user's data folder and a portable copy's keep each kind of file apart
 | its `<id>.log` (this run's; the 4 before in `logs/<date>.log`) and `threads.txt` | `recompiled/<id>/` | `~/.local/state/scarletnx/recompiled/<id>/` | `state/recompiled/<id>/` |
 | its pipeline cache | `recompiled/<id>/shader_cache/` | `~/.cache/scarletnx/recompiled/<id>/shader_cache/` | `cache/recompiled/<id>/shader_cache/` |
 | extractions (`3ds/` for the 3DS driver) | `work/` | `~/.cache/scarletnx/work/` | `cache/work/` |
-| the recompile's code units, `<key>.o`, every game's | `units/` of the user's cache folder | `~/.cache/scarletnx/units/` | `cache/units/` |
 | the menu's themes, `<name>/theme.ini` | - | `~/.local/share/scarletnx/themes/` | `themes/` |
 | the menu's `settings.ini`, `app.ini`, `folders.txt`, `gamecontrollerdb.txt` | - | `~/.config/scarletnx/` | `config/` |
 | the setup's `setup.ini` ([Setup](#setup)) | - | `~/.config/scarletnx/` | `config/` |
@@ -830,9 +838,33 @@ Keyboard and on-screen controls also drive player one.
 `gamepad_assign=1`, the default, gives the players out as a console does (after Eden's Modern Console): each controller
 that connects is the lowest player free ("P2: Xbox Wireless Controller joined"), and one that leaves keeps its player
 for 45 seconds, which it takes back when it returns while another that connects goes past it. Once a player's controller
-has been gone 3 seconds the game pauses ("P2 disconnected: reconnect, or press + on another controller to go on") until
-it returns, or until + is let go on another controller, which goes on without that player. `0` gives them out as each
-player's `gamepad_p<N>_device` names its controller, the next to connect where it names none.
+has been gone 3 seconds the game pauses until it returns, or until + is let go on another controller, which goes on
+without that player. In a window the pause shows the controllers' dialog (below) with that player's card, where A on
+another pad takes its place and *Go on without P2* goes on. `0` gives them out as each player's `gamepad_p<N>_device`
+names its controller, the next to connect where it names none.
+
+When the game asks for its controllers (the console's controller applet), a dialog over the game says what the game
+expects: how many players, how each one holds its controller (with a picture), and the game's own text and color for
+each player. A game of Joy-Con 2 alone that started their mouse sensor gets an optional panel to check the Joy-Con 2 as
+a mouse (on the table or in the air, the cursor, R and ZR): the game never says whether it uses the mouse, so the dialog
+only says "if". Each player has a card that a controller fills with the console's
+gestures, which also choose its style: SL and SR together on one Joy-Con make it a player alone, held sideways (half of
+a pair leaves the pair), L on a left Joy-Con and R on a right one held together make them one pair, and L and R
+together on a pair or any other pad make it a whole one (a pad plays as whatever style the game takes). A gesture the
+game does not take is refused with the reason in the card. A only picks the dialog's items. A console controller (a
+Pro Controller, Joy-Cons, a Joy-Con 2 or Pro Controller 2 the runtime connects, a pad in Switch mode) keeps its own
+style as on the console: a game that takes none of its styles does not see it, asks for its controllers, and the
+dialog says why that one does not fit. A generic pad and the keyboard play as whatever style the game takes. While the TV mode is off,
+player 1's card says whether it is the Joy-Cons attached to the console (the handheld controls, which the game also
+sees as player 1) or detached. A game that does not take the handheld controls, and the Joy-Con 2 mouse, need them
+detached: *Detach the Joy-Cons from the console (tabletop)* takes the handheld controls away for the session and
+leaves the TV mode and the performance mode as they are, and *Attach the Joy-Cons to the console* brings them back. A line under the cards says who is still missing, Continue goes back to the
+game once the least it needs are there, and Cancel tells the game the player backed out. With `joycon2=1` the dialog
+listens for Joy-Con 2 and Pro Controller 2 while it shows: a known one connects as soon as it is heard, a new one
+waiting to sync is connected once picked. *Disconnect P2* closes the link of a controller the runtime connected itself
+(no command goes to the controller) and leaves player 2 waiting: for a minute the controller is not connected again by
+itself, its *Connect ... again* item takes it back at once, and after that a button press connects it as before. The game's menu opens the same dialog under *Controllers > Assign players*, the game paused.
+`controller_applet=1` answers at once when the players are already there.
 `gamepad_joycon_pair=1` makes SDL combine a left and right Joy-Con. Set it to `0` to expose them separately and
 restart the game after changing it.
 
@@ -872,9 +904,10 @@ pad.
 
 F1 a page of the game's menu with these keys and the buttons above, a row each (Up/Down go over it, any other key goes
 back to the game); F2 the game's menu; F3 screenshot; F4 FPS limit off and on; F5 thread dump; F6 showcase on and off;
-F7 save state; F8 load state; F9 next save state slot; F10 60-second Tracy capture (SNX_TRACY builds); F11/Alt+Enter
-fullscreen; F12 stats on and off; Ctrl+Shift+F12 a RenderDoc capture of the next frame, with RenderDoc in the game
-(`renderdoc`, or a game RenderDoc's program started), as the game's menu's **Capture frame** is, which shows only then;
+F7 save state; F8 load state; F9 next save state slot; F10 Tracy capture for `tracy_capture_seconds` (60 s by
+default, SNX_TRACY builds); F11/Alt+Enter fullscreen; F12 stats on and off; Ctrl+Shift+F12 a RenderDoc capture of the
+next frame, with RenderDoc in the game (`renderdoc`, or a game RenderDoc's program started), as the game's menu's
+**Capture frame** is, which shows only then;
 Pause pauses the whole game and resumes it (the window's title says "(paused)"); Escape twice within 3 seconds quit, the
 first press a warning over the game; Ctrl+D the TV mode On, Off or Auto for the run, as the game's menu's **TV mode**
 is. F4, F6, F12, Ctrl+D and Pause say over the game what the press set (`FPS limit: off`, `Stats: on`), the log

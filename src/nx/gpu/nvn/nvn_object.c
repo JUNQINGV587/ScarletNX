@@ -10,6 +10,7 @@
    table (its API version is the SDK's, 55.8 in one game) rather than nxnative's 55.15 */
 #include "nx/gpu/nvn/nvn_object.h"
 #include "nx/gpu/gpu.h"
+#include "nx/gpu/renderer.h"
 #include "nx/gpu/guest_pools.h"
 #include "nx/gpu/guest_textures.h"
 #include "nx/gpu/nvn/nvn_replay.h"
@@ -24,7 +25,6 @@
 #include "nx/gpu/nvn/nvn_section.h"
 #include "nx/gpu/texture/blocklinear.h"
 #include "nx/runtime/main.h"
-#include "nx/gpu/gpu.h"
 #include "nx/gpu/shader/sm86.h"
 #include "nx/hle/services/nvdrv.h"
 #include "nx/hle/services/native_video.h"
@@ -38,7 +38,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <stdatomic.h>
 
 u64 nvn_serial(void) { return (atomic_fetch_add_explicit(&g_nvn.object.serial, 1, memory_order_relaxed) + 1); }
@@ -312,6 +311,12 @@ u64 nvn_DeviceGetTexelFetchHandle(CPU* c, u64 d, i32 id) {
 u64 nvn_DeviceGetTimestampInNanoseconds(CPU* c, u64 d, u64 counter) {
     (void)c;
     (void)d;
+    /* a report whose submission isn't done waits for it off the guest core, as nvn_SyncWait does */
+    if (gpu_release_stamp_sync(counter, 0)) {
+        nvn_wait_begin();
+        gpu_release_stamp_sync(counter, 1);
+        nvn_wait_end();
+    }
     return snx_gpu_ns_of_ticks(NVN_OBJ(NVNcounterData, counter)->timestamp);
 }
 /* fast clear values are hints to the hardware's compression */
@@ -395,9 +400,18 @@ void nvn_MemoryPoolBuilderSetFlags(CPU* c, u64 b, i32 flags) {
    load, and its loading threads waited up to 1.7 s in 5 s for that lock. The game's thread also reads and writes
    through a new pool's GPU addresses at once (a program's header, its linkage table): until the map is made, the
    table answers it for those pages. The VA allocator still answers at once, and ended addresses go back to it only
-   after their unmap, so no pool gets them while they still show the old pages */
+   after their unmap, so no pool gets them while they still show the old pages.
+
+   An Ounce device shows a pool with storage at the storage's own address: its GPU address is the CPU address, as the
+   console's driver maps such a pool, so nvnMemoryPoolGetBufferAddress answers the storage. An engine frees the storage
+   of a pool the CPU can't access by that address, where it can't map it; with an address of the allocator's it freed
+   a GPU address, which its allocator stopped on. The range goes back to the allocator when the pool ends, before its
+   unmap: only a pool over the same storage takes it again, which shows the same pages, its map queued after the
+   unmap. A virtual pool, and a pool whose range another pool's holds, take the allocator's addresses */
 #define NVN_POOL_VIRTUAL 0x200u
 #define NVN_POOL_ALIGN   0x20000u /* the GPU address alignment: a big page, as compressible kinds want */
+/* a pool shown at its storage's own address: gpu == memory, which no address of the allocator's is on an Ounce */
+static int pool_own_address(const NvnPool* o) { return o->memory && o->gpu == o->memory; }
 int nvn_MemoryPoolInitialize(CPU* c, u64 p, u64 b) {
     const NvnPoolBuilder* s = NVN_OBJ(NvnPoolBuilder, b);
     NvnPool o = {0};
@@ -424,7 +438,13 @@ int nvn_MemoryPoolInitialize(CPU* c, u64 p, u64 b) {
     if (!o.memory && !(o.flags & NVN_POOL_VIRTUAL))
         LOG_LIMIT(8, "nvn: memory pool %llx has no storage (flags %#x)\n", (unsigned long long)p, o.flags);
     lead = o.memory & 0xfff;
-    va = gmmu_space_alloc(lead + o.size, NVN_POOL_ALIGN);
+    va = g_ounce && o.memory && !(o.flags & NVN_POOL_VIRTUAL) ? gmmu_space_alloc_at(o.memory - lead, lead + o.size) : 0;
+    if (g_ounce && o.memory && !(o.flags & NVN_POOL_VIRTUAL) && !va)
+        WARN_LIMIT(8,
+                   "nvn: memory pool %llx: its storage %llx (%llx bytes) is in another pool's GPU range, so its GPU "
+                   "address isn't the storage's: a game that takes one for the other goes wrong there\n",
+                   (unsigned long long)p, (unsigned long long)o.memory, (unsigned long long)o.size);
+    if (!va) va = gmmu_space_alloc(lead + o.size, NVN_POOL_ALIGN);
     if (va && o.memory) gmmu_later_post(gmmu_later(GMMU_LATER_MAP, va, o.memory - lead, lead + o.size, 0));
     if (!va)
         fatal("nvn: no GPU address space left for a memory pool of %llx bytes", (unsigned long long)o.size);
@@ -435,6 +455,20 @@ int nvn_MemoryPoolInitialize(CPU* c, u64 p, u64 b) {
          (unsigned long long)o.memory, (unsigned long long)o.size, (unsigned long long)o.gpu, o.flags);
     return 1;
 }
+/* An Ounce pool that ends while results of the GPU over it are not in guest memory yet: its unmap, queued for the GPU
+   thread, lands them, and the end waits for it. The console's GPU wrote them into the storage as it ran, and the game
+   may hand the storage to other uses as soon as the pool has ended: landed later, they wrote the GPU's old pixels over
+   memory its allocator had given to its own tables since, which then read as zeros. The wait has a bound, past which
+   it says so and goes on */
+#define POOL_END_WAIT_NS (5000ll * 1000 * 1000)
+static int pool_end_holds(const NvnPool* o, u64 gva, u64 size) {
+    return g_ounce && o->memory && g_renderer->gpu_holds && g_renderer->gpu_holds(gva, size);
+}
+static void pool_end_wait(u64 pool, u32 seq) {
+    if (!gmmu_later_wait(seq, POOL_END_WAIT_NS))
+        WARN_LIMIT(4, "nvn: memory pool %llx ended with results of the GPU over it, which hadn't landed after %u ms\n",
+                   (unsigned long long)pool, (unsigned)(POOL_END_WAIT_NS / 1000000));
+}
 void nvn_MemoryPoolFinalize(CPU* c, u64 p) {
     NvnPool* o = NVN_OBJ(NvnPool, p);
     u64 lead = o->gpu & 0xfff;
@@ -442,8 +476,16 @@ void nvn_MemoryPoolFinalize(CPU* c, u64 p) {
     u32 nvmap =
         o->magic == NVN_MAGIC('P', 'O', 'O', 'L') ? atomic_exchange_explicit(&o->nvmap, 0, memory_order_acq_rel) : 0;
     if (o->magic == NVN_MAGIC('P', 'O', 'O', 'L') && o->gpu) { /* the handle goes after the unmap, as it went before */
+        int held = pool_end_holds(o, o->gpu - lead, lead + o->size);
         gpu_pool_remove(o->gpu);
-        gmmu_later_post(gmmu_later(GMMU_LATER_FREE, o->gpu - lead, 0, lead + o->size, nvmap));
+        u32 seq;
+        if (pool_own_address(o)) {
+            gmmu_space_give_back(o->gpu - lead, lead + o->size);
+            seq = gmmu_later(GMMU_LATER_UNMAP, o->gpu - lead, 0, lead + o->size, nvmap);
+        } else
+            seq = gmmu_later(GMMU_LATER_FREE, o->gpu - lead, 0, lead + o->size, nvmap);
+        gmmu_later_post(seq);
+        if (held) pool_end_wait(p, seq);
         nvmap = 0;
     }
     if (o->magic == NVN_MAGIC('P', 'O', 'O', 'L') && o->memory) nvn_cmd_memory_back(o->memory, o->size);
@@ -796,15 +838,30 @@ i32 nvn_SamplerPoolGetSize(CPU* c, u64 sp) {
     (void)c;
     return NVN_OBJ(const NvnDescPool, sp)->count;
 }
+/* A texture descriptor written over another. The game writes it between two submissions, and the GPU thread may still
+   replay the work before them, with no write tracking epoch between (one Ounce game's menus and loads register new
+   textures at indices its last frame sampled others at). That replay reads the descriptor as it binds, so it would draw
+   with the new texture: the write waits for the work submitted before it, as a sampler's does (sampler_write). Recorded
+   as a GPU-side write of its 32 bytes, so what the renderer keeps of the descriptor (the texture memo, the pool map)
+   checks it again at its next lookup, not only after the next submission. The descriptor the slot already holds is no
+   write, and no wait */
+static void texture_write(u64 slot, const u32 tic[8]) {
+    if (!memcmp(GP(slot), tic, NVN_DESCRIPTOR_SIZE)) return;
+    nvn_wait_begin();
+    nvn_replay_finish_all();
+    nvn_wait_end();
+    memcpy(GP(slot), tic, NVN_DESCRIPTOR_SIZE); /* guest memory: every byte the game sees */
+    gpu_mem_written_cpu(slot, NVN_DESCRIPTOR_SIZE);
+}
 /* an image's descriptor is in the texture pool's ID space too (nvnDeviceGetImageHandle is the ID) */
 static void register_texture(u64 tp, i32 id, u64 t, u64 v, int image) {
     u64 slot = desc_slot(tp, id, "texture");
     NvnTexture tex;
     NvnView view;
-    u32 tic[8];
+    u32 tic[8] = {0};
     if (!slot) return;
-    if (!t) {                            /* no texture: an empty descriptor */
-        memset(GP(slot), 0, sizeof tic); /* guest memory: every byte the game sees */
+    if (!t) { /* no texture: an empty descriptor */
+        texture_write(slot, tic);
         return;
     }
     memcpy(&tex, GP(t), sizeof tex);
@@ -812,7 +869,7 @@ static void register_texture(u64 tp, i32 id, u64 t, u64 v, int image) {
     if (!nvn_tic_encode(&tex, v ? &view : NULL, image, g_nvn.loader.api, tic))
         LOG_LIMIT(8, "nvn: a texture of format %#x, which has no texture descriptor: an empty one at %d\n",
                   v && (view.set & NVN_VIEW_FORMAT) ? view.format : tex.d.format, id);
-    memcpy(GP(slot), tic, sizeof tic);
+    texture_write(slot, tic);
 }
 void nvn_TexturePoolRegisterTexture(CPU* c, u64 tp, i32 id, u64 t, u64 v) {
     (void)c;
@@ -1920,14 +1977,15 @@ int nvn_program_early_z(u64 serial) {
     pm_unlock(&g_nvn.object.xfb_lock);
     return found;
 }
-/* The early tests a fragment stage's control section asks for: its byte at 0x718, nonzero for on. The game's driver
+/* The early tests a fragment stage's control section asks for: its byte at 0x718, nonzero for on (an Ounce section's
+   at nvn_section_early_z). The game's driver
    reads it in SetShaders (its accessor returns the byte) and writes MANDATED_EARLY_Z (3D method 0x084) with it into
    the program's commands, which BindProgram copies. Without it Vulkan may run a fragment program before its depth
    and stencil tests, and a fragment those tests reject keeps its image stores: one game's light volumes record
    which volumes cover a pixel in an image, and a volume's rejected fragments recorded it where it does not, so a
    floor beside the volume lost its indoor light and took the sky's */
 static void early_z_of(u64 control, u64 serial) {
-    if (!control || !GP(control)[0x718]) return;
+    if (!control || !(ounce_section(control) ? nvn_section_early_z(GP(control)) : GP(control)[0x718])) return;
     LOG_LIMIT(1, "nvn: a fragment program asks for early depth and stencil tests: they run before it\n");
     pm_lock(&g_nvn.object.xfb_lock);
     void* entries = g_nvn.object.early_z;
@@ -2058,7 +2116,7 @@ static int set_shaders(u64 p, i32 n, u64 sd, u64 stride) {
     NvnProgram* o = NVN_OBJ(NvnProgram, p);
     u64 last = 0; /* the control section of the last stage before rasterization */
     u64 tess_controls[2] = {0};
-    u64 fragment = 0; /* the fragment stage's control section, which the Ounce's is not */
+    u64 fragment = 0; /* the fragment stage's control section */
     NvnOunceEntry ounce = {0};
     u32 subroutine_mask = 0;
     i32 i, last_rank = -1;
@@ -2090,7 +2148,7 @@ static int set_shaders(u64 p, i32 n, u64 sd, u64 stride) {
         if (!ounce_section(control) && gr32(control + 8) >= 7 && GP(control)[0x7c0]) subroutine_mask |= 1u << stage;
         if (stage == NVN_SHADER_STAGE_TESS_CONTROL) tess_controls[0] = control;
         if (stage == NVN_SHADER_STAGE_TESS_EVALUATION) tess_controls[1] = control;
-        if (stage == NVN_SHADER_STAGE_FRAGMENT && !ounce_section(control)) fragment = control;
+        if (stage == NVN_SHADER_STAGE_FRAGMENT) fragment = control;
         rank = stage == NVN_SHADER_STAGE_GEOMETRY          ? 3
                : stage == NVN_SHADER_STAGE_TESS_EVALUATION ? 2
                : stage == NVN_SHADER_STAGE_TESS_CONTROL    ? 1

@@ -131,7 +131,13 @@ encoding needing a feature the target lacks is an undefined instruction, as on t
 CPU. `SNX_RECOMPILER_A64_SWITCH`, the default, is the Switch's Cortex-A57 (Armv8.0
 with CRC32 and the Cryptographic Extension). `SNX_RECOMPILER_A64_MAX` takes every
 feature the decoder knows; `llvm_qemu_differential` checks the emitters against QEMU
-for it. `SNX_RECOMPILER_A64_ANDROID` is an Android phone's CPU, as the Android
+for it, and the native back ends' tests check theirs (FEAT_FP8's as FPMR zero has them,
+which is all code can do here: an `MSR` or `MRS` of FPMR is undefined). An instruction a
+native back end has no code for is said at the recompile, once a function: its address,
+the instruction, its word and address, the feature and the target, and how many functions
+there were; LLVM makes them, and where there is no LLVM the instruction is an undefined
+one where it runs.
+`SNX_RECOMPILER_A64_ANDROID` is an Android phone's CPU, as the Android
 driver's native bridge runs it: Armv8.2 with the atomics, RDM, half precision, the
 dot product and LRCPC, without pointer authentication, so that the `PACIASP` and
 `AUTIASP` of the HINT space are NOPs, as on a phone without the feature.
@@ -196,6 +202,14 @@ that can't be written to leaves the JIT working without the file.
 `snx_recompiled_invalidate` clears dispatch entries for compiled functions overlapping
 [addr, addr+size) and purges matching lazy JIT units. Host code stays loaded for running
 threads. An optional callback receives each retired [start, end) span.
+`snx_recompiled_update_code(m, addr, code, size)` copies the guest's current bytes for a
+word-aligned range into the module's own copy of the code, the copy its JIT compiles from,
+and returns the bytes inside the module's ranges. Call it with the changed bytes before
+`snx_recompiled_invalidate`. Without it, a module made for an embedder compiles a patched
+function again from the bytes it was made from. A module made with
+`snx_recompiler_set_live_code` has no copy, so the call returns 0 and writes nothing. JIT workers read copied words
+atomically while they compile. Concurrent updates to one module are serialized, and readers reject copied-image
+reads when the image generation changes; callers still invalidate changed functions after updating the bytes.
 
 For A32 and Thumb, `snx_recompile32` prepares an address range whose blocks are compiled
 on first use by the LLVM block compiler (`src/common/cpu/arm/`), and

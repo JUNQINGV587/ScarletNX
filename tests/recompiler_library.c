@@ -141,6 +141,162 @@ static void jit_cache(struct snx_recompiler* r, uint8_t* mem, const char* folder
     free(file);
 }
 
+/* ---- a switch through a jump table (llvm-mc -triple=aarch64), at SWITCH64: LLVM's compressed table of bytes, its
+   cases counted in instructions from case0, the table permuted so case k is body (5k mod 32) ----
+   f:      cmp w0, #31; b.hi dflt; mov w8, w0; adr x9, table; adr x10, case0; ldrb w11, [x9, x8];
+           add x10, x10, x11, lsl #2; br x10
+   casek:  movz x0, #(7k + 3); ret                    (k 0..31: 32 cases, so many leaders the BR takes the table)
+   dflt:   movz x0, #999; ret
+   table:  .byte (5k mod 32) * 2 for k 0..31 */
+#define SWITCH64 0xA000u
+static unsigned switch_misses;
+static void (*switch_miss_next)(CPU*, uint64_t);
+static void switch_miss(CPU* c, uint64_t pc) {
+    ++switch_misses;
+    switch_miss_next(c, pc);
+}
+static const uint32_t switch_words[] = {
+    0x71007c1f, 0x540008e8, 0x2a0003e8, 0x100008e9, 0x1000008a, 0x3868692b,
+    0x8b0b094a, 0xd61f0140, 0xd2800060, 0xd65f03c0, 0xd2800140, 0xd65f03c0,
+    0xd2800220, 0xd65f03c0, 0xd2800300, 0xd65f03c0, 0xd28003e0, 0xd65f03c0,
+    0xd28004c0, 0xd65f03c0, 0xd28005a0, 0xd65f03c0, 0xd2800680, 0xd65f03c0,
+    0xd2800760, 0xd65f03c0, 0xd2800840, 0xd65f03c0, 0xd2800920, 0xd65f03c0,
+    0xd2800a00, 0xd65f03c0, 0xd2800ae0, 0xd65f03c0, 0xd2800bc0, 0xd65f03c0,
+    0xd2800ca0, 0xd65f03c0, 0xd2800d80, 0xd65f03c0, 0xd2800e60, 0xd65f03c0,
+    0xd2800f40, 0xd65f03c0, 0xd2801020, 0xd65f03c0, 0xd2801100, 0xd65f03c0,
+    0xd28011e0, 0xd65f03c0, 0xd28012c0, 0xd65f03c0, 0xd28013a0, 0xd65f03c0,
+    0xd2801480, 0xd65f03c0, 0xd2801560, 0xd65f03c0, 0xd2801640, 0xd65f03c0,
+    0xd2801720, 0xd65f03c0, 0xd2801800, 0xd65f03c0, 0xd28018e0, 0xd65f03c0,
+    0xd28019c0, 0xd65f03c0, 0xd2801aa0, 0xd65f03c0, 0xd2801b80, 0xd65f03c0,
+    0xd2807ce0, 0xd65f03c0, 0x1e140a00, 0x063c3228, 0x2e241a10, 0x160c0238,
+    0x3e342a20, 0x261c1208, 0x0e043a30, 0x362c2218,
+};
+static void switch64(struct snx_recompiler* r, uint8_t* mem) {
+    int backend;
+    place(mem, SWITCH64, switch_words, sizeof(switch_words) / sizeof(switch_words[0]));
+    for (backend = 1; backend >= 0; --backend) {
+        struct snx_recompiled* m;
+        RtAPI rt;
+        CPU cpu;
+        Seen seen;
+        uint64_t k;
+        char what[256];
+        snx_recompiler_set_backend(r, backend);
+        m = snx_recompile(r, SWITCH64, mem + SWITCH64, sizeof(switch_words));
+        snprintf(what, sizeof(what), "switch, back end %d: snx_recompile: %s", backend, snx_recompiler_error(r));
+        check(m != NULL, what);
+        if (!m) continue;
+#if defined(__x86_64__) && !defined(_WIN32)
+        /* the function, and its table's bytes after it taken for one */
+        snprintf(what, sizeof(what), "the switch's functions are the x86-64 back end's (%lu of %lu)",
+                 (unsigned long)snx_recompiled_x64_functions(m), (unsigned long)snx_recompiled_functions(m));
+        if (backend) check(snx_recompiled_x64_functions(m) == snx_recompiled_functions(m), what);
+#endif
+        snx_runtime_defaults(&rt);
+        rt.svc = svc64;
+        rt.undef = undef64;
+        rt.brk = brk64;
+        switch_miss_next = rt.miss;
+        rt.miss = switch_miss;
+        memset(&cpu, 0, sizeof(cpu));
+        memset(&seen, 0, sizeof(seen));
+        cpu.mem = mem;
+        cpu.rt = &rt;
+        cpu.thread = &seen;
+        check(snx_recompiled_bind(m, &cpu) == 0, "bind the switch");
+        for (k = 0; k < 41; ++k) {
+            uint64_t want = k < 32 ? (k * 5 % 32) * 7 + 3 : 999;
+            cpu.x[0] = k;
+            cpu.x[30] = STOP;
+            snx_recompiled_run(m, &cpu, SWITCH64, STOP);
+            snprintf(what, sizeof(what), "switch, back end %d: case %llu gives %llu, not %llu", backend,
+                     (unsigned long long)k, (unsigned long long)cpu.x[0], (unsigned long long)want);
+            check(cpu.x[0] == want && cpu.pc == STOP && !seen.brks && !seen.undefs, what);
+        }
+        /* each case entered at its own address: the function's dispatch block finds its leader, nothing compiled */
+        switch_misses = 0;
+        for (k = 0; k < 33; ++k) {
+            uint64_t want = k < 32 ? k * 7 + 3 : 999;
+            cpu.x[0] = 12345;
+            cpu.x[30] = STOP;
+            snx_recompiled_run(m, &cpu, SWITCH64 + 0x20 + 8 * k, STOP);
+            snprintf(what, sizeof(what), "switch, back end %d: entered at case %llu, x0 %llu, not %llu", backend,
+                     (unsigned long long)k, (unsigned long long)cpu.x[0], (unsigned long long)want);
+            check(cpu.x[0] == want && cpu.pc == STOP && !seen.brks && !seen.undefs, what);
+        }
+        snprintf(what, sizeof(what), "switch, back end %d: the cases' entries compiled nothing (%u misses)", backend,
+                 switch_misses);
+        check(!switch_misses, what);
+        snx_recompiled_free(m);
+    }
+    snx_recompiler_set_backend(r, 1);
+}
+
+/* The same past its cases, at PAST64 (llvm-mc): f: cbz w1, past; and x0, x0, #31; past: adr x9, table; adr x10, low;
+   ldrb w11, [x9, x0]; add x10, x10, x11, lsl #2; br x10; low: movz x0, #777; ret; casek: movz x0, #(7k + 3); ret
+   (k 0..31); high: movz x0, #888; ret. The table's 32 entries name the cases; with x1 zero the index is not masked, and
+   entry 32 names low, before the first case, 33 case 0's RET, between two, and 34 high, past the last */
+#define PAST64 0xB000u
+static const uint32_t past_words[] = {
+    0x34000041, 0x92401000, 0x10000929, 0x1000008a, 0x3860692b, 0x8b0b094a, 0xd61f0140, 0xd2806120, 0xd65f03c0,
+    0xd2800060, 0xd65f03c0, 0xd2800140, 0xd65f03c0, 0xd2800220, 0xd65f03c0, 0xd2800300, 0xd65f03c0, 0xd28003e0,
+    0xd65f03c0, 0xd28004c0, 0xd65f03c0, 0xd28005a0, 0xd65f03c0, 0xd2800680, 0xd65f03c0, 0xd2800760, 0xd65f03c0,
+    0xd2800840, 0xd65f03c0, 0xd2800920, 0xd65f03c0, 0xd2800a00, 0xd65f03c0, 0xd2800ae0, 0xd65f03c0, 0xd2800bc0,
+    0xd65f03c0, 0xd2800ca0, 0xd65f03c0, 0xd2800d80, 0xd65f03c0, 0xd2800e60, 0xd65f03c0, 0xd2800f40, 0xd65f03c0,
+    0xd2801020, 0xd65f03c0, 0xd2801100, 0xd65f03c0, 0xd28011e0, 0xd65f03c0, 0xd28012c0, 0xd65f03c0, 0xd28013a0,
+    0xd65f03c0, 0xd2801480, 0xd65f03c0, 0xd2801560, 0xd65f03c0, 0xd2801640, 0xd65f03c0, 0xd2801720, 0xd65f03c0,
+    0xd2801800, 0xd65f03c0, 0xd28018e0, 0xd65f03c0, 0xd28019c0, 0xd65f03c0, 0xd2801aa0, 0xd65f03c0, 0xd2801b80,
+    0xd65f03c0, 0xd2806f00, 0xd65f03c0, 0x08060402, 0x100e0c0a, 0x18161412, 0x201e1c1a, 0x28262422, 0x302e2c2a,
+    0x38363432, 0x403e3c3a, 0x00420300,
+};
+static unsigned past_polls;
+static void past_poll(CPU* c) {
+    ++past_polls;
+    atomic_store_explicit(&c->poll, 0, memory_order_relaxed);
+}
+static void switch_past64(struct snx_recompiler* r, uint8_t* mem) {
+    int backend;
+    place(mem, PAST64, past_words, sizeof(past_words) / sizeof(past_words[0]));
+    for (backend = 1; backend >= 0; --backend) {
+        struct snx_recompiled* m;
+        RtAPI rt;
+        CPU cpu = {0};
+        Seen seen = {0};
+        uint64_t k;
+        char what[160];
+        snx_recompiler_set_backend(r, backend);
+        m = snx_recompile(r, PAST64, mem + PAST64, sizeof(past_words));
+        check(m != NULL, "past the cases: snx_recompile");
+        if (!m) continue;
+        snx_runtime_defaults(&rt);
+        rt.svc = svc64;
+        rt.undef = undef64;
+        rt.brk = brk64;
+        rt.poll = past_poll;
+        cpu.mem = mem;
+        cpu.rt = &rt;
+        cpu.thread = &seen;
+        check(snx_recompiled_bind(m, &cpu) == 0, "past the cases: bind");
+        for (k = 0; k < 70; ++k) { /* each index, and each again with a poll pending */
+            uint64_t index = k % 35, want = index < 32 ? 7 * index + 3 : index == 32 ? 777 : index == 33 ? 33 : 888;
+            cpu.x[0] = index;
+            cpu.x[1] = 0;
+            cpu.x[30] = STOP;
+            past_polls = 0;
+            atomic_store_explicit(&cpu.poll, k >= 35, memory_order_relaxed);
+            snx_recompiled_run(m, &cpu, PAST64, STOP);
+            snprintf(what, sizeof(what), "past the cases, back end %d: index %llu gives %llu, not %llu", backend,
+                     (unsigned long long)index, (unsigned long long)cpu.x[0], (unsigned long long)want);
+            check(cpu.x[0] == want && cpu.pc == STOP && !seen.brks && !seen.undefs, what);
+            snprintf(what, sizeof(what), "past the cases, back end %d: index %llu, %u polls taken, not %d", backend,
+                     (unsigned long long)index, past_polls, k >= 35);
+            check(past_polls == (k >= 35), what);
+        }
+        snx_recompiled_free(m);
+    }
+    snx_recompiler_set_backend(r, 1);
+}
+
 static void run64(struct snx_recompiler* r, const char* backend, uint8_t* mem, const char* keep_ir) {
     struct snx_recompiled *m, *first;
     RtAPI rt;
@@ -366,6 +522,20 @@ static void invalidate64(struct snx_recompiler* r, uint8_t* mem) {
     check(snx_recompiled_function(module, helper) == NULL &&
               snx_recompiled_function(module, CODE64) != NULL,
           "invalidation: clear only the helper's dispatch entries");
+    {
+        /* the module's own copy of the code, which its JIT compiles from, follows the guest's bytes */
+        uint32_t words[2] = {0xd503201f, 0xd65f03c0}; /* nop; ret */
+        uint8_t guest[sizeof(words)];                 /* the words as the guest has them in memory */
+        place(guest, 0, words, 2);
+        check(snx_recompiled_update_code(module, helper, guest, sizeof(guest)) == sizeof(guest),
+              "update_code: the words inside the module's ranges are taken");
+        check(snx_recompiled_update_code(module, helper + 2, guest, 4) == 0,
+              "update_code: a misaligned address is refused");
+        check(snx_recompiled_update_code(module, 0x10, guest, 4) == 0,
+              "update_code: an address outside the ranges is not taken");
+        check(snx_recompiled_update_code(module, helper, mem + helper, sizeof(words)) == sizeof(words),
+              "update_code: the original bytes go back");
+    }
     snx_runtime_defaults(&rt);
     rt.svc = svc64;
     rt.undef = undef64;
@@ -565,6 +735,242 @@ static void live64(struct snx_recompiler* r, uint8_t* mem) {
     snx_recompiler_set_live_code(r, 0);
 }
 
+/* A function patched again after the JIT built code for its first patch: the AOT retirement and the JIT's own drop of
+   the unit both clear the pc's slot, and whichever comes second must still leave the pc compilable. The retirement used
+   to empty the slot unconditionally, so the unit's drop (a compare-and-swap against its own code) failed and kept the
+   pc's pending bit: every later miss there answered NULL without queueing, an undefined instruction for good */
+static unsigned repatch_undefs;
+static void repatch_undef(CPU* c, uint64_t pc, uint32_t word) {
+    (void)word;
+    ++repatch_undefs;
+    c->pc = 0;
+    (void)pc;
+}
+static void repatch_svc(CPU* c, uint32_t imm) {
+    (void)c;
+    (void)imm;
+}
+static void repatch_brk(CPU* c, uint64_t pc, uint32_t imm) {
+    (void)pc;
+    (void)imm;
+    c->pc = 0;
+}
+static uint64_t repatch_run(struct snx_recompiled* module, uint8_t* mem, RtAPI* rt, uint64_t entry) {
+    CPU cpu;
+    memset(&cpu, 0, sizeof(cpu));
+    cpu.mem = mem;
+    cpu.rt = rt;
+    cpu.x[31] = 0x6000;
+    if (snx_recompiled_bind(module, &cpu) != 0) return UINT64_MAX;
+    snx_recompiled_run(module, &cpu, entry, 0);
+    return cpu.x[0];
+}
+
+static void test_update_code_live(void) {
+    static uint8_t mem[MEMORY];
+    const uint32_t program[2] = {0x91000400, 0xd65f03c0}; /* add x0,x0,#1; ret */
+    const uint32_t other = 0xd503201f;                      /* nop */
+    uint8_t guest[4];
+    struct snx_recompiler* r = snx_recompiler_new(SNX_RECOMPILER_FLAG_LLVM);
+    check(r != NULL, "update_code live: a recompiler");
+    if (!r) return;
+    place(mem, CODE64, program, 2);
+    snx_recompiler_set_live_code(r, 1);
+    struct snx_recompiled* module = snx_recompile(r, CODE64, mem + CODE64, sizeof(program));
+    check(module != NULL, "update_code live: the module compiles");
+    if (!module) {
+        snx_recompiler_free(r);
+        return;
+    }
+    place(guest, 0, &other, 1);
+    check(snx_recompiled_update_code(module, CODE64, guest, sizeof(guest)) == 0,
+          "update_code live: a live-code module has no copy to update");
+    check(memcmp(mem + CODE64, guest, sizeof(guest)) != 0, "update_code live: the caller's bytes are not written");
+    snx_recompiled_free(module);
+    snx_recompiler_free(r);
+}
+
+static void test_repatch(void) {
+    enum { AT = 0x4000, PATCHED = AT + 0x40 }; /* the entry's line and the patched word's line differ */
+    static uint8_t mem[MEMORY];
+    struct snx_recompiler* r = snx_recompiler_new(SNX_RECOMPILER_FLAG_LLVM);
+    check(r != NULL, "repatch: a recompiler");
+    if (!r) return;
+    uint32_t words[18];
+    for (unsigned i = 0; i < 16; ++i) words[i] = 0xd503201f; /* nop */
+    words[16] = 0x91000400;                                   /* add x0,x0,#1 */
+    words[17] = 0xd65f03c0;                                   /* ret */
+    place(mem, AT, words, 18);
+    snx_recompiler_set_hook_direct_calls(r, 1);
+    struct snx_recompiled* module = snx_recompile(r, AT, mem + AT, sizeof(words));
+    check(module != NULL, "repatch: the module compiles");
+    if (!module) {
+        snx_recompiler_free(r);
+        return;
+    }
+    RtAPI rt;
+    snx_runtime_defaults(&rt);
+    rt.svc = repatch_svc;
+    rt.undef = repatch_undef;
+    rt.brk = repatch_brk;
+    check(repatch_run(module, mem, &rt, AT) == 1, "repatch: the AOT code runs first");
+    int all = 1;
+    for (unsigned k = 2; k <= 6; ++k) {
+        uint32_t word = 0x91000000u | (k << 10); /* add x0,x0,#k */
+        place(mem, PATCHED, &word, 1);
+        snx_recompiled_update_code(module, PATCHED, mem + PATCHED, sizeof(word));
+        snx_recompiled_invalidate(module, PATCHED, 64, NULL, NULL);
+        if (repatch_run(module, mem, &rt, AT) != k) all = 0;
+    }
+    check(all && repatch_undefs == 0,
+          "repatch: each patch of the same function runs, none is an undefined instruction");
+    snx_recompiled_free(module);
+    snx_recompiler_free(r);
+}
+
+#ifndef _WIN32
+/* ---- snx_recompiled_update_code while the module's JIT compiles ----
+   UPDATE: ret, the module's entry and its AOT function. UPDATE_FN: mov x0,#0; add x0,x0,#1; FLIP; ret, which only
+   the JIT compiles, FLIP a nop or cbnz xzr,.-4 (never taken: x0 is 1 either way). UPDATE_FAR: nop; ret, never run */
+#define UPDATE      0x5000u
+#define UPDATE_FN   (UPDATE + 0x10)
+#define UPDATE_FLIP (UPDATE_FN + 8)
+#define UPDATE_FAR  (UPDATE + 0x400)
+#define UPDATE_END  (UPDATE_FAR + 8)
+#define NOP_WORD    0xd503201fu
+#define RET_WORD    0xd65f03c0u
+typedef struct {
+    struct snx_recompiled* m;
+    uint64_t at;       /* the word it writes */
+    uint32_t words[2]; /* in turn */
+    long pause_us;     /* about this long between two writes, 0 for none */
+    _Atomic int stop;
+} UpdateWriter;
+static void nap_us(long us) {
+    struct timespec t;
+    t.tv_sec = us / 1000000;
+    t.tv_nsec = (us % 1000000) * 1000L;
+    while (nanosleep(&t, &t)) {}
+}
+static void* update_writer(void* arg) {
+    UpdateWriter* w = (UpdateWriter*)arg;
+    unsigned seed = 1;
+    for (unsigned n = 0; !atomic_load_explicit(&w->stop, memory_order_acquire); ++n) {
+        uint8_t bytes[4];
+        place(bytes, 0, &w->words[n & 1], 1);
+        snx_recompiled_update_code(w->m, w->at, bytes, sizeof bytes);
+        seed = seed * 1103515245u + 12345u;
+        if (w->pause_us) nap_us(w->pause_us / 2 + (long)((seed >> 16) % (unsigned)w->pause_us));
+    }
+    return NULL;
+}
+/* x0 of a run of UPDATE_FN, UINT64_MAX when it reached no code */
+static uint64_t update_call(struct snx_recompiled* m, uint8_t* mem, RtAPI* rt) {
+    CPU cpu = {0};
+    Seen seen = {0};
+    cpu.mem = mem;
+    cpu.rt = rt;
+    cpu.thread = &seen;
+    cpu.x[30] = STOP;
+    if (snx_recompiled_bind(m, &cpu)) return UINT64_MAX;
+    snx_recompiled_run(m, &cpu, UPDATE_FN, STOP);
+    return seen.undefs ? UINT64_MAX : cpu.x[0];
+}
+static struct snx_recompiled* update_module(struct snx_recompiler* r, uint8_t* mem, RtAPI* rt) {
+    const uint32_t ret = RET_WORD, fn[] = {0xd2800000, 0x91000400, NOP_WORD, RET_WORD}, far[] = {NOP_WORD, RET_WORD};
+    memset(mem + UPDATE, 0, UPDATE_END - UPDATE);
+    place(mem, UPDATE, &ret, 1);
+    place(mem, UPDATE_FN, fn, 4);
+    place(mem, UPDATE_FAR, far, 2);
+    snx_runtime_defaults(rt);
+    rt->svc = svc64;
+    rt->undef = undef64;
+    rt->brk = brk64;
+    return snx_recompile(r, UPDATE, mem + UPDATE, UPDATE_END - UPDATE);
+}
+
+static double update_seconds(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+/* A word that changes while the JIT compiles its function: discovery and the emitter see one version of it. Read
+   again by the emitter, a cbnz where discovery had read the nop branched to UPDATE_FN + 4, a block discovery never
+   made, and the JIT's thread died in LLVMBuildBr within the first runs. A batch whose word changed is compiled again,
+   so the runs stop after 30 s on a host slow enough to lose most batches that way */
+static void update_flip64(struct snx_recompiler* r, uint8_t* mem) {
+    RtAPI rt;
+    struct snx_recompiled* m = update_module(r, mem, &rt);
+    pthread_t writer;
+    unsigned wrong = 0, runs = 0;
+    check(m != NULL, "update flip: a module");
+    if (!m) return;
+    UpdateWriter w = {.m = m, .at = UPDATE_FLIP, .words = {NOP_WORD, 0xb5ffffffu /* cbnz xzr,.-4 */}, .pause_us = 5000};
+    if (pthread_create(&writer, NULL, update_writer, &w)) {
+        check(0, "update flip: the writer thread");
+        snx_recompiled_free(m);
+        return;
+    }
+    for (double end = update_seconds() + 30; runs < 100 && update_seconds() < end; ++runs) {
+        snx_recompiled_invalidate(m, UPDATE_FN, 16, NULL, NULL);
+        wrong += update_call(m, mem, &rt) != 1;
+    }
+    atomic_store_explicit(&w.stop, 1, memory_order_release);
+    pthread_join(writer, NULL);
+    check(runs && !wrong, "update flip: each run of a function while another thread flips one of its words gives 1");
+    snx_recompiled_free(m);
+}
+
+typedef struct {
+    struct snx_recompiled* m;
+    uint8_t* mem;
+    RtAPI* rt;
+    uint64_t x0;
+    _Atomic int done;
+} UpdateRun;
+static void* update_runner(void* arg) {
+    UpdateRun* u = (UpdateRun*)arg;
+    u->x0 = update_call(u->m, u->mem, u->rt);
+    atomic_store_explicit(&u->done, 1, memory_order_release);
+    return NULL;
+}
+/* 1 when UPDATE_FN, invalidated, runs to x0 = 1 within 20 s while two threads write as w says without a pause: two,
+   so that one of them is writing whenever the other is off its CPU */
+static int update_runs_beside(struct snx_recompiled* m, uint8_t* mem, RtAPI* rt, UpdateWriter* w) {
+    UpdateRun u = {.m = m, .mem = mem, .rt = rt};
+    pthread_t writers[2], runner;
+    int started = 0;
+    snx_recompiled_invalidate(m, UPDATE_FN, 16, NULL, NULL);
+    atomic_store_explicit(&w->stop, 0, memory_order_relaxed);
+    while (started < 2 && !pthread_create(&writers[started], NULL, update_writer, w)) ++started;
+    int ran = started == 2 && !pthread_create(&runner, NULL, update_runner, &u);
+    for (long ms = 0; ran && ms < 20000 && !atomic_load_explicit(&u.done, memory_order_acquire); ms += 10) nap(10);
+    int in_time = ran && atomic_load_explicit(&u.done, memory_order_acquire);
+    atomic_store_explicit(&w->stop, 1, memory_order_release); /* a run still waiting gets its code once they stop */
+    while (started) pthread_join(writers[--started], NULL);
+    if (ran) pthread_join(runner, NULL);
+    return in_time && u.x0 == 1;
+}
+
+/* Updates that leave the words a JIT batch read as they were, of another range of the module or the same bytes again,
+   keep the batch: thrown away for any update of the module, no batch finished while a writer never paused, and a run
+   that took milliseconds waited until the writer stopped */
+static void update_elsewhere64(struct snx_recompiler* r, uint8_t* mem) {
+    RtAPI rt;
+    struct snx_recompiled* m = update_module(r, mem, &rt);
+    check(m != NULL, "update elsewhere: a module");
+    if (!m) return;
+    UpdateWriter far = {.m = m, .at = UPDATE_FAR, .words = {NOP_WORD, 0xd2800021u /* mov x1,#1 */}};
+    check(update_runs_beside(m, mem, &rt, &far),
+          "update elsewhere: a function compiles while another word of its module changes without a pause");
+    UpdateWriter same = {.m = m, .at = UPDATE_FLIP, .words = {NOP_WORD, NOP_WORD}};
+    check(update_runs_beside(m, mem, &rt, &same),
+          "update elsewhere: a function compiles while its own word is written again with the bytes it holds");
+    snx_recompiled_free(m);
+}
+#endif
+
 int main(int argc, char** argv) {
     uint8_t* mem = (uint8_t*)calloc(MEMORY, 1);
     struct snx_recompiler* r;
@@ -573,6 +979,8 @@ int main(int argc, char** argv) {
     if (!mem) return 2;
     place(mem, CODE64, a64_words, sizeof(a64_words) / sizeof(a64_words[0]));
     place(mem, CODE32, a32_words, sizeof(a32_words) / sizeof(a32_words[0]));
+    test_update_code_live();
+    test_repatch();
     check(snx_recompiler_abi() == SNX_ABI, "the library's ABI is this cpu.h's");
     check(!snx_recompiler_has(0) && !snx_recompiler_new(0), "flags must name a backend");
     check(!snx_recompiler_has(2) && !snx_recompiler_new(2), "flags must name LLVM");
@@ -595,12 +1003,16 @@ int main(int argc, char** argv) {
               "the Switch and max A64 targets");
         snx_recompiler_set_jobs(r, 2);
         run64(r, "llvm", mem, keep_ir);
+        switch64(r, mem);
+        switch_past64(r, mem);
         progress64(r, mem);
         schedule64(r);
         invalidate64(r, mem);
         live64(r, mem);
 #ifndef _WIN32
         spin64(r, mem);
+        update_flip64(r, mem);
+        update_elsewhere64(r, mem);
 #endif
         jit_cache(r, mem, cache);
         run32(r, mem);

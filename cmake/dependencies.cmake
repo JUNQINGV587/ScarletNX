@@ -236,30 +236,10 @@ if((SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY) OR SNX_BUILD_3DS OR snx_vita_runtime OR
     set(snx_ffmpeg_images OFF)
     if(SNX_BUILD_ANDROID AND NOT SNX_TOOLS_ONLY)
         set(snx_ffmpeg_images ON)
-        # zlib (zlib license) for FFmpeg's PNG decoder and encoder, which call its inflate and deflate, and for the
-        # Android driver's libz.so, the NDK's zlib that an app's native code links (src/android/bridge/hle_zlib.c).
-        # libdeflate has no stream interface, so they get zlib itself: static, as libz.a in a folder of its own that
-        # FFmpeg's configure finds with -lz
+        # zlib for FFmpeg's PNG decoder and encoder and the Android driver's libz.so (cmake/zlib.cmake)
         AddJsonPackage(NAME zlib DOWNLOAD_ONLY FORCE_BUNDLED_PACKAGE ON)
         snx_cpmfile(snx_zlib_hash zlib hash)
-        add_library(snx_zlib STATIC
-            "${zlib_SOURCE_DIR}/adler32.c" "${zlib_SOURCE_DIR}/compress.c" "${zlib_SOURCE_DIR}/crc32.c"
-            "${zlib_SOURCE_DIR}/deflate.c" "${zlib_SOURCE_DIR}/infback.c" "${zlib_SOURCE_DIR}/inffast.c"
-            "${zlib_SOURCE_DIR}/inflate.c" "${zlib_SOURCE_DIR}/inftrees.c" "${zlib_SOURCE_DIR}/trees.c"
-            "${zlib_SOURCE_DIR}/uncompr.c" "${zlib_SOURCE_DIR}/zutil.c" "${zlib_SOURCE_DIR}/gzclose.c"
-            "${zlib_SOURCE_DIR}/gzlib.c" "${zlib_SOURCE_DIR}/gzread.c" "${zlib_SOURCE_DIR}/gzwrite.c")
-        target_include_directories(snx_zlib SYSTEM PUBLIC "${zlib_SOURCE_DIR}")
-        if(NOT WIN32)
-            # what zlib's own configure finds: gz*.c's read, write and close
-            target_compile_definitions(snx_zlib PRIVATE Z_HAVE_UNISTD_H)
-        endif()
-        # position independent: FFmpeg is built with --enable-pic, and the Android runtime is a shared library. The
-        # folder is a generator expression so that a multi-config generator (Xcode) adds no folder for the
-        # configuration to it
-        set(snx_zlib_lib_dir "${PROJECT_BINARY_DIR}/zlib/lib")
-        set_target_properties(snx_zlib PROPERTIES OUTPUT_NAME z POSITION_INDEPENDENT_CODE ON
-                                                  ARCHIVE_OUTPUT_DIRECTORY "$<1:${snx_zlib_lib_dir}>")
-        snx_quiet(snx_zlib)
+        include("${PROJECT_SOURCE_DIR}/cmake/zlib.cmake")
     endif()
     snx_cpmfile(snx_ffmpeg_hash ffmpeg hash)
     AddJsonPackage(NAME ffmpeg DOWNLOAD_ONLY FORCE_BUNDLED_PACKAGE ON)
@@ -286,35 +266,65 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
     snx_package_file(yuzu-oss-extension)
     include("${PROJECT_SOURCE_DIR}/cmake/shared_fonts.cmake")
 
+    # NVIDIA Streamline's headers (MIT, NVIDIA-RTX/Streamline v2.14.16), the DLSS backend's (src/nx/gpu/vk/upscaler/dlss.cpp),
+    # in a Windows build alone, as Streamline runs there alone. One file each, the ones it includes: the repository also
+    # holds NVIDIA's NGX SDK, whose licence keeps it out of this program, and nothing else of it is fetched. NVIDIA's
+    # runtime (its DLLs) is never fetched or shipped: the user downloads it (docs/user/dlss.md)
+    if(WIN32)
+        set(snx_streamline_include "${PROJECT_BINARY_DIR}/streamline/include")
+        # each pinned in cpmfile.json by its SHA-512, as streamline_<its name, sl_dlss_h>
+        foreach(snx_sl_name IN ITEMS sl.h sl_struct.h sl_consts.h sl_version.h sl_result.h sl_appidentity.h
+                                     sl_device_wrappers.h sl_core_api.h sl_core_types.h sl_dlss.h sl_helpers_vk.h)
+            string(MAKE_C_IDENTIFIER "${snx_sl_name}" snx_sl_id)
+            snx_package_file(streamline_${snx_sl_id})
+            # one folder, as they include each other by name
+            configure_file("${streamline_${snx_sl_id}_SOURCE_DIR}/${snx_sl_name}"
+                           "${snx_streamline_include}/${snx_sl_name}" COPYONLY)
+        endforeach()
+    endif()
+
     # AMD FidelityFX Super Resolution 2.2.1 (MIT), the temporal upscaler the Ounce's DLSS evaluations run through
     # (src/nx/gpu/vk/fsr2, gpu/nvn/nvn_dlss.c): its library and Vulkan backend's sources and its GLSL passes, which the
     # build compiles (cmake/fsr2_shaders.cmake). The archive's prebuilt tools (tools/sc, Windows programs) are not used
     AddJsonPackage(NAME fidelityfx-fsr2 DOWNLOAD_ONLY FORCE_BUNDLED_PACKAGE ON)
-    # Its library carries one patch (.patch/fidelityfx-fsr2/0001-memory-types.patch): the backend takes device-local
+    # Its library carries two patches (.patch/fidelityfx-fsr2). 0001-memory-types.patch: the backend takes device-local
     # memory only from a type that is not host-visible, and found none where every device-local type is (lavapipe, some
-    # integrated GPUs), so no context could be made there
+    # integrated GPUs), so no context could be made there. 0002-fsr1-easu-glsl.patch: FSR 1's EASU in its ffx_fsr1.h,
+    # which FSR 2 never compiles, puts a comparison in an integer, which GLSL refuses. The upscalers' spatial pass
+    # compiles it (src/nx/gpu/vk/upscaler/up_easu.comp)
     set(snx_fsr2_api_dir "${FidelityFX-FSR2_SOURCE_DIR}/src/ffx-fsr2-api")
+    # SMAA 1x (Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando Navarro and Diego Gutierrez, MIT), the
+    # anti-aliasing the upscalers run before a copy or a spatial upscale (src/nx/gpu/vk/upscaler/up_smaa.comp): its
+    # reference shader and its precomputed area and search textures, each pinned in cpmfile.json at the commit its
+    # repository ends at
+    snx_package_file(smaa-shader)
+    snx_package_file(smaa-area-tex)
+    snx_package_file(smaa-search-tex)
     # RenderDoc's in-application API, one header (renderdoc, gpu/vk/renderdoc.c), from the release tag
     snx_package_file(renderdoc_app)
 
     # Tracy client, for SNX_TRACY development builds.
     if(SNX_TRACY)
+        option(SNX_TRACY_WAIT_STACKS "Keep Tracy's wait stacks on: they walk the stack at every context switch and need root and tracefs" OFF)
         # The sampler and the callstacks it needs are on; the zones take no callstacks of their own, so it costs
-        # nothing per zone. The wait stacks are off: they walk the stack at every context switch, and they need
-        # root and tracefs. The zones' own validation is on: it queues a ZoneValidation next to every zone begin,
-        # end, text and value, doubled per zone and only while a server is attached, which is the price of a run
-        # that says when this runtime's zone pairs are unbalanced. The code the zones are in and the pictures of the
-        # presented frame are on too: both cost nothing until a GUI asks for them.
+        # nothing per zone. The wait stacks are off by default: SNX_TRACY_WAIT_STACKS=ON keeps them on. They walk the
+        # stack at every context switch, and they need root and tracefs. The zones' own validation is on: it queues a
+        # ZoneValidation next to every zone begin, end, text and value, doubled per zone and only while a server is
+        # attached, which is the price of a run that says when this runtime's zone pairs are unbalanced. The code the
+        # zones are in and the pictures of the presented frame are on too: both cost nothing until a GUI asks for them.
         # Fibers are on: the guest's waits get a lane each, named by what the thread blocked on. Tracy's set_option
         # makes TRACY_FIBERS a PUBLIC define, so the runtime that emits them sees it too.
         set(snx_tracy_options "TRACY_ENABLE ON" "TRACY_ON_DEMAND ON" "TRACY_NO_CRASH_HANDLER ON" "TRACY_STATIC ON"
                               "TRACY_MANUAL_LIFETIME ON" "TRACY_NO_WAIT_STACKS ON" "TRACY_FIBERS ON")
+        if(SNX_TRACY_WAIT_STACKS)
+            list(REMOVE_ITEM snx_tracy_options "TRACY_NO_WAIT_STACKS ON")
+        endif()
         if(NOT ANDROID)
             list(APPEND snx_tracy_options "TRACY_ONLY_LOCALHOST ON" "TRACY_NO_BROADCAST ON")
         endif()
         AddJsonPackage(NAME tracy FORCE_BUNDLED_PACKAGE ON OPTIONS ${snx_tracy_options})
-        # The sampler waits for the runtime to ask for it, and samples at 1 kHz unless TRACY_SAMPLING_HZ says
-        # otherwise.
+        # The sampler waits for the runtime to ask for it and samples at 1 kHz; TRACY_SAMPLING_HZ is this build's
+        # compile-time define, not an environment variable.
         target_compile_definitions(TracyClient PRIVATE TRACY_SAMPLING_PROFILER_MANUAL_START TRACY_SAMPLING_HZ=1000)
         snx_quiet(TracyClient)
     endif()
@@ -406,6 +416,15 @@ if(SNX_BUILD_GUI)
     target_include_directories(snx_miniz SYSTEM PUBLIC "${miniz_SOURCE_DIR}")
     target_compile_definitions(snx_miniz PUBLIC MINIZ_NO_STDIO MINIZ_NO_ZLIB_COMPATIBLE_NAMES)
     snx_quiet(snx_miniz)
+endif()
+
+# GNU Unifont 18.0.01 (GPL-2.0-or-later with the font embedding exception, or OFL-1.1), the .hex of all its planes GNU
+# releases: the menu draws the CJK and Hangul blocks of game titles with its glyphs, which scripts/build-glyphs.py
+# takes from it (src/gui/CMakeLists.txt)
+if(SNX_BUILD_GUI)
+    snx_package_file(unifont)
+    snx_cpmfile(snx_unifont_version unifont version)
+    set(snx_unifont_hex "${Unifont_SOURCE_DIR}/unifont_all-${snx_unifont_version}.hex.gz")
 endif()
 
 # The boot splash's drawings are SVGs, drawn at the splash's size by lunasvg (MIT) on plutovg (MIT; its rasterizer and

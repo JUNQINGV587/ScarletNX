@@ -34,6 +34,8 @@
 #include "nx/runtime/main.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
+#include "nx/runtime/platform/tracy.h"
+#include "common/platform/time.h"
 #include "common/utilities/common.h"
 #include "common/utilities/endian.h"
 #include <stdlib.h>
@@ -201,8 +203,16 @@ static int abort_needed(u32 r) {
     fatal("nn::fs::%s failed with result 0x%x (error %04u-%04u), which the SDK stops the game on", function, r,
           2000 + (r & 0x1ff), (r >> 9) & 0x1fff);
 }
-/* the end of a function that returns a Result */
+/* the end of a function that returns a Result. An error is rare, so it gets a trace message naming the call and why
+   it failed; a successful call pays one test of r. The reason is the Result's module and description, the same numbers
+   the log's fatal names when the SDK stops on the error */
 static u32 done(const char* function, u32 r) {
+    if (r && snx_tracy_attached()) {
+        char text[96];
+        int n = snprintf(text, sizeof text, "nn fs %s error %04u-%04u", function, 2000 + (r & 0x1ff),
+                         (r >> 9) & 0x1fff);
+        if (n > 0) SNX_MSG(text, (size_t)(n < (int)sizeof text ? n : (int)sizeof text - 1));
+    }
     if (r && abort_needed(r)) stop(function, r);
     return r;
 }
@@ -368,21 +378,27 @@ static u32 rom_load(NRom* rm, int game, u64 data_id) {
     *rm = (NRom){0};
     rm->game = game;
     rm->data_id = data_id;
+    /* a mount reads the image's tables, which is where an nn::fs mount spends its time. The value is the table bytes
+       once read, the text says which image and why a mount failed */
+    SNX_ZONE_TV(z, "nn fs rom load", 0, "%s", game ? "game image" : "data image");
     if (game)
         snprintf(what, sizeof what, "the game's RomFS");
     else {
         snprintf(what, sizeof what, "the data %016llx", (unsigned long long)data_id);
         u32 r = fs_storage_open(data_id, &rm->st);
         if (r) {
+            SNX_ZONE_TEXT(z, "storage %x failed", r);
             *rm = (NRom){0};
             return r;
         }
     }
     if (rom_tables(rm, what)) {
+        SNX_ZONE_TEXT(z, "%s tables unreadable", what);
         if (!game) fs_storage_close(&rm->st);
         *rm = (NRom){0};
         return R_OUT_OF_RANGE; /* a storage the SDK's RomFS cannot read either */
     }
+    SNX_ZONE_VALUE(z, rm->dirs_size + rm->files_size);
     rm->used = 1;
     return 0;
 }
@@ -665,24 +681,6 @@ static u32 query_rom_cache_size(CPU* c, const char* symbol, u64 size) {
 }
 u32 nnfs_query_mount_rom_cache_size(CPU* c, u64 size) { return query_rom_cache_size(c, SYM_QUERY_ROM_CACHE, size); }
 
-/* MountRom and QueryMountRomCacheSize for the program of the application at index, whose RomFS the SDK opens: this
-   program's own when index is this program's (g_program, 0 for a game of one program), answered as the overloads
-   without an index are. The native layer has no other program's RomFS, so the game stops, naming both */
-static void own_program(const char* function, i32 index) {
-    if (index != g_program)
-        fatal("nn::fs::%s: the game asks for the RomFS of program %d of its application, and this is program %d, the "
-              "only one whose RomFS the runtime mounts",
-              function, index, g_program);
-}
-u32 nnfs_mount_rom_program(CPU* c, u64 name, i32 index, u64 cache, u64 cache_size) {
-    own_program("MountRom", index);
-    return mount_rom(c, SYM_MOUNT_ROM_PROGRAM, name, cache, cache_size);
-}
-u32 nnfs_query_mount_rom_cache_size_program(CPU* c, u64 size, i32 index) {
-    own_program("QueryMountRomCacheSize", index);
-    return query_rom_cache_size(c, SYM_QUERY_ROM_PROGRAM, size);
-}
-
 /* The data storage of id (an add-on content's, or a system archive's, as OpenDataStorageByDataId gives it), its tables
    read into a free image (lock held): the image, or -1 with *r the Result */
 static int data_image(u64 id, u32* r) {
@@ -699,6 +697,57 @@ static int data_image(u64 id, u32* r) {
 /* The add-on content of index: its data id is the game's base id + index, as aoc's PrepareAddOnContent, which
    always finds it in place here, gives it */
 static int aoc_image(i32 index, u32* r) { return data_image(aoc_base_id(g_hle.kernel.title_id) + (u64)(u32)index, r); }
+
+/* MountRom and QueryMountRomCacheSize for the program of the application at index, whose RomFS the SDK opens. A
+   program's ID is its application's plus its index, so this program's index is the low byte of its title ID, or
+   g_program for a collection's other program. Its own index is answered as the overloads without an index are. Another
+   program's RomFS is the image system/archives/<its ID>.romfs in the game's data folder: a Switch 2 Edition's program
+   1 mounts program 0, the Switch 1 game, when its own RomFS lacks the Switch 1 game's files */
+static i32 own_index(void) { return g_program ? g_program : (i32)(g_hle.kernel.title_id & (SNX_PROGRAMS_MAX - 1)); }
+/* the image of program index's RomFS, another program's (lock held): the image, or -1 with *r the Result. The game
+   stops when the image is not there: archive_node would give an empty one, and the program needs its files */
+static int program_image(const char* function, i32 index, u32* r) {
+    u64 id = g_hle.kernel.title_id - (u64)own_index() + (u64)(u32)index;
+    char path[64];
+    snprintf(path, sizeof path, "system/archives/%016llx.romfs", (unsigned long long)id);
+    FILE* f = index >= 0 && index < SNX_PROGRAMS_MAX ? fs_open_read(path, NULL) : NULL;
+    if (!f)
+        fatal("nn::fs::%s: the game asks for the RomFS of program %d of its application (%016llx), and this is program "
+              "%d. Put that program's RomFS image in the game's data folder as %s",
+              function, index, (unsigned long long)id, own_index(), path);
+    fclose(f);
+    return data_image(id, r);
+}
+u32 nnfs_mount_rom_program(CPU* c, u64 name, i32 index, u64 cache, u64 cache_size) {
+    if (index == own_index()) return mount_rom(c, SYM_MOUNT_ROM_PROGRAM, name, cache, cache_size);
+    pm_lock(&g_nnfs.lock);
+    u32 r;
+    int rom = program_image("MountRom", index, &r);
+    if (rom >= 0) {
+        r = mount_image(c, "MountRom", name, cache, cache_size, (u32)rom);
+        if (r) rom_release((u32)rom);
+    }
+    pm_unlock(&g_nnfs.lock);
+    return done("MountRom", r);
+}
+u32 nnfs_query_mount_rom_cache_size_program(CPU* c, u64 size, i32 index) {
+    if (index == own_index()) return query_rom_cache_size(c, SYM_QUERY_ROM_PROGRAM, size);
+    pm_lock(&g_nnfs.lock);
+    u32 r = 0;
+    u64 n = 0;
+    if (!size)
+        r = R_NULL_ARGUMENT;
+    else {
+        int rom = program_image("QueryMountRomCacheSize", index, &r);
+        if (rom >= 0) {
+            n = rom_cache_size(rom_at((u32)rom));
+            rom_release((u32)rom);
+        }
+    }
+    pm_unlock(&g_nnfs.lock);
+    if (!r) put_size(c, size, n);
+    return done("QueryMountRomCacheSize", r);
+}
 
 u32 nnfs_mount_add_on_content(CPU* c, u64 name, i32 index, u64 cache, u64 cache_size) {
     pm_lock(&g_nnfs.lock);
@@ -1043,6 +1092,8 @@ void nnfs_close_file(CPU* c, u64 h) {
 static u32 file_read(const char* function, u64 h, u64 read_out, int want_read, i64 offset, u64 buffer, u64 size,
                      u64* n) {
     *n = 0;
+    SNX_ZONE_V(z, "nn fs read", size); /* the bytes asked for; the text says which call and where it failed */
+    SNX_ZONE_TEXT(z, "%s", function);
     NFile* f = file_take(function, h);
     u32 r = f->sticky;
     if (!r && want_read && !read_out) r = R_NULL_ARGUMENT;
@@ -1057,6 +1108,7 @@ static u32 file_read(const char* function, u64 h, u64 read_out, int want_read, i
             r = R_OUT_OF_RANGE;
     }
     if (r || !size) {
+        SNX_ZONE_TEXT(z, "%s %s", function, r ? "check failed" : "no bytes");
         pm_unlock(&g_nnfs.lock);
         return r;
     }
@@ -1064,6 +1116,7 @@ static u32 file_read(const char* function, u64 h, u64 read_out, int want_read, i
         fs_lock();
         r = fs_file_read(file_data(f), (u64)offset, buffer, size, n);
         fs_unlock();
+        SNX_ZONE_TEXT(z, "%s save %llu bytes", function, (unsigned long long)*n);
         pm_unlock(&g_nnfs.lock);
         return r;
     }
@@ -1072,21 +1125,36 @@ static u32 file_read(const char* function, u64 h, u64 read_out, int want_read, i
     NRom* rm = rom_at(f->rom);
     u64 data = rm->data + rom_file_u64(rm, f->entry, 8), total = rom_file_u64(rm, f->entry, 16);
     pm_unlock(&g_nnfs.lock);
-    if ((u64)offset > total) return R_OUT_OF_RANGE; /* at the end reads nothing, past it is an error */
+    if ((u64)offset > total) {
+        SNX_ZONE_TEXT(z, "%s past end", function);
+        return R_OUT_OF_RANGE; /* at the end reads nothing, past it is an error */
+    }
     u64 count = size < total - (u64)offset ? size : total - (u64)offset;
     if (rm->game ? romfs_read_guest(data + (u64)offset, buffer, count)
-                 : fs_storage_read_guest(&rm->st, data + (u64)offset, buffer, count))
+                 : fs_storage_read_guest(&rm->st, data + (u64)offset, buffer, count)) {
+        SNX_ZONE_TEXT(z, "%s host read failed", function);
         return R_OUT_OF_RANGE;
+    }
     /* the game's RomFS is one storage whatever mount reads it (the SDK read it through one IStorage); another
        image is its own */
     u64 wait = fs_pace_read(rm->game ? (const void*)&g_hle.fs : (const void*)&rm->st, data + (u64)offset, count);
+    SNX_ZONE_TEXT(z, "%s romfs %llu bytes", function, (unsigned long long)count);
+    SNX_PLOT("nn fs read bytes", (double)count);
+    /* the console's pace is a blocking wait: end the zone before it, so the zone times only the read's CPU work */
+    SNX_ZONE_END(z);
     if (wait) {
         /* off the thread's core, as the console's storage read blocks the thread and its core runs the others: a
            movie's decoder, on the core of its read-ahead, set up too late to free its first buffers otherwise */
         KThread* t = kthread_cur();
+#if defined(SNX_TRACY)
+        u64 t0 = plat_ns();
+#endif
         core_leave(t);
         plat_sleep_ns((i64)wait);
         core_enter(t);
+#if defined(SNX_TRACY)
+        SNX_PLOT("nn fs pace ms", (double)(t0 ? plat_ns() - t0 : 0) / 1e6);
+#endif
     }
     *n = count;
     return 0;
@@ -1126,7 +1194,11 @@ u32 nnfs_read_file_exact_option(CPU* c, u64 h, i64 offset, u64 buffer, u64 size,
 
 /* FileAccessor::Write: the sticky Result, the checks in their order, the write, then the file's state */
 u32 nnfs_write_file(CPU* c, u64 h, i64 offset, u64 buffer, u64 size, u64 option) {
-    if (!is_native(h)) return (u32)sdk_own(c, SYM_WRITE_FILE);
+    SNX_ZONE_V(z, "nn fs write", size);
+    if (!is_native(h)) {
+        SNX_ZONE_TEXT(z, "SDK own WriteFile");
+        return (u32)sdk_own(c, SYM_WRITE_FILE);
+    }
     u32 opt = snx_ld_le32(hook_host(c, option)); /* WriteOption: bit 0 flushes */
     NFile* f = file_take("WriteFile", h);
     u32 r = f->sticky;
@@ -1155,6 +1227,8 @@ u32 nnfs_write_file(CPU* c, u64 h, i64 offset, u64 buffer, u64 size, u64 option)
         }
     }
     pm_unlock(&g_nnfs.lock);
+    SNX_ZONE_TEXT(z, "%llu bytes %s", (unsigned long long)size, r ? "failed" : "written");
+    SNX_PLOT("nn fs write bytes", (double)(r ? 0 : size));
     return done("WriteFile", r);
 }
 u32 nnfs_flush_file(CPU* c, u64 h) {
@@ -1316,6 +1390,7 @@ static int rom_dir_next(CPU* c, NDir* d, u64 out) {
         e = d->next_file;
         d->next_file = rom_file_field(rm, e, 1);
         is_dir = 0;
+        if ((u64)e + ROM_FILE_FIXED > rm->files_size) return 0; /* an entry the table does not hold: no file */
         size = rom_file_u64(rm, e, 16);
     } else
         return 0;

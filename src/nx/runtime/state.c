@@ -30,11 +30,14 @@
 #include "nx/runtime/clock.h"
 #include "nx/runtime/main.h"
 #include "nx/runtime/pause.h"
+#include "nx/runtime/platform/backend.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/overlay.h"
 #include "nx/runtime/platform/plat.h"
+#include "nx/runtime/platform/tracy.h"
 #include "nx/runtime/platform/ui.h"
 #include "nx/runtime/platform/unattended.h"
+#include "nx/runtime/platform/wait_screen.h"
 #include "nx/runtime/options.h"
 #include "nx/runtime/state_fns.h"
 #include "nx/runtime/state_io.h"
@@ -81,6 +84,7 @@ static StateIo buf_io(Buf* b) {
 /* a section of the reader read whole into b: 0, or -1 when the state has none or it is damaged */
 static int section_read(StateReader* r, const char* tag, u64* schema, Buf* b) {
     u64 n;
+    SNX_ZONE_T(z_read, "state section read", "%s", tag);
     if (sr_begin(r, tag, schema)) return -1;
     n = sr_left(r);
     b->p = (u8*)malloc(n ? (size_t)n : 1);
@@ -89,6 +93,7 @@ static int section_read(StateReader* r, const char* tag, u64* schema, Buf* b) {
     return b->p && !sr_get(r, b->p, n) ? 0 : -1;
 }
 static int section_write(StateWriter* w, const char* tag, u64 schema, const Buf* b) {
+    /* no zone here: sw_put can wait for a compression worker, and a wait does not belong in a zone */
     return sw_begin(w, tag, schema) || sw_put(w, b->p, b->n) || sw_end(w) ? -1 : 0;
 }
 
@@ -320,9 +325,12 @@ static int check_memory(StateReader* r, char* why, size_t whysize) {
     MemBlock* blk = NULL;
     u8* buf = (u8*)malloc(GROUP * PAGE);
     int ok = 0;
+    SNX_ZONE_CS(z_check_mem, "state memory check", 0);
     if (!buf || sr_begin(r, "MEMORY", NULL) || sr_get(r, hdr, sizeof hdr) || sr_get(r, &nblk, 4) ||
         sr_get(r, &nspan, 4) || nblk > (1u << 24) || nspan > (1u << 24))
         goto out;
+    SNX_ZONE_VALUE(z_check_mem, nblk);
+    SNX_ZONE_TEXT(z_check_mem, "%u blocks, %u spans", nblk, nspan);
     blk = (MemBlock*)malloc(sizeof *blk * (nblk + 1));
     span_off = (u64*)malloc(8 * (nspan + 1));
     span_size = (u64*)malloc(8 * (nspan + 1));
@@ -386,11 +394,14 @@ static int load_memory(StateReader* r, ShmPlan* plan, char* why, size_t whysize)
     MemBlock* blk = NULL;
     u8* buf = (u8*)malloc(GROUP * PAGE);
     int r_ = -1, begun = 0;
+    SNX_ZONE_CS(z_load_mem, "state memory load", 0);
     memset(plan, 0, sizeof *plan);
     memset(shm_size, 0, sizeof shm_size);
     if (!buf || sr_begin(r, "MEMORY", NULL) || sr_get(r, hdr, sizeof hdr) || sr_get(r, &nblk, 4) ||
         sr_get(r, &nspan, 4) || nblk > (1u << 24) || nspan > (1u << 24))
         goto bad;
+    SNX_ZONE_VALUE(z_load_mem, nblk);
+    SNX_ZONE_TEXT(z_load_mem, "%u blocks, %u spans", nblk, nspan);
     blk = (MemBlock*)malloc(sizeof *blk * (nblk + 1));
     span_off = (u64*)malloc(8 * (nspan + 1));
     span_size = (u64*)malloc(8 * (nspan + 1));
@@ -408,9 +419,11 @@ static int load_memory(StateReader* r, ShmPlan* plan, char* why, size_t whysize)
         s = &g_hle.svcmem.shmems[slot - 1];
         shm_size[slot - 1] = span_size[i];
         if (s->o.type == KO_SHMEM && s->pool && ((s->size + PAGE - 1) & ~(u64)(PAGE - 1)) == span_size[i]) {
+            SNX_ZONE_T(z_shm, "state shmem", "reused slot %u", slot - 1);
             plan->host[slot - 1] = s->host;
             plan->off[slot - 1] = s->pool - 1;
         } else {
+            SNX_ZONE_T(z_shm, "state shmem", "made slot %u", slot - 1);
             plan->host[slot - 1] = mem_pool_host(span_size[i], &plan->off[slot - 1]);
             plan->made[slot - 1] = 1;
             if (!plan->host[slot - 1]) {
@@ -974,7 +987,9 @@ static int hle_check(const Hle* h) {
         if (o->data) { /* a slot of its service's pool, whose first u32 names it (svcobj_new_data) */
             uintptr_t off = (uintptr_t)o->data - HLE_LO;
             u32 id;
-            if ((uintptr_t)o->data < HLE_LO || o->datasize < 4 || off > sizeof(Hle) - o->datasize) return -1;
+            if ((uintptr_t)o->data < HLE_LO || o->datasize < 4 || o->datasize > sizeof(Hle) ||
+                off > sizeof(Hle) - o->datasize)
+                return -1;
             memcpy(&id, (const u8*)h + off, 4);
             if (id != i + 1) return -1;
         }
@@ -1051,7 +1066,9 @@ static int stage_hle(Hle* ld, Buf* heap, const Names* names, Buf* fs_paths) {
         heap->at += n;
         switch (kind) {
             case HEAP_STORAGE:
+                /* its bytes, as many as the storage says it holds (one for an empty one, as they were written) */
                 if (slot >= AM_STORAGES || ld->am.storages[slot].d ||
+                    n != (ld->am.storages[slot].size ? ld->am.storages[slot].size : 1) ||
                     !(ld->am.storages[slot].d = (u8*)malloc((size_t)(n ? n : 1))))
                     goto bad;
                 memcpy(ld->am.storages[slot].d, p, (size_t)n);
@@ -1253,12 +1270,17 @@ int state_save(const char* path, char* why, size_t whysize) {
     u64 t0 = plat_ns(), t_land = 0, t_gather = 0, t_memory = 0;
     u8* thumb = NULL;
     int r = -1, has_nvn = nvn_loader_active();
+    SNX_SECTION_SCOPED_C(snx_save_state, "save state", 3);
+    SNX_FRAME_SCOPED(f_state, "state"); /* save and load each frame one discontinuous set */
     why[0] = 0;
     if (game_pause()) {
         snprintf(why, whysize, "the game didn't stop to be saved");
         return -1;
     }
-    if (savable(why, whysize) || (has_nvn && nvn_state_save(&nio, why, whysize))) goto resume;
+    if (savable(why, whysize) || (has_nvn && nvn_state_save(&nio, why, whysize))) {
+        SNX_ZONE_T(z_nosave, "state save refused", "%s", why[0] ? why : "can't be saved");
+        goto resume;
+    }
     /* the frame the player sees, the game held: what the menu and the launcher show of the state */
     thumb = (u8*)malloc((size_t)SNX_UI_IMAGE_W * SNX_UI_IMAGE_H * 4);
     if (thumb && (!g_renderer->thumbnail || g_renderer->thumbnail(thumb, SNX_UI_IMAGE_W, SNX_UI_IMAGE_H))) {
@@ -1273,21 +1295,31 @@ int state_save(const char* path, char* why, size_t whysize) {
     header_make(&h);
     h.thumb_w = SNX_UI_IMAGE_W;
     h.thumb_h = SNX_UI_IMAGE_H;
-    if (save_hle(&hle, &heap, &names) || gpu_state_save(&gio) || video_save(&vio) || fs_state_temp_save(&tio) ||
-        (g_renderer->save_targets && g_renderer->save_targets(&sio))) {
-        snprintf(why, whysize, "the game's state couldn't be gathered (the log says what)");
-        goto end;
+    {
+        SNX_ZONE(z_gather, "state gather");
+        SNX_ZONE_VALUE(z_gather, 0); /* 0 gathered, 1 refused */
+        if (save_hle(&hle, &heap, &names) || gpu_state_save(&gio) || video_save(&vio) || fs_state_temp_save(&tio) ||
+            (g_renderer->save_targets && g_renderer->save_targets(&sio))) {
+            SNX_ZONE_VALUE(z_gather, 1);
+            snprintf(why, whysize, "the game's state couldn't be gathered (the log says what)");
+            SNX_ZONE_TEXT(z_gather, "refused: %s", why);
+            goto end;
+        }
     }
     t_gather = plat_ns();
+    SNX_PLOT("rt state gather bytes", (double)(hle.n + heap.n + gpu.n + surf.n + video.n + temp.n + nvn.n));
     snprintf(folder, sizeof folder, "%sstates", g_exedir);
     plat_mkdir(folder);
     w = sw_open(path, &h, thumb, why, whysize);
     if (!w) goto end;
-    if (section_write(w, "HLE", state_schema(), &hle) || names_write(w, &names) || section_write(w, "HEAP", 1, &heap) ||
-        section_write(w, "GPU", 1, &gpu) || section_write(w, "VIDEO", 1, &video) ||
-        (has_nvn && section_write(w, "NVN", nvn_schema(), &nvn)) || (surf.n && section_write(w, "SURF", 1, &surf)) ||
-        section_write(w, "TEMP", 1, &temp) || (t_memory = plat_ns(), save_memory(w, why, whysize))) {
-        sw_abort(w);
+    /* no zone over the writes: sw_put can wait for a compression worker; the sections' bytes are plots at the end */
+    if (section_write(w, "HLE", state_schema(), &hle) || names_write(w, &names) ||
+        section_write(w, "HEAP", 1, &heap) || section_write(w, "GPU", 1, &gpu) ||
+        section_write(w, "VIDEO", 1, &video) || (has_nvn && section_write(w, "NVN", nvn_schema(), &nvn)) ||
+        (surf.n && section_write(w, "SURF", 1, &surf)) || section_write(w, "TEMP", 1, &temp) ||
+        (t_memory = plat_ns(), save_memory(w, why, whysize))) {
+        sw_abort(w); /* waits for the workers: outside any zone */
+        SNX_ZONE_T(z_nowrite, "state write refused", "%s", why[0] ? why : "a section failed");
         if (!why[0]) snprintf(why, whysize, "the file couldn't be written");
         goto end;
     }
@@ -1305,6 +1337,7 @@ resume:
     free(video.p);
     free(temp.p);
     free(nvn.p);
+    SNX_PLOT("rt state save ms", (double)(plat_ns() - t0) / 1e6);
     if (r)
         WARN("state: %s wasn't saved: %s\n", path, why);
     else
@@ -1331,6 +1364,8 @@ int state_load(const char* path, char* why, size_t whysize) {
     u64 cur_off[KSHMEM_MAX], cur_size[KSHMEM_MAX], schema = 0, t0 = plat_ns(), t_checked;
     u32 i;
     int staged = 0, has_temp, has_nvn;
+    SNX_SECTION_SCOPED_C(snx_load_state, "load state", 3);
+    SNX_FRAME_SCOPED(f_state, "state");
     why[0] = 0;
     memset(&vs, 0, sizeof vs);
     r = sr_open(path, &h, why, whysize);
@@ -1402,6 +1437,8 @@ int state_load(const char* path, char* why, size_t whysize) {
         goto refuse;
     if (check_memory(r, why, whysize)) goto refuse;
     t_checked = plat_ns();
+    SNX_PLOT("rt state load bytes", (double)(hle.n + heap.n + gpu.n + surf.n + video.n + temp.n + nvn.n));
+    SNX_PLOT("rt state load check ms", (double)(t_checked - t0) / 1e6);
     if (game_pause()) {
         snprintf(why, whysize, "the game didn't stop to be loaded over");
         goto refuse;
@@ -1449,11 +1486,14 @@ int state_load(const char* path, char* why, size_t whysize) {
     free(video.p);
     free(temp.p);
     free(nvn.p);
+    SNX_PLOT("rt state load ms", (double)(plat_ns() - t0) / 1e6);
     LOG("state: loaded %s (guest time %.3f s) at frame %d in %.0f ms (checked %.0f)\n", path, (double)h.guest_ns / 1e9,
         atomic_load_explicit(&g_frames, memory_order_relaxed), (double)(plat_ns() - t0) / 1e6,
         (double)(t_checked - t0) / 1e6);
     return 0;
-refuse:
+refuse:;
+    SNX_ZONE_T(z_noload, "state load refused", "%s", why[0] ? why : "refused");
+    SNX_PLOT("rt state load ms", (double)(plat_ns() - t0) / 1e6);
     sr_close(r);
     if (staged) staged_free((Hle*)hle.p);
     gpu_state_staged_free(gs);
@@ -1560,6 +1600,16 @@ static void state_unattended(void) {
 }
 
 /* ============================================================ the player's: hotkeys and the menu */
+/* a load the player asked for (loading_begin): when it began, the slot's words for its box, whether the box shows, and
+   its thread's: ticking, told it is over, and gone */
+static struct {
+    struct {
+        u64 began_ms;
+        char slot[24];
+        int shown, ticking;
+        _Atomic int over, gone;
+    } loading;
+} g_state;
 static int g_slot = 1;        /* the slot F7 and F8 use, 1 to state_slots */
 static int g_ask, g_ask_slot; /* a save, load or delete asked for, done at the next pass */
 static int g_menu_pause;      /* the save states' pages hold the game: 1 paused, -1 it didn't stop */
@@ -1641,6 +1691,57 @@ void state_slot_next(void) {
         toast("Slot %d: %s", g_slot, when);
     }
 }
+/* A load the player asked for (F8, the menu's Load) that takes long: a box over the game greyed out
+   (overlay_loading) from SNX_WAIT_LOADING_MS on, shown by a thread of its own as this one is busy with the load,
+   until it ends: then it goes with the state's first frame, or at once when the load failed, whose notification
+   follows. The presses that came meanwhile are dropped, as they did nothing; the log says how long it took and
+   whether the box showed */
+static void loading_tick(void* unused) {
+    (void)unused;
+    while (!atomic_load_explicit(&g_state.loading.over, memory_order_acquire)) {
+        if (!g_state.loading.shown && snx_loading_shows(g_state.loading.began_ms, plat_ns() / 1000000u)) {
+            ui_lock();
+            overlay_loading(g_state.loading.slot, plat_ns());
+            ui_unlock();
+            g_state.loading.shown = 1;
+        }
+        if (g_state.loading.shown && g_renderer->refresh) g_renderer->refresh();
+        plat_sleep_ns(16000000);
+    }
+    atomic_store_explicit(&g_state.loading.gone, 1, memory_order_release);
+}
+static void loading_begin(const char* slot) {
+    g_state.loading.began_ms = plat_ns() / 1000000u;
+    g_state.loading.shown = 0;
+    g_state.loading.ticking = 0;
+    snprintf(g_state.loading.slot, sizeof g_state.loading.slot, "%s", slot);
+    atomic_store_explicit(&g_state.loading.over, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_state.loading.gone, 0, memory_order_relaxed);
+    if (!backend_window_shown()) return; /* nothing to show it in */
+    if (plat_thread(loading_tick, NULL, 0)) {
+        char why[256];
+        WARN("state: no thread for the load's box (%s): the load shows none\n", snx_os_error(why, sizeof why));
+        return;
+    }
+    g_state.loading.ticking = 1;
+}
+static void loading_over(int failed) {
+    atomic_store_explicit(&g_state.loading.over, 1, memory_order_release);
+    while (g_state.loading.ticking && !atomic_load_explicit(&g_state.loading.gone, memory_order_acquire))
+        plat_sleep_ns(1000000);
+    if (g_state.loading.shown) {
+        ui_lock();
+        if (failed)
+            overlay_loading_end();
+        else
+            overlay_loading_done();
+        ui_unlock();
+    }
+    backend_presses_drop();
+    LOG("state: the load took %llu ms with the player waiting, %s\n",
+        (unsigned long long)(plat_ns() / 1000000u - g_state.loading.began_ms),
+        g_state.loading.shown ? "its box shown" : "too quick for its box");
+}
 /* what was asked, done, and said */
 static void ask_do(int op, int slot) {
     char name[16], label[24], start[24], path[sizeof g_exedir + sizeof g_exename + 64], why[256];
@@ -1679,13 +1780,16 @@ static void ask_do(int op, int slot) {
         WARN("state: %s wasn't loaded: %s\n", path, why);
         return;
     }
+    loading_begin(start);
     /* the game as it was, kept to go back to: a load of the auto slot itself keeps that one */
     if (g_settings.save_state_backup && slot) {
         char back[sizeof path], bwhy[256];
         state_path(back, sizeof back, "auto");
         if (state_save(back, bwhy, sizeof bwhy)) WARN("state: no auto slot before the load: %s\n", bwhy);
     }
-    if (state_load(path, why, sizeof why))
+    const int failed = state_load(path, why, sizeof why);
+    loading_over(failed);
+    if (failed)
         toast("Not loaded: %s", why);
     else
         toast("Loaded %s", label);

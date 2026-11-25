@@ -8,7 +8,10 @@ void vk_descriptors_layout(VkDescriptorSetLayout layout, const VkDescriptorSetLa
 /* cb_addr: the constant buffer slots that heaps take by address (vk_cb_addr_mask); descriptor buffers write them all */
 VkDescriptorSet vk_descriptors_write(VkDescriptorSetLayout layout, u32 count, const VkWriteDescriptorSet* writes,
                                      u32 cb_addr);
-void vk_descriptors_bind(VkCommandBuffer cb, VkPipelineLayout layout, u32 first, u32 count, const VkDescriptorSet* sets);
+/* ndyn dynamic offsets dyn of the sets' dynamic constant buffers (cb_dynamic.h), in the order of set and binding: only
+   with descriptor sets, 0 otherwise */
+void vk_descriptors_bind(VkCommandBuffer cb, VkPipelineLayout layout, u32 first, u32 count, const VkDescriptorSet* sets,
+                         u32 ndyn, const u32* dyn);
 /* Heap bindings invalidate legacy descriptor state across both pipeline bind points. */
 void vk_descriptors_invalidate(void);
 void vk_descriptors_reset(u32 slot);
@@ -31,4 +34,10 @@ VkResult vk_buffer_create(const VkBufferCreateInfo* info, const DevMemWant* allo
 void rec_CmdBindDescriptorBuffersEXT(VkCommandBuffer cb, VkDeviceAddress address);
 void rec_CmdSetDescriptorBufferOffsetsEXT(VkCommandBuffer cb, VkPipelineLayout layout, u32 first, u32 count,
                                          const VkDeviceSize* offsets);
+/* the same at another bind point, a compute pipeline's (vk_descriptors_bind_compute) */
+void rec_CmdSetDescriptorBufferOffsetsBP(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipelineLayout layout, u32 first,
+                                         u32 count, const VkDeviceSize* offsets);
+/* a compute dispatch's set, at the compute bind point: descriptor sets, or descriptor buffers where the renderer
+   uses them (descriptor heaps have no compute path) */
+void vk_descriptors_bind_compute(VkCommandBuffer cb, VkPipelineLayout layout, u32 first, VkDescriptorSet set);
 #endif

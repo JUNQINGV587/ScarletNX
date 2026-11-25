@@ -6,6 +6,7 @@
 #ifndef SNX_TOOLS_SAILGEN_H
 #define SNX_TOOLS_SAILGEN_H
 
+#include <setjmp.h>
 #include <stddef.h>
 
 typedef unsigned long long SgU64;
@@ -42,6 +43,8 @@ enum {
     N_ASSERT,  /* assert(...): the arguments are skipped */
     N_WILD,    /* _ in a pattern */
     N_TYPE,    /* a type, as its source text (name) */
+    N_UPDATE,  /* [a with b = d], or [a with b .. c = d]: bits a with bit b (bits b to c) made d */
+    N_WHILE,   /* while a do b */
     N_COUNT
 };
 
@@ -125,13 +128,28 @@ unsigned sg_find(const char* name, int kind);
 /* every definition of name and kind, in order: the first after index after (0 to start), 0 when none is left */
 unsigned sg_find_next(const char* name, int kind, unsigned after);
 void sg_fail(unsigned node, const char* fmt, ...);
+/* where sg_fail goes instead of exiting, after saying why (the generator's, for SAILGEN_SKIP: a clause it can't make
+   left out), NULL to exit */
+extern jmp_buf* sg_fail_jump;
 void* sg_alloc(size_t size);
 char* sg_read(const char* path, size_t* size);
 
 /* --extract: the definitions roots reach, copied into out (extract.c) */
 int sg_extract(const char* roots_path, const char* out_path, const char* const* inputs, int input_count);
-/* the generator: C for the decode functions roots names (gen.c), with the back end's file copied at its top */
-int sg_generate(const char* roots_path, const char* backend_path, const char* profile_path, const char* out_path);
+/* the generator: C for the decode functions roots names (gen.c), with the back end's files copied at its top */
+int sg_generate(const char* roots_path, const char* const* backend_paths, int backend_count, const char* profile_path,
+                const char* out_path);
+/* GPU mode (gpu.c): C for the roots' instructions and fusions of a GPU's ISA, apart from the CPUs' generator */
+int sg_gpu_generate(const char* roots_path, const char* const* backend_paths, int backend_count, const char* out_path);
+/* --sdm: the instruction pages of Intel's SDM Vol. 2 out of pdftotext's text of it, with the overrides (sdm.c) */
+int sg_sdm_extract(const char* text_path, const char* out_path, const char* const* override_paths,
+                   int override_count);
+/* --isel: the x86-64 back end's instruction selection, from the SDM's pages and the back end's primitives (isel.c) */
+int sg_isel(const char* pages_path, const char* ops_path, const char* out_path, const char* report_path);
+/* --encoders: an encoder for each clause of the scattered decode function prefix (__DecodeA64) of the inputs, or of
+   those that call a root of roots_path (enc.c) */
+int sg_encoders(const char* prefix, const char* roots_path, const char* const* inputs, int input_count,
+                const char* out_path);
 /* the output buffer, written only when it changes */
 void sg_out(const char* fmt, ...);
 int sg_flush(const char* path);

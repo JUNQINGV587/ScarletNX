@@ -361,8 +361,8 @@ static void ngs_atrac9_and_extra_busses(VitaProcess* p, VitaThread* t, uint32_t 
     assert(CALL(n, "sceNgsRackInit", system, buffer_info, description, rack_out) == 0);
     assert(CALL(n, "sceNgsRackGetVoiceHandle", at9_rack, 0, voice_out) == 0);
     assert(vita_read32(p, voice_out) == at9_voice);
-    /* a Simple Atrac9 voice has the simple voice's six modules: Need For Speed Most Wanted bypasses modules 1-5 and
-       locks module 3's params (a game that got an error there read the SceNgsBufferInfo it never got and crashed), and
+    /* a Simple Atrac9 voice has the simple voice's six modules: a racing game bypasses modules 1-5 and locks
+       module 3's params (a game that got an error there read the SceNgsBufferInfo it never got and crashed), and
        a seventh is out of range */
     for (uint32_t module = 0; module < 6; ++module) {
         vita_write32(p, buffer_info, 0);
@@ -468,6 +468,38 @@ static void host_file(VitaProcess* p, const char* name, const void* bytes, size_
     assert(!fclose(f));
     free(path);
 }
+/* a block of 64 KiB for a case's own names and words. A host commits whole pages of its own, 16 KiB on Apple's ARM and
+   up to 64 KiB on Linux's, at an address that is a multiple of them: a block of the Vita's 4 KiB would leave the next
+   one made (SceLibc's heap, at the first fopen) at an address such a host refuses */
+static uint32_t words_block(VitaProcess* p) {
+    uint32_t block = vita_alloc(p, &p->user, 0x10000, 0x10000);
+    assert(block && !(block & 0xffff));
+    return block;
+}
+
+/* A request whose size rounds to nothing (within a page of 4 GiB) is refused: it used to round to 0, take a slot no
+   free list would ever see again, and, where the host's page is larger than the guest's, commit a page for it */
+static void impossible_size(VitaProcess* p) {
+    assert(vita_alloc(p, &p->user, 0xfffff800u, 0x1000) == 0);
+    assert(vita_alloc(p, &p->user, 0xffffffffu, 0x1000) == 0);
+    uint32_t a = vita_alloc(p, &p->user, 0x1000, 0x1000);
+    assert(a && vita_mapped(p, a, 0x1000));
+    vita_free(p, a);
+}
+
+/* A block that comes back inside a host page another block still holds must read zero, as one on a fresh page does:
+   the page stays mapped, so a range committed into it would otherwise repeat what the last block left there */
+static void shared_page_zero(VitaProcess* p) {
+    uint32_t a = vita_alloc(p, &p->user, 0x1000, 0x1000), b = vita_alloc(p, &p->user, 0x1000, 0x1000);
+    assert(a && b == a + 0x1000);
+    memset(vita_ptr(p, a), 0x5a, 0x1000);
+    vita_free(p, a);
+    assert(vita_alloc(p, &p->user, 0x1000, 0x1000) == a);
+    for (unsigned i = 0; i < 0x1000; i += 4) assert(vita_read32(p, a + i) == 0);
+    vita_free(p, a);
+    vita_free(p, b);
+}
+
 /* SceLibc's fread and fwrite take a size and a count, and 0x10000 times 0x10001 is 0x10000 more than 4 GiB: the bytes
    the call may move are the product's, which no buffer holds, not what 32 bits keep of it, which this one does. The
    stream's own block is made first, so the buffer is the last and the page past its end is no one's */
@@ -476,8 +508,7 @@ static void libc_stream_sizes(VitaProcess* p, VitaThread* t) {
     static unsigned char half[0x10000];
     memset(half, 0x5a, sizeof half);
     host_file(p, "two-buffers.bin", half, sizeof half, 2);
-    uint32_t names = vita_alloc(p, &p->user, 0x1000, 0x1000);
-    assert(names);
+    uint32_t names = words_block(p);
     strcpy(vita_ptr(p, names), "ux0:two-buffers.bin"), strcpy(vita_ptr(p, names + 0x40), "r+b");
     uint32_t file = CALL(libc, "fopen", names, names + 0x40);
     assert(file);
@@ -490,6 +521,44 @@ static void libc_stream_sizes(VitaProcess* p, VitaThread* t) {
     assert(CALL(libc, "fwrite", buffer, 0x10000, 0x10001, file) == 0 && CALL(libc, "ftell", file) == 0);
     assert(CALL(libc, "fread", buffer, 0x10000, 1, file) == 1 && bytes[0] == 0x5a && bytes[0xffff] == 0x5a);
     assert(CALL(libc, "fclose", file) == 0);
+}
+/* the calls that fill a structure of the game's answer an error for a pointer to no memory of its own, and write
+   nothing: a semaphore's and the free memory's, a module's, a stat's, the controller's and the touch panel's */
+static void unmapped_outputs(VitaProcess* p, VitaThread* t, uint32_t mem) {
+    const VitaHle* kernel = vita_hle_kernel;
+    strcpy(vita_ptr(p, mem), "sema");
+    uint32_t sema = CALL(kernel, "sceKernelCreateSema", mem, 0, 1, 10, 0);
+    assert(sema && !(sema & 0x80000000u));
+    assert(CALL(kernel, "sceKernelGetSemaInfo", sema, UNMAPPED, 0x3c) == SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    assert(CALL(kernel, "sceKernelGetSemaInfo", sema, mem + 0x100, 0x3c) == 0 && vita_read32(p, mem + 0x100) == 0x3c);
+    assert(CALL(kernel, "sceKernelGetFreeMemorySize", UNMAPPED) == SCE_KERNEL_ERROR_INVALID_ARGUMENT);
+    assert(CALL(vita_hle_ctrl, "sceCtrlPeekBufferPositive", 0, UNMAPPED, 1) == 0x80340001u);
+    assert(CALL(vita_hle_ctrl, "sceCtrlPeekBufferPositive", 0, mem + 0x200, 1) == 1);
+    strcpy(vita_ptr(p, mem), "ux0:two-buffers.bin");
+    assert(CALL(vita_hle_io, "sceIoGetstat", mem, UNMAPPED) & 0x80000000u);
+    assert(CALL(vita_hle_io, "sceIoGetstat", mem, mem + 0x300) == 0);
+    /* a semaphore's count and a signal are any 32 bits: a signal past the most, or past what a count holds, is the
+       overflow, and the count stays */
+    assert(CALL(kernel, "sceKernelSignalSema", sema, 0x7fffffff) == SCE_KERNEL_ERROR_SEMA_OVF);
+    assert(CALL(kernel, "sceKernelSignalSema", sema, 9) == 0);
+    assert(CALL(kernel, "sceKernelSignalSema", sema, 1) == SCE_KERNEL_ERROR_SEMA_OVF);
+    uint32_t free_run = CALL(kernel, "sceKernelCreateSema", mem, 0, 2, 0, 0); /* no most */
+    assert(CALL(kernel, "sceKernelSignalSema", free_run, 0x7fffffff) == SCE_KERNEL_ERROR_SEMA_OVF);
+    assert(CALL(kernel, "sceKernelGetSemaInfo", free_run, mem + 0x100, 0x3c) == 0 && vita_read32(p, mem + 0x12c) == 2);
+    /* a path's parts are parted by a backslash too where the host parts them so: ".." between two names no file */
+    strcpy(vita_ptr(p, mem), "ux0:..\\..\\outside.txt"), strcpy(vita_ptr(p, mem + 0x40), "wb");
+    assert(CALL(vita_hle_libc, "fopen", mem, mem + 0x40) == 0);
+}
+/* a field's width from an argument is any 32 bits, and its digits any number: the widest field is 4096, to the left
+   for a negative width, the most negative one too */
+static void libc_field_widths(VitaProcess* p, VitaThread* t, uint32_t mem) {
+    const VitaHle* libc = vita_hle_libc;
+    uint32_t out = words_block(p);
+    char* text = vita_ptr(p, out);
+    strcpy(vita_ptr(p, mem), "%*d");
+    assert(CALL(libc, "sprintf", out, mem, 0x80000000u, 5) == 4096 && text[0] == '5' && text[4095] == ' ');
+    strcpy(vita_ptr(p, mem), "%99999999999d");
+    assert(CALL(libc, "sprintf", out, mem, 5) == 4096 && text[4095] == '5' && text[0] == ' ');
 }
 /* a file opened in a mounted archive closes with it: once the archive is unmounted its handle names no file, where it
    would read the archive's freed tables. The archive is a PSARC of one stored file: the header, the manifest's entry
@@ -505,9 +574,7 @@ static void fios_archive_unmount(VitaProcess* p, VitaThread* t) {
     psarc[93] = 8, psarc[95] = 16;                                 /* each block stored whole */
     memcpy(psarc + 96, "data.bin", 8), memcpy(psarc + 104, data, 16);
     host_file(p, "one-file.psarc", psarc, sizeof psarc, 1);
-    uint32_t names = vita_alloc(p, &p->user, 0x1000, 0x1000), mount = names + 0x200, file = names + 0x204,
-             buffer = names + 0x300;
-    assert(names);
+    uint32_t names = words_block(p), mount = names + 0x200, file = names + 0x204, buffer = names + 0x300;
     strcpy(vita_ptr(p, names), "ux0:one-file.psarc"), strcpy(vita_ptr(p, names + 0x40), "ux0:packed");
     strcpy(vita_ptr(p, names + 0x80), "ux0:packed/data.bin");
     assert(CALL(io, "sceFiosArchiveMountSync", 0, mount, names, names + 0x40, 0, 0, 0) == 0);
@@ -542,8 +609,12 @@ int main(void) {
     ngs_atrac9_and_extra_busses(p, t, mem);
     gxm_program_metadata(p, t, mem);
     gxm_texture_transfers(p, t, mem);
+    impossible_size(p);
+    shared_page_zero(p);
     /* these make blocks of their own after mem, which is the last one no longer */
     libc_stream_sizes(p, t);
+    unmapped_outputs(p, t, mem);
+    libc_field_widths(p, t, mem);
     fios_archive_unmount(p, t);
     vita_process_free(p);
     assert(!snx_remove_tree(root));

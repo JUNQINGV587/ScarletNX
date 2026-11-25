@@ -56,6 +56,9 @@ static struct {
     char logged[2048]; /* a line as options.c makes its longest (say_deprecated's), never cut */
     char said[4096]; /* every line, one after the other */
     int write;       /* plat_replace_file replaces the file: ini_open writes it */
+    /* the notice over the game's first frame (overlay_settings_notice): its lists, and how many were given */
+    char game[1024], global[1024], kind[256];
+    int notices;
 } g_test;
 
 int plat_power_on_charger(void) {
@@ -118,6 +121,12 @@ int backend_ini(const char* k, const char* v) {
 int hud_debug_set(const char* text) {
     (void)text;
     return 0;
+}
+void overlay_settings_notice(const char* game, const char* global, const char* kind) {
+    snprintf(g_test.game, sizeof g_test.game, "%s", game);
+    snprintf(g_test.global, sizeof g_test.global, "%s", global);
+    snprintf(g_test.kind, sizeof g_test.kind, "%s", kind);
+    g_test.notices++;
 }
 int unattended_known(const char* k) {
     (void)k;
@@ -396,6 +405,66 @@ static void test_astc_bc_old(void) {
     g_test.write = 0;
 }
 
+/* compress_shader_cache, deprecated: the shader cache is always packed, when the game closes. An old .ini's value is
+   said with what holds now, whichever it was, and stays in the file under [Deprecated] */
+static void test_compress_shader_cache_old(void) {
+    char* text;
+    g_test.write = 1;
+    text = open_ini("[Performance]\ncompress_shader_cache=0\n");
+    CHECK(strstr(g_test.said,
+                 "settings: compress_shader_cache=0, deprecated, chooses nothing: the shaders and pipelines "
+                 "a session makes are held in memory and written when the game closes, packed with zstd "
+                 "at its highest level (docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\n[Deprecated]\n") &&
+          strstr(text, "\n[Deprecated]\n") < strstr(text, "\ncompress_shader_cache=0\n"));
+    free(text);
+    text = open_ini("[Performance]\ncompress_shader_cache=1\n");
+    CHECK(strstr(g_test.said, "settings: compress_shader_cache=1, deprecated, chooses nothing: "));
+    free(text);
+    text = open_ini("[Performance]\nprepare_shaders=2\n"); /* an .ini without it says nothing of it */
+    CHECK(!strstr(g_test.said, "compress_shader_cache"));
+    free(text);
+    g_test.write = 0;
+}
+
+/* bc7_cache_gb, deprecated with the BC7 cache's file: an old .ini's value is said with what bounds the cache now, and
+   stays in the file under [Deprecated] */
+static void test_bc7_cache_gb_old(void) {
+    char* text;
+    g_test.write = 1;
+    text = open_ini("[Graphics]\nbc7_cache_gb=3\n");
+    CHECK(strstr(g_test.said,
+                 "settings: bc7_cache_gb=3, deprecated, bounds nothing: the BC7 cache has no file now, and "
+                 "holds the ASTC levels used most in memory, up to an eighth of the machine's, from 64 MB "
+                 "to 2048 MB (docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\n[Deprecated]\n") &&
+          strstr(text, "\n[Deprecated]\n") < strstr(text, "\nbc7_cache_gb=3\n"));
+    free(text);
+    text = open_ini("[Graphics]\nastc_mode=0\n"); /* an .ini without it says nothing of it */
+    CHECK(!strstr(g_test.said, "bc7_cache_gb"));
+    free(text);
+    g_test.write = 0;
+}
+
+/* unit_cache_gb, deprecated with the code units' folder: an old .ini's value is said with what bounds the units now,
+   and stays in the file under [Deprecated] */
+static void test_unit_cache_gb_old(void) {
+    char* text;
+    g_test.write = 1;
+    text = open_ini("[Launch]\nunit_cache_gb=7\n");
+    CHECK(strstr(g_test.said,
+                 "settings: unit_cache_gb=7, deprecated, bounds nothing: the code units are not kept on the disk now, "
+                 "and are held in memory while ScarletNX runs, up to 1% of the machine's memory and at most "
+                 "unit_cache_ceil_mb (docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\n[Deprecated]\n") &&
+          strstr(text, "\n[Deprecated]\n") < strstr(text, "\nunit_cache_gb=7\n"));
+    free(text);
+    text = open_ini("[Launch]\nunit_cache_ceil_mb=64\n"); /* an .ini without it says nothing of it */
+    CHECK(!strstr(g_test.said, "unit_cache_gb"));
+    free(text);
+    g_test.write = 0;
+}
+
 /* the log's settings line: the Display, Graphics, Audio and Performance settings off their default, each with its
    default */
 static void test_settings_line(void) {
@@ -541,6 +610,183 @@ static void test_vk_descriptors_old(void) {
     free(text);
     ini_override("vk_descriptors", NULL);
     ini_override("vk_descriptors_mode", NULL);
+    g_test.write = 0;
+}
+/* write_tracking_hot, deprecated for write_tracking_hot_pages (0 Off, 1 On, 2 Auto, its default): in an old .ini its 1
+   is On, carried to the new key, and its 0, the default every .ini had written, leaves the new key at its own Auto; any
+   other value is said with the default it leaves; the new key given, the old one is not read. On the command line 0
+   is that run's Off, said, with no "not a setting", and the file keeps its own */
+/* emulated_cores (0 Off, 1 On; 1 by default) in an old .ini: 1, the default every game's .ini had written, leaves
+   emulated_cores_mode at its own Auto; 0 is Off. Said once: the file is written with emulated_cores_mode, and
+   emulated_cores under [Deprecated], which the next run does not read. --emulated_cores=N (either name) is this run's
+   --emulated-cores-mode=N, unless the command line gives that one too; another value is said with the one in effect */
+static void test_emulated_cores_old(void) {
+    char *text, *again;
+    CHECK(options_emulated_cores_old("0", 0) == 0 && options_emulated_cores_old("0", 1) == 0);
+    CHECK(options_emulated_cores_old("1", 0) == -1 && options_emulated_cores_old("1", 1) == 1);
+    CHECK(options_emulated_cores_old("2", 0) == -2 && options_emulated_cores_old("", 1) == -2);
+    g_test.write = 1;
+    text = open_ini("[Debug]\nemulated_cores=1\n");
+    CHECK(strstr(g_test.said, "settings: emulated_cores=1, deprecated, was its default: emulated_cores_mode takes its "
+                              "own, 2 (Auto), Off for an Ounce program and On for the others "
+                              "(docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\nemulated_cores_mode=2\n") && strstr(text, "\n[Deprecated]\n") &&
+          strstr(text, "\n[Deprecated]\n") < strstr(text, "\nemulated_cores=1\n"));
+    again = open_ini(text); /* the next run: emulated_cores_mode given, emulated_cores not read again */
+    CHECK(!strstr(g_test.said, "settings: emulated_cores=") && again && strstr(again, "\nemulated_cores_mode=2\n"));
+    free(again);
+    free(text);
+    text = open_ini("[Debug]\nemulated_cores=0\n");
+    CHECK(strstr(g_test.said, "settings: emulated_cores=0, deprecated, is emulated_cores_mode=0 (Off) now "
+                              "(docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\nemulated_cores_mode=0\n"));
+    free(text);
+    text = open_ini("[Debug]\nemulated_cores=yes\n");
+    CHECK(strstr(g_test.said, "settings: emulated_cores=yes, deprecated, is neither 0 nor 1: emulated_cores_mode takes "
+                              "its default, 2 (Auto) (docs/user/deprecations.md)\n"));
+    free(text);
+    text = open_ini("[Debug]\nemulated_cores=0\nemulated_cores_mode=1\n");
+    CHECK(!strstr(g_test.said, "settings: emulated_cores=") && text && strstr(text, "\nemulated_cores_mode=1\n"));
+    free(text);
+    ini_override("emulated_cores", "1");
+    text = open_ini("[Debug]\nemulated_cores_mode=2\n");
+    CHECK(!strstr(g_test.said, "is not a setting") && ini_overridden("emulated_cores_mode") &&
+          !strcmp(ini_overridden("emulated_cores_mode"), "1"));
+    CHECK(strstr(g_test.said, "settings: --emulated_cores=1 is deprecated: this run reads it as "
+                              "--emulated-cores-mode=1 (On) (docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\nemulated_cores_mode=2\n"));
+    free(text);
+    ini_override("emulated_cores", NULL);
+    ini_override("emulated_cores_mode", NULL);
+    ini_override("emulated-cores", "0"); /* the name, as a driver passes --emulated-cores=0 on */
+    text = open_ini("[Debug]\nemulated_cores_mode=2\n");
+    CHECK(!strstr(g_test.said, "is not a setting") && ini_overridden("emulated_cores_mode") &&
+          !strcmp(ini_overridden("emulated_cores_mode"), "0"));
+    free(text);
+    ini_override("emulated-cores", NULL);
+    ini_override("emulated_cores_mode", "1");
+    ini_override("emulated_cores", "0");
+    text = open_ini("[Debug]\nemulated_cores_mode=2\n");
+    CHECK(strstr(g_test.said,
+                 "settings: --emulated_cores=0 is deprecated, and the command line gives "
+                 "--emulated-cores-mode=1 too: emulated_cores_mode=1 this run (docs/user/deprecations.md)\n"));
+    free(text);
+    ini_override("emulated_cores_mode", NULL);
+    ini_override("emulated_cores", "5");
+    text = open_ini("[Debug]\nemulated_cores_mode=2\n");
+    CHECK(strstr(g_test.said,
+                 "settings: --emulated_cores=5, deprecated, is neither 0 nor 1: emulated_cores_mode=2 this "
+                 "run, its default (Auto) (docs/user/deprecations.md)\n"));
+    free(text);
+    ini_override("emulated_cores", NULL);
+    g_test.write = 0;
+}
+static void test_write_tracking_hot_old(void) {
+    char *text, *again;
+    CHECK(options_write_tracking_hot_old("1", 0) == 1 && options_write_tracking_hot_old("1", 1) == 1);
+    CHECK(options_write_tracking_hot_old("0", 0) == -1 && options_write_tracking_hot_old("0", 1) == 0);
+    CHECK(options_write_tracking_hot_old("2", 0) == -2 && options_write_tracking_hot_old("", 1) == -2);
+    g_test.write = 1;
+    text = open_ini("[Debug]\nwrite_tracking_hot=1\n");
+    CHECK(strstr(g_test.said, "settings: write_tracking_hot=1, deprecated, is write_tracking_hot_pages=1 (On) now "
+                              "(docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\nwrite_tracking_hot_pages=1\n") && strstr(text, "\n[Deprecated]\n") &&
+          strstr(text, "\n[Deprecated]\n") < strstr(text, "\nwrite_tracking_hot=1\n"));
+    again = open_ini(text); /* the next run: write_tracking_hot_pages given, write_tracking_hot not read again */
+    CHECK(!strstr(g_test.said, "settings: write_tracking_hot=") && again &&
+          strstr(again, "\nwrite_tracking_hot_pages=1\n"));
+    free(again);
+    free(text);
+    text = open_ini("[Debug]\nwrite_tracking_hot=0\n");
+    CHECK(strstr(g_test.said, "settings: write_tracking_hot=0, deprecated, was its default: write_tracking_hot_pages "
+                              "takes its own, 2 (Auto), hot pages where page protection tracks the writes "
+                              "(docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\nwrite_tracking_hot_pages=2\n"));
+    free(text);
+    text = open_ini("[Debug]\nwrite_tracking_hot=yes\n");
+    CHECK(strstr(g_test.said, "settings: write_tracking_hot=yes, deprecated, is neither 0 nor 1: "
+                              "write_tracking_hot_pages takes its default, 2 (Auto) (docs/user/deprecations.md)\n"));
+    free(text);
+    text = open_ini("[Debug]\nwrite_tracking_hot=1\nwrite_tracking_hot_pages=0\n");
+    CHECK(!strstr(g_test.said, "settings: write_tracking_hot=") && text &&
+          strstr(text, "\nwrite_tracking_hot_pages=0\n"));
+    free(text);
+    ini_override("write_tracking_hot", "0");
+    text = open_ini("[Debug]\nwrite_tracking_hot_pages=2\n");
+    CHECK(!strstr(g_test.said, "is not a setting") && ini_overridden("write_tracking_hot_pages") &&
+          !strcmp(ini_overridden("write_tracking_hot_pages"), "0"));
+    CHECK(strstr(g_test.said, "settings: --write_tracking_hot=0 is deprecated: this run reads it as "
+                              "--write-tracking-hot-pages=0 (Off) (docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\nwrite_tracking_hot_pages=2\n"));
+    free(text);
+    ini_override("write_tracking_hot_pages", NULL);
+    ini_override("write_tracking_hot", NULL);
+    g_test.write = 0;
+}
+/* dlss_render_size and dlss_upscaler, which internal_resolution and render_upscaler took over: an old .ini's pick is
+   carried while the new key has no value, the default every .ini had written is not, a .ini that gives the new key
+   keeps it, said. On the command line the old key is that run's value of the new one. internal_resolution is read
+   at start alone, so its value is checked in the file and the overrides */
+static void test_dlss_old(void) {
+    char *text, *again;
+    CHECK(options_dlss_render_size_old("0", 0) == -1 && options_dlss_render_size_old("0", 1) == 0);
+    CHECK(options_dlss_render_size_old("2", 0) == 2 && options_dlss_render_size_old("5", 1) == 5);
+    CHECK(options_dlss_render_size_old("6", 0) == -2 && options_dlss_render_size_old("x", 1) == -2 &&
+          options_dlss_render_size_old("", 0) == -2);
+    CHECK(options_dlss_upscaler_old("0", 0) == 3 && options_dlss_upscaler_old("1", 1) == -1 &&
+          options_dlss_upscaler_old("2", 0) == -2);
+    g_test.write = 1;
+    text = open_ini("[Graphics]\ndlss_render_size=4\n");
+    CHECK(strstr(g_test.said, "settings: dlss_render_size=4, deprecated, is internal_resolution=4 (Performance) now "
+                              "(docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\ninternal_resolution=4\n") &&
+          strstr(text, "\n[Deprecated]\n") < strstr(text, "\ndlss_render_size=4\n"));
+    again = open_ini(text); /* the next run: internal_resolution given, dlss_render_size not read again */
+    CHECK(!strstr(g_test.said, "settings: dlss_render_size=") && again && strstr(again, "\ninternal_resolution=4\n"));
+    free(again);
+    free(text);
+    text = open_ini("[Graphics]\ndlss_render_size=0\n");
+    CHECK(strstr(g_test.said, "settings: dlss_render_size=0, deprecated, was its default: internal_resolution takes "
+                              "its own (docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\ninternal_resolution=0\n"));
+    free(text);
+    text = open_ini("[Graphics]\ndlss_upscaler=0\n");
+    CHECK(strstr(g_test.said, "settings: dlss_upscaler=0, deprecated, is render_upscaler=3 (None) now "
+                              "(docs/user/deprecations.md)\n"));
+    CHECK(g_settings.render_upscaler == 3 && text && strstr(text, "\nrender_upscaler=3\n"));
+    free(text);
+    text = open_ini("[Graphics]\nrender_upscaler=0\ndlss_upscaler=0\n");
+    CHECK(strstr(g_test.said, "settings: dlss_upscaler=0, deprecated, is not read: the .ini's render_upscaler=0 stays "
+                              "(docs/user/deprecations.md)\n"));
+    CHECK(g_settings.render_upscaler == 0 && text && strstr(text, "\nrender_upscaler=0\n"));
+    free(text);
+    text = open_ini("[Graphics]\ndlss_upscaler=1\n");
+    CHECK(strstr(g_test.said, "settings: dlss_upscaler=1, deprecated, was its default: render_upscaler takes its own"));
+    CHECK(g_settings.render_upscaler == 0);
+    free(text);
+    /* --dlss_upscaler=0 and --dlss_render_size=0: None and the game's sizes this run, said. The file keeps its own */
+    ini_override("dlss_upscaler", "0");
+    ini_override("dlss_render_size", "0");
+    text = open_ini("[Graphics]\nrender_upscaler=1\ninternal_resolution=2\n");
+    CHECK(ini_overridden("render_upscaler") && !strcmp(ini_overridden("render_upscaler"), "3") &&
+          g_settings.render_upscaler == 3);
+    CHECK(ini_overridden("internal_resolution") && !strcmp(ini_overridden("internal_resolution"), "0"));
+    CHECK(strstr(g_test.said, "settings: --dlss_upscaler=0 is deprecated: this run reads it as --render_upscaler=3 "
+                              "(None) (docs/user/deprecations.md)\n"));
+    CHECK(text && strstr(text, "\nrender_upscaler=1\n") && strstr(text, "\ninternal_resolution=2\n"));
+    free(text);
+    ini_override("render_upscaler", NULL);
+    ini_override("internal_resolution", NULL);
+    /* the new key given on the command line too: it stands */
+    ini_override("render_upscaler", "1");
+    text = open_ini("[Graphics]\nrender_upscaler=0\n");
+    CHECK(!strcmp(ini_overridden("render_upscaler"), "1") && g_settings.render_upscaler == 1);
+    CHECK(strstr(g_test.said, "settings: --dlss_upscaler=0 is deprecated, and the command line gives "
+                              "--render_upscaler=1 too: render_upscaler=1 this run (docs/user/deprecations.md)\n"));
+    free(text);
+    ini_override("dlss_upscaler", NULL);
+    ini_override("dlss_render_size", NULL);
+    ini_override("render_upscaler", NULL);
     g_test.write = 0;
 }
 /* a startup setting is read by the process's first ini_open alone, so each of these is a process of its own
@@ -780,16 +1026,230 @@ static int picks_clean(void) {
     free(dir);
     return 0;
 }
+/* the settings that change how fast the game runs, named over its first frame (options_perf_notice), by where each
+   came from: the game's picks and its .ini a gamepad's, the launcher's for every game a globe's, with how the game's code
+   was made (its .abi's made line). Off its default and perf alone: stats (the screen shows it) and the Volume are not
+   named, nor a value nobody gave that the runtime picked itself (an Ounce program's async_pipelines) */
+static void abi(const char* dir, const char* text) {
+    char* path = snx_format("%s/game.abi", dir);
+    CHECK(path && !snx_write_file(path, text, strlen(text)));
+    free(path);
+}
+static int picks_perf(void) {
+    char *ini, *picks, *base,
+        *dir = picks_game("[Display]\nstats=1\n[Graphics]\nvk_ext_shader_object=off\nresolution=1\n"
+                          "[Performance]\nfps_limit=0\nmemory_gb=8\njit_opt=2\nasync_pipelines=0\n",
+                          "[Performance]\njit_opt=0\n[Audio]\nvolume=40\n", &ini, &picks);
+    ini_override(SNX_LAUNCHER_PICKS, "1");
+    ini_override("resolution", "2");
+    ini_override("vsync", "0");
+    ini_override("fps_limit", "90");              /* the launcher's, over the .ini's 0 */
+    ini_override("anisotropy", "0");              /* its default, given: not named */
+    ini_override("vk_ext_shader_object", "auto"); /* the launcher's auto over the .ini's off: its default, not named */
+    ini_open(ini);
+    g_settings.async_pipelines = 1; /* the runtime's own pick, as for an Ounce program: nobody gave it */
+    base = snx_path_join(dir, "game");
+    CHECK(base);
+    /* no .abi: nothing of how it was made */
+    CHECK(options_perf_notice(base) == 5 && g_test.notices == 1);
+    CHECK(!strcmp(g_test.game, "memory_gb, jit_opt"));
+    CHECK(!strcmp(g_test.global, "resolution, vsync, fps_limit"));
+    /* made at -O0 ahead of time, by a recompile with its batch and unit size off their defaults */
+    abi(dir, "14\nmade opt=0 aot=1 found=1 code=2 off=llvm_batch,unit_instructions\n");
+    CHECK(options_perf_notice(base) == 8 && g_test.notices == 2);
+    CHECK(!strcmp(g_test.game, "memory_gb, jit_opt"));
+    CHECK(!strcmp(g_test.global, "resolution, vsync, fps_limit, opt, llvm_batch, unit_instructions"));
+    /* an older version's made line: its opt alone */
+    abi(dir, "14\nmade opt=0 aot=1 found=1 code=2\n");
+    CHECK(options_perf_notice(base) == 6 && !strcmp(g_test.global, "resolution, vsync, fps_limit, opt"));
+    /* --jit-only's, no code made ahead of time: its opt made nothing that runs; and opt's default */
+    abi(dir, "14\nmade opt=0 aot=0 found=0 code=2\n");
+    CHECK(options_perf_notice(base) == 5 && !strcmp(g_test.global, "resolution, vsync, fps_limit"));
+    abi(dir, "14\nmade opt=2 aot=1 found=1 code=2\n");
+    CHECK(options_perf_notice(base) == 5 && !strcmp(g_test.global, "resolution, vsync, fps_limit"));
+    CHECK(!snx_remove_tree(dir));
+    free(base);
+    free(ini);
+    free(picks);
+    free(dir);
+    return 0;
+}
+/* this run's own command line (no --launcher-picks): the launcher's sign, a globe, as a value given for this run */
+static int picks_perf_run(void) {
+    char *ini, *picks, *dir = picks_game("[Performance]\nmemory_gb=6\n", NULL, &ini, &picks);
+    ini_override("fps_limit", "0");
+    ini_override("memory_gb", "0"); /* its default over the .ini's 6: the variable at its default, nothing named */
+    ini_override("vsync", "1");     /* its default: nothing to name */
+    ini_open(ini);
+    CHECK(options_perf_notice(dir) == 1 && !strcmp(g_test.game, "") && !strcmp(g_test.global, "fps_limit"));
+    CHECK(!snx_remove_tree(dir));
+    free(ini);
+    free(picks);
+    free(dir);
+    return 0;
+}
+/* the value emulated_cores_mode's default, Auto, gives a kind of program (options_kind_value, an Ounce program's Off):
+   said with how to run it On, and named on the notice's third line, while the setting keeps its Auto, so the Debug list
+   at the top of the picture does not name it; the .ini keeps its own. Off or On from the game's .ini, its picks, this
+   run's command line or the launcher stays, said with whose it is, and nothing is named; an Auto picked is Auto. Each
+   run's list starts empty. Another key, or a value the default does not choose, is refused with the value in effect.
+   A process each: emulated_cores_mode is read when the game starts, which only a process's first .ini sets */
+static void kind_open(const char* text, const char* picks_text, int took, const char* line) {
+    char *ini, *picks, *base, *dir = picks_game(text, picks_text, &ini, &picks);
+    g_test.write = 1;
+    g_test.said[0] = 0;
+    ini_open(ini);
+    CHECK(options_kind_value("emulated_cores_mode", "0", "an Ounce program") == took);
+    if (!strstr(g_test.said, line)) fprintf(stderr, "said:\n%s", g_test.said);
+    CHECK(strstr(g_test.said, line));
+    CHECK((base = snx_path_join(dir, "game")));
+    CHECK(options_perf_notice(base) == took && !strcmp(g_test.kind, took ? "emulated_cores_mode Off" : ""));
+    CHECK(!snx_remove_tree(dir));
+    free(base);
+    free(ini);
+    free(picks);
+    free(dir);
+}
+static int picks_kind(void) {
+    char *ini, *picks, *text, *dir, list[HUD_DEBUG_MAX];
+    /* the .ini every run writes, emulated_cores_mode at its default: the kind's Off, Auto kept */
+    dir = picks_game("[Debug]\nemulated_cores_mode=2\n", NULL, &ini, &picks);
+    g_test.write = 1;
+    g_test.said[0] = 0;
+    ini_open(ini);
+    CHECK(options_kind_value("emulated_cores_mode", "0", "an Ounce program") == 1 &&
+          g_settings.emulated_cores_mode == 2);
+    CHECK(strstr(g_test.said,
+                 "settings: emulated_cores_mode=2 (Auto), its default, gives an Ounce program 0 (Off) this "
+                 "run; 1 (On) in the game's own settings, the launcher's or --emulated-cores-mode=1 runs it "
+                 "On\n"));
+    CHECK((text = snx_path_join(dir, "game")));
+    CHECK(options_perf_notice(text) == 1 && !strcmp(g_test.kind, "emulated_cores_mode Off") && !g_test.game[0] &&
+          !g_test.global[0]);
+    free(text);
+    CHECK(!options_debug(0, list, sizeof list) || !strstr(list, "emulated_cores"));
+    CHECK((text = file_text(ini)) && strstr(text, "\nemulated_cores_mode=2\n"));
+    free(text);
+    CHECK(!snx_remove_tree(dir));
+    free(ini);
+    free(picks);
+    free(dir);
+    /* another key, or a value the default does not choose: refused, with the value in effect */
+    g_test.said[0] = 0;
+    CHECK(options_kind_value("volume", "40", "an Ounce program") == -1);
+    CHECK(strstr(g_test.said, "settings: volume is no setting of three words read at the start whose default chooses "
+                              "between the other two, so an Ounce program's volume=40 is not taken: volume=100 this "
+                              "run\n"));
+    CHECK(options_kind_value("emulated_cores_mode", "2", "an Ounce program") == -1);
+    CHECK(strstr(g_test.said,
+                 "settings: an Ounce program's emulated_cores_mode=2 is not one of the two values 2 (Auto) "
+                 "chooses between: emulated_cores_mode=2 this run\n"));
+    CHECK(options_kind_value("no_such_key", "1", "an Ounce program") == -1);
+    CHECK(
+        strstr(g_test.said, "settings: no_such_key is no setting, so an Ounce program's no_such_key=1 does nothing\n"));
+    g_test.write = 0;
+    return 0;
+}
+static int picks_kind_pick(void) {
+    kind_open("[Debug]\nemulated_cores_mode=2\n", "[Debug]\nemulated_cores_mode=1\n", 0,
+              "settings: emulated_cores_mode=1 (On), the game's own pick, over the 0 (Off) its Auto gives an Ounce "
+              "program\n");
+    CHECK(g_settings.emulated_cores_mode == 1);
+    return 0;
+}
+static int picks_kind_auto(void) { /* an Auto picked: the kind's, said as the pick's */
+    kind_open("[Debug]\nemulated_cores_mode=1\n", "[Debug]\nemulated_cores_mode=2\n", 1,
+              "settings: emulated_cores_mode=2 (Auto), the game's own pick, gives an Ounce program 0 (Off) this run");
+    return 0;
+}
+static int picks_kind_cli(void) {
+    ini_override("emulated_cores_mode", "0");
+    kind_open("[Debug]\nemulated_cores_mode=1\n", NULL, 0,
+              "settings: emulated_cores_mode=0 (Off), this run's command line's, the value its Auto gives an Ounce "
+              "program too\n");
+    return 0;
+}
+/* an older version's .ini: its 0 is Off, the .ini's */
+static int picks_kind_old0(void) {
+    kind_open("[Debug]\nemulated_cores=0\n", NULL, 0,
+              "settings: emulated_cores_mode=0 (Off), the game's .ini's, the value its Auto gives an Ounce program "
+              "too\n");
+    CHECK(g_settings.emulated_cores_mode == 0);
+    return 0;
+}
+/* the launcher's --emulated_cores=1 for every game stays the launcher's: the game's own pick of Off goes over it */
+static int picks_kind_launcher(void) {
+    ini_override(SNX_LAUNCHER_PICKS, "1");
+    ini_override("emulated_cores", "1");
+    kind_open("[Debug]\nemulated_cores_mode=2\n", "[Debug]\nemulated_cores_mode=0\n", 0,
+              "settings: emulated_cores_mode=0 (Off), the game's own pick, the value its Auto gives an Ounce program "
+              "too\n");
+    CHECK(strstr(g_test.said, "settings: the launcher's --emulated_cores=1 is deprecated: this run reads it as "
+                              "--emulated-cores-mode=1 (On) (docs/user/deprecations.md)\n"));
+    CHECK(g_settings.emulated_cores_mode == 0);
+    return 0;
+}
+/* an older version's pick of emulated_cores, its On: the pick of emulated_cores_mode, said once, the picks file written
+   with that one alone; then the game's own pick of On is over the Off Auto gives an Ounce program. Where the picks give
+   emulated_cores_mode too, the old one is kept and does nothing, said so */
+static int picks_kind_oldpick(void) {
+    char *ini, *picks, *text,
+        *dir = picks_game("[Debug]\nemulated_cores_mode=2\n", "[Debug]\nemulated_cores=1\n", &ini, &picks);
+    g_test.write = 1;
+    g_test.said[0] = 0;
+    ini_open(ini);
+    CHECK(strstr(g_test.said, "settings: emulated_cores=1 in ") &&
+          strstr(g_test.said, "game.picks, deprecated, is emulated_cores_mode=1 (On) there now "
+                              "(docs/user/deprecations.md)\n"));
+    CHECK(!strstr(g_test.said, "is no setting a game's picks take"));
+    CHECK(g_settings.emulated_cores_mode == 1 &&
+          options_kind_value("emulated_cores_mode", "0", "an Ounce program") == 0);
+    CHECK(strstr(g_test.said, "settings: emulated_cores_mode=1 (On), the game's own pick, over the 0 (Off) its Auto "
+                              "gives an Ounce program\n"));
+    CHECK((text = file_text(picks)) && strstr(text, "\n[Debug]\nemulated_cores_mode=1\n") &&
+          !strstr(text, "emulated_cores="));
+    free(text);
+    g_test.said[0] = 0; /* the next run: nothing to say */
+    ini_open(ini);
+    CHECK(!strstr(g_test.said, "emulated_cores="));
+    CHECK(!snx_remove_tree(dir));
+    free(ini);
+    free(picks);
+    free(dir);
+    dir = picks_game("[Debug]\nemulated_cores_mode=2\n", "[Debug]\nemulated_cores=1\nemulated_cores_mode=0\n", &ini,
+                     &picks);
+    g_test.said[0] = 0;
+    ini_open(ini);
+    CHECK(strstr(g_test.said, "settings: emulated_cores=1 in ") &&
+          strstr(g_test.said, "game.picks is no setting a game's picks take: it is kept there and does nothing\n"));
+    CHECK(!snx_remove_tree(dir));
+    free(ini);
+    free(picks);
+    free(dir);
+    g_test.write = 0;
+    return 0;
+}
 static int options_picks(const char* which) {
-    int failed = !strcmp(which, "--picks-clean")    ? picks_clean()
-                 : !strcmp(which, "--picks-next")   ? picks_next()
-                 : !strcmp(which, "--picks-order")  ? picks_order()
-                 : !strcmp(which, "--picks-menu")   ? picks_menu()
-                 : !strcmp(which, "--picks-hand")   ? picks_hand()
-                 : !strcmp(which, "--picks-reload") ? picks_reload()
-                                                    : 2;
+    int failed = !strcmp(which, "--picks-perf")            ? picks_perf()
+                 : !strcmp(which, "--picks-kind")          ? picks_kind()
+                 : !strcmp(which, "--picks-kind-pick")     ? picks_kind_pick()
+                 : !strcmp(which, "--picks-kind-auto")     ? picks_kind_auto()
+                 : !strcmp(which, "--picks-kind-cli")      ? picks_kind_cli()
+                 : !strcmp(which, "--picks-kind-old0")     ? picks_kind_old0()
+                 : !strcmp(which, "--picks-kind-launcher") ? picks_kind_launcher()
+                 : !strcmp(which, "--picks-kind-oldpick")  ? picks_kind_oldpick()
+                 : !strcmp(which, "--picks-perf-run")      ? picks_perf_run()
+                 : !strcmp(which, "--picks-clean")         ? picks_clean()
+                 : !strcmp(which, "--picks-next")          ? picks_next()
+                 : !strcmp(which, "--picks-order")         ? picks_order()
+                 : !strcmp(which, "--picks-menu")          ? picks_menu()
+                 : !strcmp(which, "--picks-hand")          ? picks_hand()
+                 : !strcmp(which, "--picks-reload")        ? picks_reload()
+                                                           : 2;
     if (failed == 2)
-        fprintf(stderr, "options_tv_mode: %s is none of --picks-order, -menu, -hand, -reload, -clean, -next\n",
+        fprintf(stderr,
+                "options_tv_mode: %s is none of --picks-order, -menu, -hand, -reload, -clean, -next, -perf, -perf-run, "
+                "-kind, -kind-pick, -kind-auto, -kind-cli, -kind-old0, -kind-launcher, -kind-oldpick\n",
                 which);
     if (!failed) printf("options_tv_mode %s: ok\n", which);
     return failed;
@@ -883,10 +1343,16 @@ int main(int argc, char** argv) {
     test_settings_line();
     test_memory_fit_old();
     test_astc_bc_old();
+    test_bc7_cache_gb_old();
+    test_unit_cache_gb_old();
+    test_compress_shader_cache_old();
     test_controls_opacity_old();
     test_dropped_keys_old();
     test_vk_descriptors_old_default();
     test_vk_descriptors_old();
+    test_write_tracking_hot_old();
+    test_emulated_cores_old();
+    test_dlss_old();
     test_key_steps();
     printf("options_tv_mode: ok\n");
     return 0;

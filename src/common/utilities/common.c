@@ -59,6 +59,10 @@
 #include <pthread_np.h> /* pthread_get_name_np */
 #include <sys/rtprio.h> /* a thread's idle class (snx_thread_priority_low) */
 #endif
+#ifdef __PROSPERO__
+/* the console's libkernel exports it, and the payload SDK's pthread_np.h has only pthread_get_name_np */
+int pthread_getname_np(pthread_t thread, char* name, size_t size);
+#endif
 #ifdef __linux__
 #include <sys/prctl.h>    /* PR_GET_NAME: a thread's name, without _GNU_SOURCE's pthread_getname_np */
 #include <sys/resource.h> /* a thread's nice (snx_thread_priority_low) */
@@ -1777,7 +1781,7 @@ void snx_thread_name_get(char* out, size_t n) {
             snprintf(out, n, "%s", full); /* cut as the other systems cut it */
         LocalFree(wide);
     }
-#elif defined(__APPLE__)
+#elif defined(__APPLE__) || defined(__PROSPERO__) /* the PS5's libkernel has no pthread_get_name_np */
     if (pthread_getname_np(pthread_self(), out, n)) out[0] = 0;
 #elif defined(__linux__)
     char name[16]; /* PR_GET_NAME writes 16 bytes, its end included */
@@ -2137,20 +2141,6 @@ int snx_memory_pressure(char* words, size_t size) {
     (void)why;
     snprintf(words, size, "none on this system");
     return -1;
-#endif
-}
-int snx_memory_total(SnxU64* bytes) {
-#ifdef _WIN32
-    MEMORYSTATUSEX status;
-    status.dwLength = sizeof status;
-    if (!GlobalMemoryStatusEx(&status) || !status.ullTotalPhys) return 0;
-    *bytes = status.ullTotalPhys;
-    return 1;
-#else
-    long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
-    if (pages <= 0 || page <= 0) return 0;
-    *bytes = (SnxU64)pages * (SnxU64)page;
-    return 1;
 #endif
 }
 int snx_terminal(void) {

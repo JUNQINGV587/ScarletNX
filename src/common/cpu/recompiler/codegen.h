@@ -14,6 +14,16 @@ typedef struct {
     size_t leader_count;
 } SnxFunction;
 
+/* what a function's flow gives of the jump table of the BR at address: its base (0 where the code before its load does,
+   ~0 where two ways to the BR take two); bound, the entries a compare of the index bounds it to, or else max, those the
+   index's making lets it reach, each 0 for none; and the unwind range its cases are in, count instructions from first,
+   count 0 for none */
+typedef struct {
+    SnxU64 address, base, first;
+    size_t count;
+    unsigned bound, max;
+} SnxFlowTable;
+
 typedef struct {
     /* the guest's A64 features (SNX_A64_FEAT_* or a SNX_A64_TARGET_* of a64_decoder.h), what decodes: 0 is the
        Switch's. The analyses' features argument: emitting decodes with them too */
@@ -31,6 +41,18 @@ typedef struct {
        them */
     int check_fetch;
     int hook_direct_calls;
+    /* the words read from a module whose copy can change while it is read (SnxCodeImage.generation), each taken from
+       the module once, so discovery, the jump tables, the emitter and the JIT cache's hash agree on one version of
+       every word: the one the code is built from. One block: read_capacity addresses, as many words, as many marks */
+    unsigned char* read_block;
+    size_t read_count, read_capacity;
+    /* the jump tables whose base or end came from their function's flow (explore's, the leaders'), not from the code
+       before the load, by BR address, so every later snx_codegen_jump_table (the leaders, the back ends) finds the same
+       cases; and every table's base the leaders know of, ascending: where the table before it ends */
+    SnxFlowTable* flow_tables;
+    size_t flow_table_count, flow_table_capacity;
+    SnxU64* table_bases;
+    size_t table_base_count;
 } SnxCodegen;
 
 int snx_codegen_analyze(SnxCodegen* codegen, const SnxCodeImage* modules, size_t module_count, const SnxU64* hints,
@@ -53,8 +75,17 @@ int snx_codegen_analyze_from(SnxCodegen* codegen, const SnxCodeImage* modules, s
                              void* context, SnxU64 features);
 void snx_codegen_free(SnxCodegen* codegen);
 SnxCodeImage* snx_codegen_module(SnxCodegen* codegen, SnxU64 address);
+/* the instruction word at address: 1, or 0 outside the text. From a module whose copy can change, the word this codegen
+   read there first (read_block) */
 int snx_codegen_word(SnxCodegen* codegen, SnxU64 address, SnxU32* word);
-/* the case targets of the jump table the BR at address dispatches through, up to capacity; 0 when it is not one */
+/* 1 when every word in read_block is what its module holds now */
+int snx_codegen_words_current(const SnxCodegen* codegen);
+/* conservative discovery targets for a BR's jump table, up to capacity; emitted BR instructions still use their
+   register and dispatch at run time (the native back ends' through a table of the cases, the others by the dispatch
+   block). A switch of more cases is followed to SNX_JUMP_TABLE_MAX of them, a table a compare bounds to as many entries
+   as its immediate says (cases repeat: a switch of a byte or an opcode has more entries than cases) */
+#define SNX_JUMP_TABLE_MAX     2048
+#define SNX_JUMP_TABLE_ENTRIES 4096
 size_t snx_codegen_jump_table(SnxCodegen* codegen, SnxU64 address, SnxU64* targets, size_t capacity);
 SnxU64 snx_function_address(const SnxFunction* function, size_t index);
 int snx_function_contains(const SnxFunction* function, SnxU64 address);

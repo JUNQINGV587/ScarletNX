@@ -16,11 +16,12 @@ cmake_minimum_required(VERSION 3.28)
 cmake_policy(VERSION 3.25)
 
 # Clang only: the runtime, the generated game code and the third-party libraries are built and tested with one
-# compiler. It is the default here, so a plain `cmake -B build` picks it over the system's cc
-if(NOT DEFINED CMAKE_C_COMPILER AND NOT DEFINED ENV{CC})
+# compiler. It is the default here, so a plain `cmake -B build` picks it over the system's cc; a toolchain file names
+# its own, which project() reads only after this
+if(NOT DEFINED CMAKE_C_COMPILER AND NOT DEFINED ENV{CC} AND NOT CMAKE_TOOLCHAIN_FILE)
     set(CMAKE_C_COMPILER clang)
 endif()
-if(NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
+if(NOT DEFINED CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX} AND NOT CMAKE_TOOLCHAIN_FILE)
     set(CMAKE_CXX_COMPILER clang++)
 endif()
 project(ScarletNX LANGUAGES C CXX)
@@ -179,13 +180,16 @@ if(NOT SNX_BUILD_TESTING)
 endif()
 # Before the dependencies: the tests' network fixtures link ENet and zstd, whatever the build
 include(CTest)
+# a test option given without the tests stops here
+include(cmake/test_options.cmake)
 # ThinLTO in the optimized configurations, where the toolchain links it (cmake/lto.cmake): before the packages, which
 # get it too
 include(cmake/lto.cmake)
 # Before the sources: the ISO C driver of a tools-only build links LZ4 too
 include(cmake/dependencies.cmake)
 # every local include is a path from src/ ("nx/hle/kernel/ipc.h"); generated and third-party headers come with their
-# targets, but for the SPIR-V headers (cmake/glsl.cmake), which are paths from src/ in the build tree
+# targets, but for the SPIR-V headers (cmake/glsl.cmake) and SMAA's textures (cmake/areatex.cmake), which are paths from
+# src/ in the build tree
 include_directories("${PROJECT_SOURCE_DIR}/src" "${PROJECT_BINARY_DIR}/generated/include")
 # every setting, generated from src/nx/runtime/settings.txt (struct Settings, g_settings, their tables)
 include(cmake/settings.cmake)
@@ -255,7 +259,9 @@ endif()
 if(NOT WIN32)
     include(GNUInstallDirs)
     install(FILES dist/wimsy.svg DESTINATION ${CMAKE_INSTALL_DATADIR}/icons/hicolor/scalable/apps COMPONENT desktop)
-    install(DIRECTORY dist/icons/hicolor DESTINATION ${CMAKE_INSTALL_DATADIR}/icons COMPONENT desktop)
+    # the Christmas icons stay out: the window icon takes December's from the source, the desktop keeps Wimsy
+    install(DIRECTORY dist/icons/hicolor DESTINATION ${CMAKE_INSTALL_DATADIR}/icons COMPONENT desktop
+            PATTERN "wimsy-xmas.png" EXCLUDE)
 endif()
 # jemalloc's, which the program links whatever runtimes it holds (SNX_JEMALLOC)
 if(SNX_JEMALLOC)
@@ -318,6 +324,15 @@ string(FIND "${renderdoc_app}" "*/" renderdoc_app_end)
 string(SUBSTRING "${renderdoc_app}" 0 ${renderdoc_app_end} renderdoc_app)
 file(WRITE "${PROJECT_BINARY_DIR}/renderdoc_app-LICENSE.txt" "${renderdoc_app}*/\n")
 install(FILES "${PROJECT_BINARY_DIR}/renderdoc_app-LICENSE.txt" DESTINATION ${licenses}/renderdoc_app RENAME LICENSE.txt)
+# NVIDIA Streamline's headers (a Windows build's DLSS, cmake/dependencies.cmake): their license is the MIT comment at the
+# top of each, as sl.h has it
+if(WIN32)
+    file(READ "${snx_streamline_include}/sl.h" streamline_sl)
+    string(FIND "${streamline_sl}" "*/" streamline_sl_end)
+    string(SUBSTRING "${streamline_sl}" 0 ${streamline_sl_end} streamline_sl)
+    file(WRITE "${PROJECT_BINARY_DIR}/Streamline-LICENSE.txt" "${streamline_sl}*/\n")
+    install(FILES "${PROJECT_BINARY_DIR}/Streamline-LICENSE.txt" DESTINATION ${licenses}/Streamline RENAME LICENSE.txt)
+endif()
 install(FILES "${OpenSSL_SOURCE_DIR}/LICENSE.txt" DESTINATION ${licenses}/OpenSSL)
 # lib/LICENSE is the library's BSD-2-Clause. The top-level LICENSE covers the rest of LZ4 (GPL-2.0-or-later), none
 # of which is built here

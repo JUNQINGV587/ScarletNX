@@ -8,7 +8,7 @@
 * [3DS on Pretendo Network](#3ds-on-pretendo-network)
 * [Tests](#tests)
 
-The DS's and the 3DS's online services through their communities' replacements, in strict C99 on the host's own
+The DS's and the 3DS's online services through their communities' replacements, in strict ISO C23 on the host's own
 sockets: the DS's WFC services and its firmware's connection slot, which `src/nds/hle/pxi.c` gives the game, and the
 3DS's login on Pretendo Network, which `src/3ds/services/frd.c` and `soc.c` make. Every call that can fail returns a
 negative value and writes why into the caller's buffer, naming the value it was given.
@@ -121,8 +121,10 @@ Pretendo account's principal ID and the code its server gave it. Its replies: `r
 and `datetime`; an error's code otherwise (102 an unknown account or device, 110 no server for the title, 121 a
 certificate it refuses, 122 a wrong `uidhmac`, 150 a serial that is not the device's, 152 another game server ID).
 
-The console's files come from a folder laid out as Azahar's NAND folder (`ctr_console`), where Azahar's Artic Setup
-Tool copies them from the player's console:
+The console's files come from a folder laid out as Azahar's NAND folder (`ctr_console`). Azahar's Artic Setup Tool
+copies the first two from the player's console; the third, the friends save with the Pretendo account, it does not
+copy ("Artic Setup Tool does not copy your account or save data from your system", Pretendo's guide for Azahar): Nimbus
+makes it when it runs in Azahar:
 
 | File                                                                    | What the login takes                 |
 |-------------------------------------------------------------------------|--------------------------------------|

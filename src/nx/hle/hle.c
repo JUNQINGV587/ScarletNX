@@ -15,6 +15,8 @@ void hle_init(void) {
     int i;
     /* every lock: PMUTEX_INIT's value isn't all zero on every platform */
     pm_init(&g_host.kernel.klock);
+    for (i = 0; i < (int)(sizeof g_host.kernel.arb_lk / sizeof *g_host.kernel.arb_lk); i++)
+        pm_init(&g_host.kernel.arb_lk[i]);
     pm_init(&g_host.kernel.pool_lk);
     pm_init(&g_host.svcmem.views_lk);
     pm_init(&g_host.svcmem.map_lk);
@@ -23,6 +25,7 @@ void hle_init(void) {
     pm_init(&g_host.acc.pic_lk);
     pm_init(&g_host.acc.users_lk);
     pm_init(&g_host.audio.lk);
+    pm_init(&g_host.tvmr_jpeg.lk);
     pm_init(&g_host.audren.lk);
     pm_init(&g_host.ldr.lock);
     pm_init(&g_host.misc.mm_lock);
@@ -31,6 +34,7 @@ void hle_init(void) {
     pm_init(&g_host.hid.input_lock);
     pm_init(&g_host.nvdrv.seen_lock);
     pm_init(&g_host.native_video.lock);
+    pm_init(&g_host.gsv.lock);
     pm_init(&g_host.bsd.iface_lk);
     pm_init(&g_host.bsd.bind_lk);
     pm_init(&g_host.bsd.client_lk);

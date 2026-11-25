@@ -7,6 +7,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('architecture', Path(__file__).with_name('architecture.py'))
 architecture = importlib.util.module_from_spec(spec)
@@ -33,6 +34,30 @@ class ArchitectureTests(unittest.TestCase):
         self.assertEqual(len(errors), 1)
         self.assertIn('src/nx/gpu/check.c:2: getenv("SNX_CHECK"): SNX_CHECK is not the system\'s', errors[0])
         self.assertIn('src/nx/runtime/settings.txt', errors[0])
+        self.assertIn('--key=value', errors[0])
+        self.assertNotIn('no settings table', errors[0])
+
+    def test_a_driver_takes_its_settings(self):
+        files = {name: 'int main(void) { return settings_arg(0, 0, 0) != 0; }\n' for name in architecture.DRIVER_MAINS}
+
+        def driver_errors(given):
+            with tempfile.TemporaryDirectory(prefix='snx-arch-test-') as temporary:
+                root = Path(temporary)
+                for name, text in given.items():
+                    (root / name).parent.mkdir(parents=True, exist_ok=True)
+                    (root / name).write_text(text, encoding='ascii')
+                return architecture.check_driver_settings(root)
+
+        self.assertEqual(driver_errors(files), [])
+        for name in architecture.DRIVER_MAINS:
+            # no settings taken, a comment naming the function, and a main gone
+            bare = {**files, name: 'int main(void) { return 0; } /* settings_arg( */\n'}
+            errors = driver_errors(bare)
+            self.assertEqual(len(errors), 1)
+            self.assertTrue(errors[0].startswith(f'{name}: it takes no setting'))
+            gone = {k: v for k, v in files.items() if k != name}
+            missing = f'{name}: missing: DRIVER_MAINS names the mains that take the settings'
+            self.assertEqual(driver_errors(gone), [missing])
 
     def test_the_systems_variables_pass(self):
         files = {
@@ -90,6 +115,66 @@ class ArchitectureTests(unittest.TestCase):
         both = 'void o(void) { SDL_CreateWindowAndRenderer("t", 1, 1, 0, &w, &r); }\n'
         self.assertEqual(len(self.window_errors({'src/nx/a.c': both})), 1)
 
+    def detach_errors(self, files):
+        with tempfile.TemporaryDirectory(prefix='snx-arch-test-') as temporary:
+            root = Path(temporary)
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text, encoding='ascii')
+            return architecture.check_detached_threads(root)
+
+    def test_a_detached_thread_is_rejected(self):
+        errors = self.detach_errors(
+            {
+                'src/gui/a.c': 'void f(SDL_Thread* t) {\n    SDL_DetachThread(t);\n}\n',
+                'src/gui/b.cpp': 'void g() { SDL_DetachThread (0); }\n',
+                'src/gui/e.m': 'void i(void) { SDL_DetachThread(0); }\n',
+            }
+        )
+        self.assertEqual(len(errors), 3)
+        self.assertIn('src/gui/a.c:2: SDL_DetachThread reads a thread that may have ended and been freed', errors[0])
+        self.assertIn('src/gui/b.cpp:1: SDL_DetachThread', errors[1])
+
+    def test_a_joined_thread_and_a_comment_pass(self):
+        files = {
+            'src/gui/c.c': '/* not SDL_DetachThread(t) */\nvoid h(SDL_Thread* t) { SDL_WaitThread(t, 0); }\n',
+            'src/gui/d.c': 'const char* s = "SDL_DetachThread(t)";\nint My_SDL_DetachThread_count;\n',
+        }
+        self.assertEqual(self.detach_errors(files), [])
+
+    def thread_errors(self, files):
+        with tempfile.TemporaryDirectory(prefix='snx-arch-test-') as temporary:
+            root = Path(temporary)
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text, encoding='ascii')
+            return architecture.check_test_threads(root)
+
+    def test_a_tests_registers_apart_from_its_cpu_are_rejected(self):
+        files = {
+            'tests/hook_a.c': 'static SnxArmCPU a;\nstatic CPU cpu32;\n'
+            'SnxArmCPU* arm_cpu(CPU* c) { return (void)c, &a; }\n'
+            'CPU* hook_a32_cpu(SnxArmCPU* arm) { return (void)arm, &cpu32; }\n',
+        }
+        errors = self.thread_errors(files)
+        self.assertEqual(len(errors), 2)
+        self.assertIn("tests/hook_a.c:3: arm_cpu returns an object of the test's whatever its argument", errors[0])
+        self.assertIn('restrict pointer', errors[0])
+        self.assertIn('tests/hook_a.c:4: hook_a32_cpu returns an object', errors[1])
+
+    def test_one_thread_and_a_test_with_no_registers_pass(self):
+        files = {
+            'tests/hook_b.c': 'typedef struct { CPU cpu; SnxArmCPU arm; } Thread32;\n'
+            'SnxArmCPU* arm_cpu(CPU* c) { return &((Thread32*)(void*)((char*)c - offsetof(Thread32, cpu)))->arm; }\n'
+            'CPU* hook_a32_cpu(SnxArmCPU* arm) {\n'
+            '    return &((Thread32*)(void*)((char*)arm - offsetof(Thread32, arm)))->cpu;\n}\n',
+            'tests/hook_c.c': 'static CPU cpu;\nSnxArmCPU* arm_cpu(CPU* c) { return (void)c, NULL; }\n'
+            'CPU* hook_a32_cpu(SnxArmCPU* arm) { return (void)arm, &cpu; }\n',
+            'tests/hook_d.c': 'static CPU cpu;\nCPU* hook_a32_cpu(SnxArmCPU* arm) { return (void)arm, &cpu; }\n'
+            'SnxArmCPU* arm_cpu(CPU* c) {\n    (void)c;\n    return NULL;\n}\n',
+        }
+        self.assertEqual(self.thread_errors(files), [])
+
     def device_errors(self, files):
         with tempfile.TemporaryDirectory(prefix='snx-arch-test-') as temporary:
             root = Path(temporary)
@@ -119,6 +204,109 @@ class ArchitectureTests(unittest.TestCase):
         }
         self.assertEqual(self.device_errors(files), [])
 
+    def weak_errors(self, files):
+        with tempfile.TemporaryDirectory(prefix='snx-arch-test-') as temporary:
+            root = Path(temporary)
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text, encoding='ascii')
+            return architecture.check_weak_declarations(root)
+
+    def test_a_weak_declaration_of_ours_is_rejected(self):
+        files = {
+            'src/nx/runtime/driver/driver.h': '/* weak */\n[[gnu::weak]] int snx_setting_known(const char* key);\n',
+            'src/nx/runtime/driver/setup.h': '[[gnu::weak, gnu::cold]] extern const char* snx_menu_words[4];\n'
+            'int f(void) __attribute__((weak));\n',
+        }
+        errors = self.weak_errors(files)
+        self.assertEqual(len(errors), 3)
+        self.assertIn(
+            'src/nx/runtime/driver/driver.h:2: snx_setting_known is declared weak with no definition', errors[0]
+        )
+        self.assertIn('"misaligned ldr/str offset"', errors[0])
+        self.assertIn('WEAK_DECLARED (tests/architecture.py)', errors[0])
+        self.assertIn('src/nx/runtime/driver/setup.h:1: snx_menu_words is declared weak', errors[1])
+        self.assertIn('src/nx/runtime/driver/setup.h:2: ', errors[2])
+
+    def test_a_weak_definition_a_listed_name_and_a_comment_pass(self):
+        files = {
+            'src/nx/runtime/driver/driver.c': '[[gnu::weak]] int snx_setting_known(const char* key) { return 0; }\n'
+            '[[gnu::weak]] struct jit_descriptor __jit_debug_descriptor = {1, 0, NULL, NULL};\n',
+            'src/nx/hle/hook/alloc.c': '[[gnu::weak]] extern void* mallocx(size_t size, int flags);\n'
+            '[[gnu::weak, gnu::visibility("hidden")]] extern const char __ehdr_start[];\n',
+            'src/nx/runtime/main.c': '/* [[gnu::weak]] int old(void); */\nconst char* s = "[[gnu::weak]] int f(void);";\n',
+        }
+        self.assertEqual(self.weak_errors(files), [])
+
+    def driver_errors(self, files, allowed=None):
+        with tempfile.TemporaryDirectory(prefix='snx-arch-test-') as temporary:
+            root = Path(temporary)
+            for name, text in files.items():
+                (root / name).parent.mkdir(parents=True, exist_ok=True)
+                (root / name).write_text(text, encoding='ascii')
+            with mock.patch.object(architecture, 'DRIVER_CHOICES', allowed or {}):
+                return architecture.check_driver_choices(root)
+
+    def test_a_driver_a_vendor_or_a_device_compared_is_rejected(self):
+        files = {
+            'src/nx/gpu/vk/device.c': 'void f(void) {\n    int nvidia = g_vk.props.vendorID == 0x10DE;\n'
+            '    serial(p12.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY);\n}\n',
+            'src/nx/gpu/vk/ui.c': 'int t(void) {\n    switch (g_vk.props.vendorID) {\n    default: return 0;\n    }\n}\n',
+            'src/3ds/gpu/vk/a.c': 'int a(void) { return strstr(props.deviceName, "Adreno") != NULL; }\n',
+            'src/vita/gpu/b.c': 'int b(u32 v) { return v == 0x1002u; }\n',
+            'src/nx/gpu/vk/uma.c': 'int c(u32 id) {\n    switch (id) {\n        case VK_DRIVER_ID_MESA_RADV: return 1;\n'
+            '        default: return 0;\n    }\n}\n',
+        }
+        errors = self.driver_errors(files)
+        self.assertEqual(len(errors), 6, errors)
+        self.assertIn(
+            'src/3ds/gpu/vk/a.c:1: "int a(void) { return strstr(props.deviceName, "Adreno") != NULL; }" '
+            'compares a driver, a vendor or a device, which only the extension bans do: put it in '
+            'src/common/gpu/vk/extension_bans.txt',
+            errors[0],
+        )
+        self.assertIn('an "off" line asked with vk_ban', errors[0])
+        self.assertIn('a "prefer" line asked with vk_prefer', errors[0])
+        self.assertIn('joins DRIVER_CHOICES in tests/architecture.py with its reason', errors[0])
+        self.assertIn('src/nx/gpu/vk/device.c:2: "int nvidia = g_vk.props.vendorID == 0x10DE;"', errors[1])
+        self.assertIn('src/nx/gpu/vk/device.c:3: "serial(p12.driverID == VK_DRIVER_ID_NVIDIA_PROPRIETARY);"', errors[2])
+        self.assertIn('src/nx/gpu/vk/ui.c:2: "switch (g_vk.props.vendorID) {"', errors[3])
+        self.assertIn('src/nx/gpu/vk/uma.c:3: "case VK_DRIVER_ID_MESA_RADV: return 1;"', errors[4])
+        self.assertIn('src/vita/gpu/b.c:1: "int b(u32 v) { return v == 0x1002u; }"', errors[5])
+
+    def test_the_reader_a_log_a_define_and_a_comment_pass(self):
+        files = {
+            'src/common/gpu/vk/extension_bans.c': 'int h(void) { return b->driver == VK_DRIVER_ID_MESA_RADV; }\n',
+            'src/nx/gpu/vk/device.c': '/* not where vendorID == 0x10DE */\n#define SNX_GPU_VENDOR_AMD 0x1002u\n'
+            'void l(void) {\n    LOG("%s, vendor %04x\\n", p.deviceName, p.vendorID);\n'
+            '    g_vk.driver_id = (u32)dp.driverID;\n    tag(g_vk.driver_id, p.vendorID, p.deviceID);\n'
+            '    say("vendorID == 0x10DE");\n    if (vk_prefer("Location", 1, say) != 0) g_vk.host_varying = 1;\n}\n',
+            'src/nx/gpu/maxwell/m.c': 'int t(u32 o) {\n    switch (o) {\n        case 0x1002: return 1;\n'
+            '        default: return 0;\n    }\n}\n',
+            'src/android/bridge/hle_vulkan.c': 'void g(void) { p->vendorID = ARM_VENDOR_ID; d->driverID = 9; }\n',
+        }
+        self.assertEqual(self.driver_errors(files), [])
+
+    def test_a_listed_comparison_passes_and_a_stale_entry_is_rejected(self):
+        files = {
+            'src/nx/gpu/vk/ui.c': 'int t(void) {\n    switch  (g_vk.props.vendorID) {\n    default: return 0;\n    }\n}\n'
+        }
+        listed = {'src/nx/gpu/vk/ui.c': {'switch (g_vk.props.vendorID) {': 'a GPU that renders in tiles'}}
+        self.assertEqual(self.driver_errors(files, listed), [])
+        files['src/nx/gpu/vk/ui.c'] += 'int n(void) { return g_vk.props.vendorID == 0x10DE; }\n'
+        errors = self.driver_errors(files, listed)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('src/nx/gpu/vk/ui.c:6: "int n(void) { return g_vk.props.vendorID == 0x10DE; }"', errors[0])
+        stale = {'src/nx/gpu/vk/ui.c': {'if (g_vk.props.vendorID == 0x5143) {': 'gone'}}
+        errors = self.driver_errors({'src/nx/gpu/vk/ui.c': 'int t(void) { return 0; }\n'}, stale)
+        self.assertEqual(
+            errors,
+            [
+                'tests/architecture.py: DRIVER_CHOICES allows "if (g_vk.props.vendorID == 0x5143) {" in '
+                'src/nx/gpu/vk/ui.c, which has no such line: take the entry out'
+            ],
+        )
+
     def dynamic_errors(self, files):
         with tempfile.TemporaryDirectory(prefix='snx-arch-test-') as temporary:
             root = Path(temporary)
@@ -138,6 +326,28 @@ class ArchitectureTests(unittest.TestCase):
         self.assertIn('docs/layers/gpu/driver-quirks.md#turnip', errors[0])
         pool = 'VkDescriptorPoolSize s = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3};\n'
         self.assertEqual(len(self.dynamic_errors({'src/nx/gpu/vk/a.c': pool})), 1)
+
+    def test_the_constant_buffers_chosen_off_on_android_pass(self):
+        android = (
+            '    const char* off = NULL;\n#if defined(__ANDROID__)\n    /* Turnip */\n    if (!off)\n'
+            '        off = "off on Android, where vk_dynamic_cbufs=1 is not taken";\n#endif\n'
+        )
+        chosen = {
+            'src/nx/gpu/vk/cb_dynamic.h': 'return d ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC : t;\n',
+            'src/nx/gpu/vk/pipeline.c': 'sz[k] = (VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 3};\n',
+            'src/nx/gpu/vk/render.c': 'if (type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC) {\n}\n',
+        }
+        self.assertEqual(self.dynamic_errors({**chosen, 'src/nx/gpu/vk/cb_dynamic.c': android}), [])
+        # without the Android rule, the choice is dynamic on Turnip too
+        errors = self.dynamic_errors({**chosen, 'src/nx/gpu/vk/cb_dynamic.c': '    const char* off = NULL;\n'})
+        self.assertEqual(len(errors), 1)
+        self.assertIn('vk_cb_dynamic_choose takes dynamic slots on Android', errors[0])
+        # a second use in one of those files is no part of the choice
+        extra = {**chosen, 'src/nx/gpu/vk/cb_dynamic.c': android}
+        extra['src/nx/gpu/vk/render.c'] += 'b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC;\n'
+        errors = self.dynamic_errors(extra)
+        self.assertEqual(len(errors), 1)
+        self.assertIn('src/nx/gpu/vk/render.c:3: VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC', errors[0])
 
     def test_a_recorders_case_and_a_comment_pass(self):
         files = {

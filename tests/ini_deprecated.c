@@ -26,9 +26,22 @@ int main(void) {
            !ini_deprecated("user_uid"));
     assert(ini_deprecated("vk_descriptors") && strstr(ini_deprecated("vk_descriptors"), "now vk_descriptors_mode") &&
            !ini_deprecated("vk_descriptors_mode"));
+    /* write_tracking_hot: its 0, the default every .ini wrote, is write_tracking_hot_pages's Auto, so not a rename */
+    assert(ini_deprecated("write_tracking_hot") &&
+           strstr(ini_deprecated("write_tracking_hot"), "now write_tracking_hot_pages, whose 2 is Auto") &&
+           !ini_deprecated("write_tracking_hot_pages") && !ini_renamed("write_tracking_hot"));
+    /* emulated_cores: its 1, the default every .ini wrote, is emulated_cores_mode's Auto */
+    assert(ini_deprecated("emulated_cores") &&
+           strstr(ini_deprecated("emulated_cores"),
+                  "now emulated_cores_mode, of the same 0 (Off) and 1 (On) and 2, Auto") &&
+           !ini_deprecated("emulated_cores_mode"));
+    /* of the same 0 and 1: a pick of it (the launcher's, the game's) is carried over */
+    assert(ini_renamed("emulated_cores") && !strcmp(ini_renamed("emulated_cores"), "emulated_cores_mode"));
     /* renamed, of the same values: the launcher carries a pick of it over */
     assert(ini_renamed("vk_descriptors") && !strcmp(ini_renamed("vk_descriptors"), "vk_descriptors_mode") &&
            !ini_renamed("memory_fit") && !ini_renamed("vk_descriptors_mode") && !ini_renamed(""));
+    assert(!strcmp(ini_renamed("dlss_render_size"), "internal_resolution") && ini_deprecated("dlss_render_size") &&
+           ini_deprecated("dlss_upscaler") && !ini_renamed("dlss_upscaler") && !ini_deprecated("internal_resolution"));
     /* the NVN and Maxwell paths' switches, the ASTC background's CPU threads and the unattended run's one press */
     assert(!strcmp(ini_deprecated("nvn_direct"), "the runtime always runs the game's NVN calls") &&
            ini_deprecated("mme_verify") && ini_deprecated("astc_background_threads") &&

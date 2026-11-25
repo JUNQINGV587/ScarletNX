@@ -47,7 +47,8 @@ extern "C" {
 
 /* ---- the recompiler ---- */
 
-/* flags of snx_recompiler_new: the backend. LLVM is the only one */
+/* flags of snx_recompiler_new: the backend. LLVM is the only one to name: the x86-64 back end, where it is built, makes
+   what it can of the code beside it (snx_recompiler_set_backend) */
 #define SNX_RECOMPILER_FLAG_LLVM 1
 
 struct snx_recompiler;
@@ -79,7 +80,10 @@ SNX_RECOMPILER_API int snx_recompiler_set_optimization(struct snx_recompiler* r,
 #define SNX_RECOMPILER_A64_ANDROID 2
 SNX_RECOMPILER_API int snx_recompiler_set_a64_target(struct snx_recompiler* r, int target);
 /* Code units compiled at once, on host threads; 0, the default, uses one per processor */
-SNX_RECOMPILER_API void snx_recompiler_set_jobs(struct snx_recompiler* r, unsigned jobs);
+SNX_RECOMPILER_API /* the code generator: 1 the x86-64 back end with LLVM making what it can't (the default where it is built:
+   x86-64), 0 LLVM alone. SNX_RECOMPILER_BACKEND=llvm in the environment is 0 too */
+SNX_RECOMPILER_API void snx_recompiler_set_backend(struct snx_recompiler* r, int x64);
+void snx_recompiler_set_jobs(struct snx_recompiler* r, unsigned jobs);
 /* How far a recompile is, for a caller's progress bar: called once with the totals and nothing done, then as each code
    unit finishes, from the thread that compiled it, with the recompiler's queue locked (so it must be quick). The weight
    is the units' instructions plus four per basic block, which follows the work better than the function count. Not called for a module the
@@ -163,6 +167,9 @@ SNX_RECOMPILER_API void snx_recompiled_range(const struct snx_recompiled* m, uin
    callers of earlier versions still link) */
 SNX_RECOMPILER_API size_t snx_recompiled_functions(const struct snx_recompiled* m);
 SNX_RECOMPILER_API size_t snx_recompiled_fallbacks(const struct snx_recompiled* m);
+/* Of the functions, those the x86-64 back end made (snx_recompiler_set_backend), not LLVM: 0 for a module from the
+   cache folder */
+SNX_RECOMPILER_API size_t snx_recompiled_x64_functions(const struct snx_recompiled* m);
 /* Points cpu at the module: its dispatch table and code range (cpu->disp, code_lo, code_hi). cpu->mem and cpu->rt
    are the caller's and must be set before, cpu->rt with svc, undef, brk and miss (snx_runtime_defaults' miss compiles
    what the bound module lacks). 0, or -1 when cpu->rt lacks a hook */
@@ -181,6 +188,14 @@ SNX_RECOMPILER_API void snx_recompiled_set_fallback(struct snx_recompiled* m, Gu
    loaded for running threads. With snx_recompiler_set_hook_direct_calls, dispatch entries are cleared and the optional
    callback receives each retired [start, end) span. Returns the number of retired functions */
 typedef void (*snx_recompiled_invalidate_callback)(void* context, uint64_t start, uint64_t end);
+/* Bring the module's own copy of the code (the one its JIT compiles from) up to the guest's current bytes for
+   [addr, addr + size), word aligned: call it with what the guest now has before snx_recompiled_invalidate, so the
+   units the JIT then builds for the changed code are the new code. Returns the bytes updated (those inside the
+   module's ranges), 0 for a module made with snx_recompiler_set_live_code, whose JIT already reads the caller's
+   bytes. Concurrent updates to one module are serialized; JIT readers of copied words reject a read if its image
+   generation changes. The caller must still invalidate changed functions after updating the bytes. */
+SNX_RECOMPILER_API size_t snx_recompiled_update_code(struct snx_recompiled* m, uint64_t addr, const void* code,
+                                                     size_t size);
 SNX_RECOMPILER_API size_t snx_recompiled_invalidate(struct snx_recompiled* m, uint64_t addr, uint64_t size,
                                                     snx_recompiled_invalidate_callback callback, void* context);
 /* Calls the guest function at pc (snx_recompiled_lookup) and returns when that host function returns: at the guest

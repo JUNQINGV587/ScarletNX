@@ -426,8 +426,9 @@ void plat_vm_track(u8* p, u64 size) {
             if (pm >= 0) {
                 atomic_store_explicit(&g_pagemap, pm, memory_order_relaxed);
                 if (g_settings.write_tracking_hot_pages == 1)
-                    WARN("memory: write_tracking_hot=1 leaves pages hot only where page protection tracks the writes, "
-                         "and userfaultfd tracks them here (write_tracking=0): no page is hot this run\n");
+                    WARN(
+                        "memory: write_tracking_hot_pages=1 leaves pages hot only where page protection tracks the writes, "
+                        "and userfaultfd tracks them here (write_tracking=0): no page is hot this run\n");
                 if (traps_by_signal()) wp_init(p, size, 0); /* the states for the traps alone */
                 return;
             }
@@ -440,7 +441,7 @@ void plat_vm_track(u8* p, u64 size) {
 #endif
     (void)by_signal;
     if (no_ww && g_settings.write_tracking_hot_pages == 1)
-        WARN("memory: write_tracking_hot=1 leaves pages hot only where page protection tracks the writes, and "
+        WARN("memory: write_tracking_hot_pages=1 leaves pages hot only where page protection tracks the writes, and "
              "write_tracking=2 tracks none: no page is hot this run\n");
     /* the states also serve traps by protection, where userfaultfd's minor faults don't (plat_trap_init) */
     if (!no_ww || !g_uffd_minor_on() || traps_by_signal()) wp_init(p, size, !no_ww);
@@ -485,7 +486,7 @@ static unsigned g_wp_shift; /* the host's page, log2 */
 static _Atomic u64 g_wp_budget; /* atomic: pages the tracking and the traps may hold at once */
 static _Atomic u64 g_wp_held;   /* atomic: pages they hold now (WP_PROT or WP_TRAP) */
 static _Atomic u32 g_wp_opened; /* atomic: moves whenever pages become writable (a fault's, a mapping change's) */
-/* Hot pages (write_tracking_hot=1): a page the scans of its leaf report written WP_HOT_AFTER times in a row is left
+/* Hot pages (write_tracking_hot_pages 1 or 2): a page the scans of its leaf report written WP_HOT_AFTER times in a row is left
    writable, and reported written by every scan after without its fault, as a page written in every epoch would be;
    at its WP_HOT_AFTER + WP_HOT_FOR-th report in a row it is protected again and counted from zero, so a page no longer
    written goes quiet. A scan that finds it unwritten, a trap or a mapping change starts its count over. Reporting a
@@ -494,7 +495,7 @@ static _Atomic u32 g_wp_opened; /* atomic: moves whenever pages become writable 
    per host page, changes under the page's lock */
 #define WP_HOT_AFTER 2
 #define WP_HOT_FOR   32
-static _Atomic u8* g_wp_hot;   /* the counts; NULL with write_tracking_hot=0 */
+static _Atomic u8* g_wp_hot;   /* the counts; NULL with write_tracking_hot_pages=0 */
 static _Atomic u64 g_wp_hot_n; /* atomic: pages hot now (counted WP_HOT_AFTER or more) */
 /* A mark per group of pages that a scan has something to do in: a page of it became written, or has a hot count. The
    scans read a state for each page of the leaves checks need, thousands in a scan and hundreds of thousands of scans
@@ -513,6 +514,8 @@ static _Thread_local struct {
     _Atomic u32 wp_retried_at;
     void* _Atomic frz_retried; /* the address a thawed write was let go again at once (frozen_wait) */
     int freezing;              /* this thread froze the range frozen now (plat_freeze to plat_thaw) */
+    /* and moved it with what the write tracking says of it kept (WwKept): the thaw's to keep */
+    int frz_kept;
     int crashed;       /* this thread faulted already */
 } t_plat_posix;
 /* a range frozen while it is copied (plat_freeze, below) */
@@ -601,7 +604,12 @@ static void wp_hold(const u8* p, u64 size, u8 to) {
 /* the change wp_hold locked them for is done: the pages are in state to now (changed), or as they were but written:
    a change that failed partway (an mprotect, a mapping) may have made some writable */
 static void trap_wake(void);
-static void wp_let(const u8* p, u64 size, u8 to, int changed) {
+/* a page the tracking holds read only and unwritten, with no trap's part in it: the thaw of a range moved with its
+   states kept leaves it so (plat_thaw) */
+static int wp_quiet(u8 s) {
+    return (s & (WP_MAPPED | WP_CLEAN | WP_PROT | WP_ARMED | WP_TRAP)) == (WP_MAPPED | WP_CLEAN | WP_PROT);
+}
+static void wp_let_but(const u8* p, u64 size, u8 to, int changed, int quiet_stay) {
     u64 i, lo, hi, freed = 0;
     int woken = 0;
     if (wp_pages(p, size, &lo, &hi)) return;
@@ -610,6 +618,10 @@ static void wp_let(const u8* p, u64 size, u8 to, int changed) {
     for (i = lo; i < hi; i++) {
         u8 s = atomic_load_explicit(&atomic_load_explicit(&g_wp, memory_order_relaxed)[i], memory_order_relaxed);
         if (!to && !s) continue;
+        if (quiet_stay && wp_quiet(s)) {
+            wp_unlock(i, (u8)(s & ~WP_LOCK));
+            continue;
+        }
         if (changed && (s & (WP_PROT | WP_TRAP))) freed++;
         if (changed && (s & WP_TRAP)) woken = 1;
         if (changed) wp_hot_over(i);
@@ -617,6 +629,18 @@ static void wp_let(const u8* p, u64 size, u8 to, int changed) {
     }
     if (freed) atomic_fetch_sub_explicit(&g_wp_held, freed, memory_order_relaxed);
     if (woken) trap_wake();
+}
+static void wp_let(const u8* p, u64 size, u8 to, int changed) { wp_let_but(p, size, to, changed, 0); }
+/* the change wp_hold locked them for wrote none of them and left each page's protection as its state has it: the
+   pages as they were, with to */
+static void wp_let_same(const u8* p, u64 size, u8 to) {
+    u64 i, lo, hi;
+    if (wp_pages(p, size, &lo, &hi)) return;
+    for (i = lo; i < hi; i++) {
+        u8 s = atomic_load_explicit(&atomic_load_explicit(&g_wp, memory_order_relaxed)[i], memory_order_relaxed);
+        if (!to && !s) continue;
+        wp_unlock(i, (u8)((s & ~WP_LOCK) | to));
+    }
 }
 /* whether a is in the range frozen now: the freeze's to answer (frozen_wait) */
 static int frozen_at(const void* a) {
@@ -717,8 +741,8 @@ static void context_frame(void* ctx, TrapWaitCtx* w);
 
 /* A wait while *w is v, and the wake of every waiter on w: a futex on Linux, _umtx_op's private word waits on FreeBSD
    (both system calls, safe in a signal handler), else a yield. With the yield on FreeBSD the trap thread spun while
-   nothing was posted, and each thread waiting in a trap too: in Mario Kart World's race the trap thread held 44 to 87%
-   of a core of six doing nothing */
+   nothing was posted, and each thread waiting in a trap too: in a racing game's race the trap thread held 44 to 87% of
+   a core of six doing nothing */
 static void trap_futex_wait(_Atomic u32* w, u32 v) {
 #if defined(__linux__)
     syscall(SYS_futex, w, FUTEX_WAIT_PRIVATE, v, NULL, NULL, 0);
@@ -849,7 +873,8 @@ static void wp_protect(u64 i, u64 n, void (*cb)(u8* p, u64 size)) {
     u8* a = g_wp_base + (i << g_wp_shift);
     u64 k, add = 0, len = n << g_wp_shift;
     u8 to;
-    int shed = 0;
+    int shed = 0, prot_ok = 0, failed = 0;
+    SNX_ZONE(z_protect, "plat page protect");
     for (k = i; k < i + n; k++)
         if (!(atomic_load_explicit(&atomic_load_explicit(&g_wp, memory_order_relaxed)[k], memory_order_relaxed) &
               WP_PROT))
@@ -860,8 +885,14 @@ static void wp_protect(u64 i, u64 n, void (*cb)(u8* p, u64 size)) {
         /* it may have changed part of the run: held, but written, so a fault opens it and the next scan tries again */
         to = WP_MAPPED | WP_PROT;
         shed = errno == ENOMEM;
-    } else
+        failed = !shed;
+    } else {
         to = WP_MAPPED | WP_PROT | WP_CLEAN;
+        prot_ok = 1;
+    }
+    /* 2: ENOMEM shed, 3: mprotect failed, 1: read only, 0: left writable */
+    SNX_ZONE_VALUE(z_protect, shed ? 2 : failed ? 3 : to ? 1 : 0);
+    if (prot_ok && n) SNX_PLOT("plat pages protected", (double)n);
     for (k = i; k < i + n; k++)
         wp_unlock(k, to ? to
                         : (u8)(atomic_load_explicit(&atomic_load_explicit(&g_wp, memory_order_relaxed)[k],
@@ -949,17 +980,19 @@ static void wp_init(u8* p, u64 size, int track) {
     g_wp_shift = shift;
     atomic_store_explicit(&g_wp_budget, budget, memory_order_relaxed);
     g_wp_track = track;
-    if (track && g_settings.write_tracking_hot_pages == 1) {
+    if (track && g_settings.write_tracking_hot_pages) { /* 1, or 2 (Auto): on wherever protection tracks */
         void* h = mmap(NULL, (size_t)(size >> shift), PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (h == MAP_FAILED)
-            WARN("memory: write_tracking_hot=1 needs %llu bytes for its counts, which mmap refused (error %d): no page "
-                 "is hot this run\n",
-                 (unsigned long long)(size >> shift), errno);
+            WARN(
+                "memory: write_tracking_hot_pages=%d needs %llu bytes for its counts, which mmap refused (error %d): no "
+                "page is hot this run\n",
+                g_settings.write_tracking_hot_pages, (unsigned long long)(size >> shift), errno);
         else {
             g_wp_hot = (_Atomic u8*)h;
-            LOG("memory: hot pages (write_tracking_hot=1): a page written in %d scans in a row stays writable for %d\n",
-                WP_HOT_AFTER, WP_HOT_FOR);
+            LOG("memory: hot pages (write_tracking_hot_pages=%d): a page written in %d scans in a row stays writable "
+                "for %d\n",
+                g_settings.write_tracking_hot_pages, WP_HOT_AFTER, WP_HOT_FOR);
         }
     }
     if (track) {
@@ -1001,7 +1034,9 @@ void plat_ww_open(u8* p, u64 size) {
        the old pages, which the move has copied already. The thread that moves it writes at once, as its write is the
        move's own (plat_alias_read into the pages a failed move left), and waiting for its own thaw would never end */
     mine = t_plat_posix.freezing;
-    if (!mine) frozen_until_thaw(p, p + size);
+    if (!mine) frozen_until_thaw(p, p + size); /* the wait stays out of the zone */
+    SNX_ZONE(z_wwopen, "plat ww open");
+    SNX_ZONE_TEXT(z_wwopen, mine ? "own move" : "other thread");
     for (i = lo; i <= hi; i++) {
         /* every page locked, not only those held now: a scan that locked one before the range was published may be
            about to protect it, and holds it until it has */
@@ -1018,6 +1053,7 @@ void plat_ww_open(u8* p, u64 size) {
         if (!mprotect(g_wp_base + (run << g_wp_shift), (size_t)(n << g_wp_shift), PROT_READ | PROT_WRITE | g_vm_exec)) {
             atomic_fetch_sub_explicit(&g_wp_held, n, memory_order_relaxed);
             atomic_fetch_add_explicit(&g_wp_opened, 1, memory_order_seq_cst);
+            SNX_PLOT("plat pages opened", (double)n);
             for (k = run; k < run + n; k++)
                 wp_unlock(k, (u8)((atomic_load_explicit(&atomic_load_explicit(&g_wp, memory_order_relaxed)[k],
                                                         memory_order_relaxed) &
@@ -1090,6 +1126,109 @@ static void ww_scans_begin(void) {
 }
 static void ww_scans_end(void) { atomic_fetch_sub_explicit(&g_ww_scans, 1, memory_order_seq_cst); }
 #endif
+
+/* What the written-page tracking says of a range kept across a move of its pages that keeps their bytes
+   (plat_vm_share, plat_vm_unshare and plat_alias_map, on a range its caller froze). A mapping made again reads as
+   written whole, and a move writes nothing: what took that report for the CPU's writes loaded a guest page over the
+   pixels the GPU had drawn there and not yet written back, and a scan between an owner's move into the pool and its
+   trap had the image stored there keep memory's bytes over its next store (memory/own.c's own_begin). The range stays
+   read only from the freeze to plat_thaw, so no write comes between. The kernel's tracking: the pages a scan would report before the move are noted (written, a bit a page), no
+   scan runs meanwhile (g_ww_letgo, as a trap's let-go holds them), and the others are protected again once the new
+   mapping is registered. Tracking by protection keeps each page's state and protection through the move instead
+   (wp_let_same) */
+typedef struct {
+    u64* written; /* NULL: nothing noted, and the range reads as written after the move */
+    int held;     /* the scans wait */
+} WwKept;
+/* whether [p, p + size) is the range this thread froze (plat_freeze): it takes no write until plat_thaw */
+static int frozen_whole(const u8* p, u64 size) {
+    return t_plat_posix.freezing && p == atomic_load_explicit(&g_frz_lo, memory_order_relaxed) &&
+           p + size == atomic_load_explicit(&g_frz_hi, memory_order_relaxed);
+}
+#if defined(__linux__) && defined(PAGEMAP_SCAN)
+/* PAGEMAP_SCAN over [p, p + size) for the written pages: noted in written (a bit a page of page bytes), or with
+   written NULL protected again, so that they read as unwritten. 0, or -1 with errno */
+static int ww_walk_written(int pm, u8* p, u64 size, u64 page, u64* written) {
+    struct page_region regions[64];
+    u64 start = (u64)(uintptr_t)p, end = start + size;
+    while (start < end) {
+        struct pm_scan_arg arg = {.size = sizeof arg,
+                                  .flags = written ? 0 : PM_SCAN_WP_MATCHING,
+                                  .start = start,
+                                  .end = end,
+                                  .vec = (u64)(uintptr_t)regions,
+                                  .vec_len = sizeof regions / sizeof *regions,
+                                  .category_mask = PAGE_IS_WRITTEN,
+                                  .return_mask = PAGE_IS_WRITTEN};
+        const int n = ioctl(pm, PAGEMAP_SCAN, &arg);
+        if (n < 0) return -1;
+        for (int i = 0; written && i < n; i++)
+            for (u64 a = regions[i].start; a < regions[i].end; a += page) {
+                const u64 k = (a - (u64)(uintptr_t)p) / page;
+                written[k >> 6] |= (u64)1 << (k & 63);
+            }
+        /* a full vector may have stopped the walk early: on from where it stopped */
+        if ((u64)n < arg.vec_len || !arg.walk_end || arg.walk_end >= end) break;
+        start = arg.walk_end;
+    }
+    return 0;
+}
+#endif
+/* before the move of frozen [p, p + size): what a scan would report of it noted, and the scans held */
+static WwKept ww_keep(u8* p, u64 size) {
+    WwKept k = {NULL, 0};
+#if defined(__linux__) && defined(PAGEMAP_SCAN)
+    const u64 page = (u64)sysconf(_SC_PAGESIZE);
+    const int pm = atomic_load_explicit(&g_pagemap, memory_order_acquire);
+    int none = 0;
+    /* the tracking whose scans answer (plat_ww_scan): by protection, its states are kept where they are */
+    if (pm < 0 || (atomic_load_explicit(&g_wp, memory_order_acquire) && g_wp_track)) return k;
+    while (
+        !atomic_compare_exchange_strong_explicit(&g_ww_letgo, &none, 1, memory_order_seq_cst, memory_order_seq_cst)) {
+        none = 0;
+        sched_yield();
+    }
+    while (atomic_load_explicit(&g_ww_scans, memory_order_seq_cst)) sched_yield();
+    k.held = 1;
+    k.written = (u64*)calloc((size_t)((size / page + 63) / 64), sizeof *k.written);
+    if (k.written && ww_walk_written(pm, p, size, page, k.written)) {
+        const int why = errno;
+        free(k.written);
+        k.written = NULL;
+        errno = why;
+    }
+    if (!k.written)
+        WARN_LIMIT(4,
+                   "memory: which pages of %llu KiB of guest memory were written could not be read before they moved "
+                   "(error %d): all of them read as written at the next scan\n",
+                   (unsigned long long)(size >> 10), errno);
+#else
+    (void)p, (void)size;
+#endif
+    return k;
+}
+/* after it, the new mapping registered: with moved, the pages noted unwritten read so again; the scans go on */
+static void ww_kept(WwKept* k, u8* p, u64 size, int moved) {
+#if defined(__linux__) && defined(PAGEMAP_SCAN)
+    const u64 page = (u64)sysconf(_SC_PAGESIZE), pages = size / page;
+    const int pm = atomic_load_explicit(&g_pagemap, memory_order_acquire);
+    for (u64 i = 0, run = 0; k->written && moved && pm >= 0 && i <= pages; i++) {
+        if (i < pages && !(k->written[i >> 6] >> (i & 63) & 1)) continue;
+        if (i > run && ww_walk_written(pm, p + run * page, (i - run) * page, page, NULL))
+            WARN_LIMIT(4,
+                       "memory: %llu KiB of guest memory moved could not be watched for writes again (error %d): they "
+                       "read as written at the next scan\n",
+                       (unsigned long long)((i - run) * page >> 10), errno);
+        run = i + 1;
+    }
+    free(k->written);
+    k->written = NULL;
+    if (k->held) atomic_store_explicit(&g_ww_letgo, 0, memory_order_seq_cst);
+    k->held = 0;
+#else
+    (void)k, (void)p, (void)size, (void)moved;
+#endif
+}
 
 int plat_ww_scan(u8* p, u64 size, void (*cb)(u8* p, u64 size)) {
     if (atomic_load_explicit(&g_wp, memory_order_acquire) && g_wp_track) return wp_scan(p, size, cb);
@@ -1210,15 +1349,200 @@ u8* plat_vm_reserve_at(u64 addr, u64 size) {
     return NULL;
 #endif
 }
+#if defined(__APPLE__)
+/* the host pages of the file slots a decommit left in memory: a punched hole drops a range's pages but a wired one
+   (a GPU's import of it, uma.c), whose bytes stay, as the GPU's reads need until the import goes, and which the
+   page's next commit would read; noted here, and zeroed at that commit (files_stale_zero). Few: the pages of an
+   import a decommit falls on */
+static struct {
+    pthread_mutex_t lock;
+    u8** page;
+    size_t n, cap;
+} g_stale = {.lock = PTHREAD_MUTEX_INITIALIZER};
+static void files_stale_note(u8* p, u64 len) {
+    const u64 page = (u64)sysconf(_SC_PAGESIZE);
+    char in[256];
+    for (u64 at = 0; at < len; at += sizeof in * page) {
+        u64 pages = (len - at) / page < sizeof in ? (len - at) / page : sizeof in;
+        if (mincore(p + at, (size_t)(pages * page), in)) {
+            WARN_LIMIT(4,
+                       "memory: which of %llu KiB of the game's memory files stayed in memory past their decommit "
+                       "is not known (error %d): their next commit may read their old bytes\n",
+                       (unsigned long long)((pages * page) >> 10), errno);
+            continue;
+        }
+        pthread_mutex_lock(&g_stale.lock);
+        for (u64 k = 0; k < pages; ++k) {
+            if (!(in[k] & MINCORE_INCORE)) continue;
+            if (g_stale.n == g_stale.cap) {
+                size_t cap = g_stale.cap ? 2 * g_stale.cap : 16;
+                u8** more = (u8**)realloc(g_stale.page, cap * sizeof *more);
+                if (!more) fatal("No memory to note %zu pages of the game's memory files a decommit left", cap);
+                g_stale.page = more;
+                g_stale.cap = cap;
+            }
+            g_stale.page[g_stale.n++] = p + at + k * page;
+        }
+        pthread_mutex_unlock(&g_stale.lock);
+    }
+}
+/* the pages of [p, p + size) a decommit left in memory, zeroed: the range is committed, writable */
+static void files_stale_zero(u8* p, u64 size) {
+    const u64 page = (u64)sysconf(_SC_PAGESIZE);
+    pthread_mutex_lock(&g_stale.lock);
+    for (size_t i = 0; i < g_stale.n;) {
+        u8* at = g_stale.page[i];
+        if (at >= p && at < p + size) {
+            memset(at, 0, (size_t)page);
+            g_stale.page[i] = g_stale.page[--g_stale.n];
+        } else
+            ++i;
+    }
+    pthread_mutex_unlock(&g_stale.lock);
+}
+#endif
 int plat_vm_commit(u8* p, u64 size) {
     int r;
     wp_hold(p, size, WP_MAPPED);
     r = plat_mem_protect(p, size, PLAT_MEM_READ | PLAT_MEM_WRITE | (g_vm_exec ? PLAT_MEM_EXEC : 0u));
+#if defined(__APPLE__)
+    if (!r && plat_vm_files_slot(p, NULL, NULL)) files_stale_zero(p, size);
+#endif
     wp_let(p, size, WP_MAPPED, !r);
     return r;
 }
+/* The file slots (plat_vm_files): set once at startup (guest_files, before kernel_init) and kept to the end. A slot is
+   1 GiB, or larger where that keeps the reservation within FILES_MAX descriptors */
+#define FILE_SLOT (1ull << 30)
+#define FILES_MAX 64
+/* what a SIGBUS on a committed page of the file slots says: past the write tracking and the freeze, a page in or out
+   failed */
+#define FILES_IO  "guest memory: a page of the game's memory files could not be read or written (the disk may be full)"
+static struct {
+    u8* base;
+    u64 size, slot;
+    int* fd; /* a descriptor for each slot; NULL without the slots */
+} g_files;
+int plat_vm_files_slot(const u8* p, int* fd, u64* off) {
+    u64 at = (u64)((uintptr_t)p - (uintptr_t)g_files.base);
+    if (!g_files.fd || at >= g_files.size) return 0;
+    if (fd) *fd = g_files.fd[at / g_files.slot];
+    if (off) *off = at % g_files.slot;
+    return 1;
+}
+/* a SIGBUS at a that FILES_IO explains: in the file slots, on a page committed (WP_MAPPED) where the states say. Darwin
+   gives SIGBUS for a protection fault too, as on an uncommitted page, which is the game's bad access */
+static int files_io(const void* a) {
+    if (!plat_vm_files_slot((const u8*)a, NULL, NULL)) return 0;
+    _Atomic u8* w = atomic_load_explicit(&g_wp, memory_order_acquire);
+    u64 i = (u64)((uintptr_t)a - (uintptr_t)g_wp_base) >> g_wp_shift;
+    return !w || i >= g_wp_pages || (atomic_load_explicit(&w[i], memory_order_relaxed) & WP_MAPPED);
+}
+#if defined(__APPLE__)
+static int files_punch(int fd, u64 off, u64 len) {
+    fpunchhole_t ph = {0};
+    ph.fp_offset = (off_t)off;
+    ph.fp_length = (off_t)len;
+    return fcntl(fd, F_PUNCHHOLE, &ph);
+}
+/* one unlinked file of len bytes in dir at p, PROT_NONE: its descriptor, or -1 with errno */
+static int files_slot(u8* p, u64 len, const char* dir, int probe) {
+    char path[PATH_MAX];
+    if (snprintf(path, sizeof path, "%s/snx-guest-XXXXXX", dir) >= (int)sizeof path) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int fd = mkostemp(path, O_CLOEXEC);
+    if (fd < 0) return -1;
+    if (unlink(path)) { /* a named file would keep the game's memory past its end */
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    /* the size first: Darwin gives SIGBUS on a mapped page past a file's end. The probe asks the disk for the punch
+       that every decommit needs, so a disk without it keeps anonymous memory instead of ending the game later */
+    if (ftruncate(fd, (off_t)len) || (probe && (pwrite(fd, "", 1, 0) != 1 || files_punch(fd, 0, plat_vm_page()))) ||
+        mmap(p, (size_t)len, PROT_NONE, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) {
+        int e = errno;
+        close(fd);
+        errno = e;
+        return -1;
+    }
+    return fd;
+}
+#endif
+int plat_vm_files(u8* base, u64 size, const char* dir) {
+#if defined(__APPLE__)
+    u64 slot = FILE_SLOT;
+    while ((size + slot - 1) / slot > FILES_MAX) slot <<= 1;
+    u64 n = (size + slot - 1) / slot, i;
+    int* fd = (int*)calloc((size_t)n, sizeof *fd);
+    if (!fd) return -1;
+    for (i = 0; i < n; i++) {
+        u64 len = size - i * slot < slot ? size - i * slot : slot;
+        fd[i] = files_slot(base + i * slot, len, dir, i == 0);
+        if (fd[i] < 0) break;
+    }
+    if (i < n) {
+        int e = errno;
+        while (i--) close(fd[i]);
+        /* a hole here would let the host map into the guest's addresses */
+        if (mmap(base, (size_t)size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1, 0) ==
+            MAP_FAILED)
+            fatal("Could not reserve the game's memory again after its files failed (error %d)", errno);
+        free(fd);
+        errno = e;
+        return -1;
+    }
+    int cls = fcntl(fd[0], F_GETPROTECTIONCLASS);
+    if (cls < 0)
+        LOG("memory: the guest files have no data protection class: %s\n", strerror(errno));
+    else
+        LOG("memory: the guest files have data protection class %d\n", cls);
+    g_files.base = base; /* before the game's threads */
+    g_files.size = size;
+    g_files.slot = slot;
+    g_files.fd = fd;
+    return 0;
+#else
+    (void)base;
+    (void)size;
+    (void)dir;
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
 void plat_vm_decommit(u8* p, u64 size) {
     wp_hold(p, size, 0);
+#if defined(__APPLE__)
+    if (plat_vm_files_slot(p, NULL, NULL)) {
+        if (!size || !plat_vm_files_slot(p + size - 1, NULL, NULL))
+            fatal("A decommit of %llu KiB runs past the game's memory files", (unsigned long long)(size >> 10));
+        /* the file mapping stays: fresh anonymous pages would count against the app's limit again */
+        for (u64 done = 0, len; done < size; done += len) {
+            int fd;
+            u64 off;
+            plat_vm_files_slot(p + done, &fd, &off);
+            len = g_files.slot - off < size - done ? g_files.slot - off : size - done;
+            if (!files_punch(fd, off, len)) {
+                files_stale_note(p + done, len);
+                continue;
+            }
+            /* the range must still read zero at its next commit: zeroed in place, its blocks kept */
+            WARN_LIMIT(4, "memory: could not free %llu KiB of the game's memory files (error %d): zeroed in place\n",
+                       (unsigned long long)(len >> 10), errno);
+            if (mprotect(p + done, (size_t)len, PROT_READ | PROT_WRITE))
+                fatal("Could not free %llu KiB of the game's memory files (error %d)", (unsigned long long)(len >> 10),
+                      errno);
+            memset(p + done, 0, (size_t)len);
+        }
+        mprotect(p, (size_t)size, PROT_NONE);
+        wp_let(p, size, 0, 1);
+        return;
+    }
+#endif
 #if defined(__linux__)
     madvise(p, (size_t)size, MADV_DONTNEED);
     mprotect(p, (size_t)size, PROT_NONE);
@@ -1232,9 +1556,15 @@ int plat_vm_share(u8* p, int fd, u64 size) {
     u8* view = (u8*)mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     int r = 0;
     if (view == (u8*)MAP_FAILED) return -1;
+    /* frozen, the range is mapped read only until plat_thaw and keeps what the written-page tracking says of it
+       (WwKept); not frozen, it reads as written, as any mapping made again */
+    const int frozen = frozen_whole(p, size);
+    WwKept kept = {NULL, 0};
+    if (frozen) kept = ww_keep(p, size);
     memcpy(view, p, (size_t)size);
     wp_hold(p, size, WP_MAPPED);
-    if (mmap(p, (size_t)size, PROT_READ | PROT_WRITE | g_vm_exec, MAP_SHARED | MAP_FIXED, fd, 0) == MAP_FAILED) {
+    if (mmap(p, (size_t)size, (frozen ? PROT_READ : PROT_READ | PROT_WRITE) | g_vm_exec, MAP_SHARED | MAP_FIXED, fd,
+             0) == MAP_FAILED) {
         /* a failed MAP_FIXED may have taken p's pages with it: fresh ones with the copy */
         r = mmap(p, (size_t)size, PROT_READ | PROT_WRITE | g_vm_exec, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) ==
                     MAP_FAILED
@@ -1242,9 +1572,14 @@ int plat_vm_share(u8* p, int fd, u64 size) {
                 : -3;
         if (r == -3) memcpy(p, view, (size_t)size);
     }
-    wp_let(p, size, WP_MAPPED, 1);
+    if (frozen && !r) {
+        wp_let_same(p, size, WP_MAPPED);
+        t_plat_posix.frz_kept = 1;
+    } else
+        wp_let(p, size, WP_MAPPED, 1);
     munmap(view, (size_t)size);
     if (r != -2) ww_remapped(p, size); /* a new mapping either way */
+    ww_kept(&kept, p, size, !r);
     return r;
 #else
     (void)p, (void)fd, (void)size;
@@ -1258,15 +1593,26 @@ int plat_vm_unshare(u8* p, u64 size) {
     u8* copy = (u8*)mmap(NULL, (size_t)size, PROT_READ | PROT_WRITE | g_vm_exec, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     int r;
     if (copy == (u8*)MAP_FAILED) return -1;
+    WwKept kept = {NULL, 0};
+    int frozen = frozen_whole(p, size);
+    if (frozen) kept = ww_keep(p, size);
     memcpy(copy, p, (size_t)size);
+    /* frozen, the copy moves over p read only, as p is until plat_thaw (WwKept) */
+    if (frozen && mprotect(copy, (size_t)size, PROT_READ | g_vm_exec)) frozen = 0;
     wp_hold(p, size, WP_MAPPED);
     r = mremap(copy, (size_t)size, (size_t)size, MREMAP_MAYMOVE | MREMAP_FIXED, p) == MAP_FAILED;
-    wp_let(p, size, WP_MAPPED, !r);
+    if (frozen && !r) {
+        wp_let_same(p, size, WP_MAPPED);
+        t_plat_posix.frz_kept = 1;
+    } else
+        wp_let(p, size, WP_MAPPED, !r);
     if (r) {
         munmap(copy, (size_t)size);
+        ww_kept(&kept, p, size, 0);
         return -2; /* MREMAP_FIXED may have unmapped p first */
     }
     ww_remapped(p, size);
+    ww_kept(&kept, p, size, frozen);
     return 0;
 #else
     (void)p, (void)size;
@@ -1574,11 +1920,26 @@ int plat_alias_init(u64 size) {
 int plat_alias_map(u8* p, u64 off, u64 size) {
     int r;
     if (g_alias < 0) return -1;
+    /* frozen, the range holds the bytes the pool's pages were given (mem.c's promote_nl): mapped read only until
+       plat_thaw, it keeps what the written-page tracking says of it (WwKept); not frozen, it reads as written, as any
+       mapping made again */
+    const int frozen = frozen_whole(p, size);
+    WwKept kept = {NULL, 0};
+    if (frozen) kept = ww_keep(p, size);
     wp_hold(p, size, WP_MAPPED);
-    r = mmap(p, (size_t)size, PROT_READ | PROT_WRITE | g_vm_exec, MAP_SHARED | MAP_FIXED, g_alias, (off_t)off) == MAP_FAILED;
-    wp_let(p, size, WP_MAPPED, !r);
-    if (r) return -1;
+    r = mmap(p, (size_t)size, (frozen ? PROT_READ : PROT_READ | PROT_WRITE) | g_vm_exec, MAP_SHARED | MAP_FIXED,
+             g_alias, (off_t)off) == MAP_FAILED;
+    if (frozen && !r) {
+        wp_let_same(p, size, WP_MAPPED);
+        t_plat_posix.frz_kept = 1;
+    } else
+        wp_let(p, size, WP_MAPPED, !r);
+    if (r) {
+        ww_kept(&kept, p, size, 0);
+        return -1;
+    }
     ww_remapped(p, size);
+    ww_kept(&kept, p, size, frozen);
     return 0;
 }
 int plat_alias_unmap(u8* p, u64 size) {
@@ -1676,7 +2037,6 @@ u8* plat_alias_host(u64 off, u64 size) {
     return p == MAP_FAILED ? NULL : (u8*)p;
 }
 void plat_alias_host_free(u8* p, u64 size) { munmap(p, (size_t)size); }
-static u64 g_alias_size;
 void plat_thread_where(u32 tid, char* out, size_t n) {
     snprintf(out, n, "?");
 #if defined(__linux__)
@@ -2094,6 +2454,8 @@ static void trap_watched(u8* p, u64 size) {
     if (atomic_load_explicit(&g_pagemap, memory_order_acquire) >= 0) ww_remapped(p, size);
 }
 int plat_trap_arm(u8* p, u64 size) {
+    SNX_ZONE_T(z_arm, "plat trap arm",
+               atomic_load_explicit(&g_trap_signal, memory_order_acquire) ? "signal" : "uffd minor");
     if (atomic_load_explicit(&g_trap_signal, memory_order_acquire)) return trap_signal_arm(p, size);
 #if SNX_UFFD_MINOR
     struct uffdio_register reg;
@@ -2110,7 +2472,13 @@ int plat_trap_arm(u8* p, u64 size) {
     reg.mode = UFFDIO_REGISTER_MODE_MINOR; /* in place of the write tracking's registration */
     if (ioctl(g_uffd, UFFDIO_REGISTER, &reg)) return -1;
     /* the pages leave the page tables and stay in the pool: the next access is a minor fault */
-    return madvise(p, (size_t)size, MADV_DONTNEED) ? -1 : 0;
+    if (madvise(p, (size_t)size, MADV_DONTNEED)) return -1;
+    /* A page armed again may have a thread asleep in a fault on it, whose fault a landing took already and left to the
+       let_go that now finds this owner there and keeps the page trapped. The unregister above wakes no minor fault
+       (Linux wakes those of a missing-mode range only), so that thread would sleep for good: woken, it faults again
+       and lands this owner */
+    struct uffdio_range wake = {(u64)(uintptr_t)p, size};
+    return ioctl(g_uffd, UFFDIO_WAKE, &wake) ? -1 : 0;
 #else
     (void)p;
     (void)size;
@@ -2119,6 +2487,7 @@ int plat_trap_arm(u8* p, u64 size) {
 }
 int plat_trap_continue(u8* p, u64 size) {
     if (atomic_load_explicit(&g_trap_signal, memory_order_acquire)) {
+        SNX_ZONE_T(z_cont_sig, "plat trap continue", "signal");
         trap_watched(p, size);
         trap_open(p, size);
         return 0;
@@ -2135,8 +2504,9 @@ int plat_trap_continue(u8* p, u64 size) {
             none = 0;
             sched_yield();
         }
-        while (atomic_load_explicit(&g_ww_scans, memory_order_seq_cst)) sched_yield();
+        while (atomic_load_explicit(&g_ww_scans, memory_order_seq_cst)) sched_yield(); /* waits stay out of the zone */
     }
+    SNX_ZONE_T(z_cont_uffd, "plat trap continue", "uffd minor");
     while (at < end) {
         struct uffdio_continue c;
         struct uffdio_range w;
@@ -2250,6 +2620,13 @@ static void note_sent(int sig, const siginfo_t* si) {
 /* SIGSEGV or SIGBUS of a write that may be the freeze's: a protection fault (Darwin reports one as SIGBUS) */
 static int access_fault(int sig, const siginfo_t* si) { return sig == SIGBUS || si->si_code == SEGV_ACCERR; }
 
+#if defined(__PROSPERO__)
+#include <stddef.h>
+/* the console puts 48 bytes between uc_sigmask and uc_mcontext that the payload SDK's FreeBSD header lacks: with it,
+   context_write's error code and context_pc's rip would be read 48 bytes off */
+static_assert(offsetof(ucontext_t, uc_mcontext.mc_rip) == 0xe0,
+              "the PS5's ucontext layout: build with the payload SDK's PS5 fork, whose sys/_ucontext.h has it");
+#endif
 /* whether the fault the context holds was a write: 0 where the system doesn't tell */
 static int context_write(void* ctx) {
     ucontext_t* uc = (ucontext_t*)ctx;
@@ -2283,6 +2660,12 @@ static void fault_signal(int sig, siginfo_t* si, void* ctx) {
         errno = saved;
         return;
     }
+    /* past the tracking and the freeze, a SIGBUS on a committed page of the file slots is the disk's (files_io) */
+    if (sig == SIGBUS && files_io(si->si_addr)) {
+        static const char m[] = FILES_IO "\n";
+        ssize_t w = write(STDERR_FILENO, m, sizeof m - 1);
+        (void)w;
+    }
     signal(sig, SIG_DFL);
 }
 static _Atomic int g_fault_handler; /* plat_install_crash_handler's, or fault_signal, catches SIGSEGV and SIGBUS */
@@ -2300,24 +2683,43 @@ static void fault_handler_install(void) {
 void plat_freeze(u8* p, u64 size) {
     fault_handler_install();
     t_plat_posix.freezing = 1;
+    t_plat_posix.frz_kept = 0;
     atomic_store_explicit(&g_frz_lo, p, memory_order_release);
     atomic_store_explicit(&g_frz_hi, p + size, memory_order_release);
     atomic_store_explicit(&g_frozen, 1, memory_order_seq_cst);
-    /* under the write tracking's locks: a fault it is opening a page for finishes before the freeze protects it */
+    /* under the write tracking's locks: a fault it is opening a page for finishes before the freeze protects it. The
+       states stay, for a move that keeps them (plat_vm_share): a page the tracking held read only still is, and a
+       write to one waits for the thaw (wp_fault) */
     wp_hold(p, size, 0);
     mprotect(p, (size_t)size, PROT_READ | g_vm_exec);
-    wp_let(p, size, 0, 0);
+    wp_let_same(p, size, 0);
 }
 void plat_thaw(void) {
     u8* lo = atomic_load_explicit(&g_frz_lo, memory_order_relaxed);
     u64 size = (u64)(atomic_load_explicit(&g_frz_hi, memory_order_relaxed) - lo);
+    u64 a = 0, b = 0;
     /* readable and writable whatever is mapped there now (the copy's pages, or the old ones when it failed), and
-       written for the write tracking */
+       written for the write tracking. But in a range moved with its states kept (plat_vm_share): there the pages the
+       tracking holds read only and unwritten stay so */
     wp_hold(lo, size, WP_MAPPED);
-    mprotect(lo, (size_t)size, PROT_READ | PROT_WRITE | g_vm_exec);
+    const int quiet_stay =
+        t_plat_posix.frz_kept && !wp_pages(lo, size, &a, &b) && lo >= g_wp_base && (b - a) << g_wp_shift == size;
+    t_plat_posix.frz_kept = 0;
+    if (!quiet_stay)
+        mprotect(lo, (size_t)size, PROT_READ | PROT_WRITE | g_vm_exec);
+    else
+        for (u64 i = a, run = a; i <= b; i++) {
+            if (i < b && !wp_quiet(atomic_load_explicit(&atomic_load_explicit(&g_wp, memory_order_relaxed)[i],
+                                                        memory_order_relaxed)))
+                continue;
+            if (i > run)
+                mprotect(g_wp_base + (run << g_wp_shift), (size_t)((i - run) << g_wp_shift),
+                         PROT_READ | PROT_WRITE | g_vm_exec);
+            run = i + 1;
+        }
     atomic_store_explicit(&g_frozen, 0, memory_order_seq_cst);
     t_plat_posix.freezing = 0;
-    wp_let(lo, size, WP_MAPPED, 1);
+    wp_let_but(lo, size, WP_MAPPED, 1, quiet_stay);
     trap_futex_wake((_Atomic u32*)&g_frozen);
 }
 /* 1 when the fault at a is a write to the frozen range, which may go on now (after waiting for the thaw). The range
@@ -2414,6 +2816,8 @@ static void crash_signal(int sig, siginfo_t* si, void* ctx) {
                                                  memory_order_seq_cst))
         for (;;) pause();
     log_crash_mode();
+    /* past the tracking and the freeze, a SIGBUS on a committed page of the file slots is the disk's (files_io) */
+    if (sig == SIGBUS && files_io(si->si_addr)) logf_(0, "*** " FILES_IO " ***\n");
     /* for SIGILL and SIGFPE si_addr is the instruction, not an address it touched */
     fault = sig == SIGSEGV || sig == SIGBUS ? si->si_addr : NULL;
     nce_crash_context(ctx, fault); /* the guest's registers, when the native code of the game crashed */

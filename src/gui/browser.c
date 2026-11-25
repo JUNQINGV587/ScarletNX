@@ -40,10 +40,7 @@ bool gui_is_multiboot(const char* name) { return suffix(name, ".mb"); }
 bool gui_is_nds(const char* name) { return suffix(name, ".nds"); }
 /* an Android app, one APK or a bundle of split APKs (an XAPK, an APKS) that scarletnx-android installs */
 bool gui_is_apk(const char* name) { return suffix(name, ".apk") || suffix(name, ".xapk") || suffix(name, ".apks"); }
-bool gui_is_dump(const char* name) {
-    return suffix(name, ".nro") || suffix(name, ".xci") || suffix(name, ".nsp") || suffix(name, ".dxci") ||
-           suffix(name, ".dnsp") || suffix(name, "/");
-}
+bool gui_is_dump(const char* name) { return suffix(name, ".nro") || snx_switch_dump_name(name) || suffix(name, "/"); }
 bool gui_game_folder(const char* path) {
     char *folder = snx_dirname(path), *name, data[SNX_PATH_SIZE];
     const char *own = path + strlen(path), *leaf = folder + strlen(folder);
@@ -405,6 +402,10 @@ char* gui_game_icon(const char* path) {
         snx_is_file(icon))
         found = snx_strdup(icon);
     if (!found && gui_game_program(path) && !snx_path_format(icon, sizeof icon, "%s/icon.png", folder) &&
+        snx_is_file(icon))
+        found = snx_strdup(icon);
+    /* an extracted game's folder listed with the dumps keeps its icon beside its exefs/, as -x lays one out */
+    if (!found && snx_extracted_game(path) && !snx_path_format(icon, sizeof icon, "%s/icon.jpg", path) &&
         snx_is_file(icon))
         found = snx_strdup(icon);
     free(folder);

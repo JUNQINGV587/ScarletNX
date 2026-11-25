@@ -242,6 +242,58 @@ static int test_cached_ldg_subtree(void) {
     return 1;
 }
 
+/* every address reads a word of its own */
+static int eval_any(void* user, u64 address, u32* words, u32 count) {
+    (void)user;
+    (void)count;
+    *words = (u32)(address * 2654435761u);
+    return 1;
+}
+/* the slot's handle, by the renderer's list, against the program's words before its texture instructions */
+static int handle_as_program(const u64* words, u32 count, u32 code, u32 reg, const ShaderInfo* si, int slot) {
+    Sm86EvalIo io = {NULL, eval_cbuf, eval_any};
+    u32 probe = SH_PROBE(code - 1, 0, reg), want = 0, got = 0;
+    (void)count;
+    CHECK(direct_eval(words, code, &io, &probe, 1, &want));
+    CHECK(direct_eval_memh((const u64(*)[2])si->memh, SH_MEMH_NUM(si->nmemh), &io, &si->tex[slot].cbuf_off, 1, &got));
+    CHECK(want == got);
+    return 1;
+}
+/* A program uses its registers again: the list keeps the program's order, so each load reads the address that the
+   program's does. A handle whose order can't be kept is refused */
+static int test_registers_used_again(void) {
+    /* the second operand's address goes through the register the first one ends in */
+    const u64 operand[] = {mov_c(10, 0, 0x110), mov_c(11, 0, 0x114), ldg(12, 10, 4), mov_c(10, 0, 0x120),
+                           mov_c(11, 0, 0x124), ldg(10, 10, 4),      lop_or(13, 10, 12), tld(13)};
+    ShaderInfo si;
+    u32* code = translate(operand, 8, ST_CS, &si);
+    CHECK(code != NULL);
+    free(code);
+    CHECK(handle_as_program(operand, 8, 7, 13, &si, 0));
+    /* two handles from one address, the second load over the address's register */
+    const u64 address[] = {mov_c(10, 0, 0x110), mov_c(11, 0, 0x114), ldg(12, 10, 4) | (4ull << 20), ldg(10, 10, 4),
+                           tld(10), tld(12)};
+    code = translate(address, 6, ST_CS, &si);
+    CHECK(code != NULL && si.ntex == 2);
+    free(code);
+    CHECK(handle_as_program(address, 6, 4, 10, &si, 0));
+    CHECK(handle_as_program(address, 6, 4, 12, &si, 1));
+    return 1;
+}
+/* an ordinary handle whose word in c[0] is a memory slot's probe is another texture */
+static int test_probe_is_no_offset(void) {
+    u64 words[16] = {0};
+    u32 count = handle_chain(words);
+    words[count++] = tld(6);
+    words[count++] = mov_c(20, 0, SH_PROBE(6, 0, 6) * 4);
+    words[count++] = tld(20);
+    ShaderInfo si;
+    u32* code = translate(words, count, ST_CS, &si);
+    CHECK(code != NULL && si.ntex == 2);
+    free(code);
+    return 1;
+}
+
 static int test_rejections(void) {
     u64 words[16] = {0};
     u32 count = handle_chain(words);
@@ -296,12 +348,12 @@ static int test_rejections(void) {
 }
 
 int main(void) {
-    CHECK(test_evaluator());
-    CHECK(test_tld_txq_and_dedup());
-    CHECK(test_tex_no_candidate_fallback());
-    CHECK(test_iadd_composer());
-    CHECK(test_cached_ldg_subtree());
-    CHECK(test_rejections());
+    /* CHECK returns 0, which a main would exit with: a failure is the first test's that returns it */
+    static int (*const tests[])(void) = {test_evaluator,           test_tld_txq_and_dedup,  test_tex_no_candidate_fallback,
+                                         test_iadd_composer,       test_cached_ldg_subtree, test_registers_used_again,
+                                         test_probe_is_no_offset, test_rejections};
+    for (size_t k = 0; k < sizeof tests / sizeof *tests; k++)
+        if (!tests[k]()) return 1;
     puts("shader_direct_memh: PASS");
     return 0;
 }

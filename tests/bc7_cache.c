@@ -2,11 +2,11 @@
    Copyright 2026 the ScarletNX contributors */
 /* The BC7 cache of ASTC levels (gpu/vk/bc7_cache.c), without a GPU. A level's key changes with every input that
    changes its blocks (each field of its shape, the encoder's build, any bit of its guest bytes, a word of its layout)
-   and is the same for the same inputs. Records come back as written, with any size (one piece of the reading or
-   several), from the file in a later run too; a file of another version starts over; a record whose blocks changed on
-   disk is dropped when read; one cut short by a crash is cut off, the records before it kept; the bound starts the
-   file over; and the file stays locked while it is open. A hit read on the recording thread (vk_bc7_cache_read_later)
-   is copied only when it checks out, and one that doesn't is dropped */
+   and is the same for the same inputs. Blocks come back as stored, of any size, while the cache holds them, and a new
+   cache holds none. Past its bound it keeps the levels used most: an encode finds room only in levels used less that
+   the last two presents left alone, counts halve with time, and the system's low memory word frees what no recent
+   present used. A hit copied on the recording thread (vk_bc7_cache_read_later) is copied from blocks that are still
+   there when the packet runs, however the level left the cache meanwhile. The bound follows the machine's memory */
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,13 +35,19 @@ u64 vk_hash_copy(void* dst, const void* src, u64 size) {
    record.c does with no such thread, and the copy is counted */
 static int g_threaded;
 int vk_rec_threaded(void) { return g_threaded; }
-int vk_rec_sync_until(u64 until) {
-    (void)until;
-    return 1;
-}
+/* with g_defer set, the packets wait for run_deferred, in order, as ones the recording thread gets to later */
+static int g_defer;
+static unsigned g_ndeferred;
+static void (*g_deferred_fn[2048])(const void* arg);
+static _Alignas(16) u8 g_deferred[2048][256];
 void vk_rec_call(void (*fn)(const void* arg), const void* arg, u64 size) {
-    (void)size;
-    fn(arg);
+    if (!g_defer) {
+        fn(arg);
+        return;
+    }
+    if (size > sizeof g_deferred[0] || g_ndeferred == sizeof g_deferred / sizeof g_deferred[0]) abort();
+    memcpy(g_deferred[g_ndeferred], arg, (size_t)size);
+    g_deferred_fn[g_ndeferred++] = fn;
 }
 VkResult vk_devmem_flush(DevMem m, u64 off, u64 size) {
     (void)m;
@@ -62,25 +68,24 @@ static void VKAPI_PTR copy_stub(VkCommandBuffer cb, VkBuffer src, VkImage dst, V
     g_copy_at = r->bufferOffset;
 }
 PFN_vkCmdCopyBufferToImage vkCmdCopyBufferToImage = copy_stub;
+
+static char g_said[1024]; /* the last line logged */
 void logf_(int lvl, const char* fmt, ...) {
     va_list ap;
     (void)lvl;
     va_start(ap, fmt);
-    vprintf(fmt, ap);
+    vsnprintf(g_said, sizeof g_said, fmt, ap);
     va_end(ap);
+    fputs(g_said, stdout);
 }
+u32 g_vk_present;
 
-#define PATH "bc7_cache_test.vkbc7"
-#define IDX  PATH ".idx"
 static unsigned checks;
 #define CHECK(x)                                                                                                       \
     do {                                                                                                               \
         ++checks;                                                                                                      \
         if (!(x)) {                                                                                                    \
             fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, #x);                                                    \
-            vk_bc7_cache_close();                                                                                      \
-            remove(PATH);                                                                                              \
-            remove(IDX);                                                                                               \
             exit(1);                                                                                                   \
         }                                                                                                              \
     } while (0)
@@ -146,218 +151,233 @@ static u8* blocks(u64 n, u32 seed) {
     for (u64 i = 0; i < n; i++) p[i] = (u8)((i * 2654435761u + seed) >> 13);
     return p;
 }
-static u64 size_of(const char* path) {
-    FILE* f = fopen(path, "rb");
-    if (!f || fseek(f, 0, SEEK_END)) return 0;
-    long n = ftell(f);
-    fclose(f);
-    return n < 0 ? 0 : (u64)n;
-}
-static u64 file_size(void) { return size_of(PATH); }
-/* the record's blocks read back the same */
+/* the level's blocks read back the same */
 static int reads_as(const u64 key[2], const u8* p, u64 n) {
     u8* back = malloc((size_t)n);
     int ok = vk_bc7_cache_find(key) == n && vk_bc7_cache_read(key, back, n) && !memcmp(back, p, (size_t)n);
     free(back);
     return ok;
 }
+static void run_deferred(void) {
+    for (unsigned i = 0; i < g_ndeferred; i++) g_deferred_fn[i](g_deferred[i]);
+    g_ndeferred = 0;
+}
+#define KEY(n) ((const u64[2]){0x1000 + (u64)(n), 0x77})
 
-static void file(void) {
-    const u64 v1[2] = {1, 2}, v2[2] = {1, 3};
-    const u64 ka[2] = {10, 20}, kb[2] = {30, 40}, kc[2] = {50, 60};
-    const u64 na = 48, nb = (5u << 20) / 2 + 16, nc = 4096; /* one piece, three, one */
-    u8 *a = blocks(na, 1), *b = blocks(nb, 2), *c = blocks(nc, 3);
-    remove(PATH);
-    remove(IDX);
-    CHECK(vk_bc7_cache_open(PATH, v1, 64u << 20));
-    CHECK(!vk_bc7_cache_find(ka));
-    CHECK(vk_bc7_cache_cold()); /* the run's notice: every level is encoded as it first loads */
-    vk_bc7_cache_put(ka, a, na);
-    vk_bc7_cache_put(kb, b, nb);
-    CHECK(reads_as(ka, a, na) && reads_as(kb, b, nb));
-    CHECK(vk_bc7_cache_cold()); /* as it opened, the levels it takes since aside */
-    u8 small[16];
-    CHECK(!vk_bc7_cache_read(ka, small, 16)); /* another size is not the record */
-    intptr_t lock;
-    CHECK(snx_lock_file(PATH, &lock) == 1); /* held while open */
-    vk_bc7_cache_close();
-    CHECK(!vk_bc7_cache_cold()); /* none open */
-    CHECK(!snx_lock_file(PATH, &lock));
-    snx_unlock_file(lock);
-    /* a later run */
-    CHECK(vk_bc7_cache_open(PATH, v1, 64u << 20));
-    CHECK(reads_as(ka, a, na) && reads_as(kb, b, nb) && !vk_bc7_cache_find(kc));
-    CHECK(!vk_bc7_cache_cold());
-    vk_bc7_cache_close();
-    /* another version: the encoder, its SPIR-V, the GPU or the driver changed */
-    CHECK(vk_bc7_cache_open(PATH, v2, 64u << 20));
-    CHECK(!vk_bc7_cache_find(ka) && !vk_bc7_cache_find(kb) && file_size() == BC7_HEAD);
-    CHECK(vk_bc7_cache_cold());
-    vk_bc7_cache_close();
-    CHECK(vk_bc7_cache_open(PATH, v2, 64u << 20)); /* its header alone, of this version: no level yet */
-    CHECK(vk_bc7_cache_cold() && file_size() == BC7_HEAD);
-    vk_bc7_cache_put(ka, a, na);
-    vk_bc7_cache_put(kb, b, nb);
-    vk_bc7_cache_close();
-    /* a byte of b's blocks changed on disk: found by the index, dropped when read */
-    FILE* f = fopen(PATH, "r+b");
-    CHECK(f && !fseek(f, (long)(BC7_HEAD + BC7_REC + na + BC7_REC + nb - 7), SEEK_SET));
-    int byte = fgetc(f);
-    CHECK(byte != EOF && !fseek(f, -1, SEEK_CUR) && fputc(byte ^ 4, f) != EOF && !fclose(f));
-    CHECK(vk_bc7_cache_open(PATH, v2, 64u << 20));
-    u8* back = malloc((size_t)nb);
-    CHECK(vk_bc7_cache_find(kb) == nb && !vk_bc7_cache_read(kb, back, nb) && !vk_bc7_cache_find(kb));
-    free(back);
-    CHECK(reads_as(ka, a, na));
-    vk_bc7_cache_put(kb, b, nb); /* encoded again, and kept again */
-    CHECK(reads_as(kb, b, nb));
-    vk_bc7_cache_put(kc, c, nc);
-    vk_bc7_cache_close();
-    /* c's record cut short by a crash: cut off, the others kept */
-    const u64 whole = file_size();
-    f = fopen(PATH, "r+b");
-    CHECK(f && !snx_cut(f, whole - 5) && !fclose(f));
-    CHECK(vk_bc7_cache_open(PATH, v2, 64u << 20));
-    CHECK(!vk_bc7_cache_find(kc) && reads_as(ka, a, na) && reads_as(kb, b, nb));
-    CHECK(file_size() == whole - BC7_REC - nc);
-    vk_bc7_cache_close();
-    /* the bound: a record that would pass it starts the file over */
-    const u64 max = BC7_HEAD + 2 * (BC7_REC + nc);
-    u64 hits, stored, restarts, bytes;
-    CHECK(vk_bc7_cache_open(PATH, v1, max));
-    vk_bc7_cache_put(ka, c, nc);
-    vk_bc7_cache_put(kb, c, nc);
-    CHECK(vk_bc7_cache_find(ka) && vk_bc7_cache_find(kb));
-    vk_bc7_cache_put(kc, c, nc);
-    vk_bc7_cache_stats(&hits, &stored, &restarts, &bytes);
-    CHECK(restarts == 1 && stored == 3 && bytes == BC7_HEAD + BC7_REC + nc && file_size() <= max);
-    CHECK(!vk_bc7_cache_find(ka) && !vk_bc7_cache_find(kb) && reads_as(kc, c, nc));
-    vk_bc7_cache_put(kc, a, 16); /* a key held already is not written again */
-    CHECK(reads_as(kc, c, nc));
-    vk_bc7_cache_close();
-    /* many records: the index grows, and finds each again from the file */
-    CHECK(vk_bc7_cache_open(PATH, v1, 64u << 20));
-    for (u64 i = 0; i < 3000; i++) {
-        const u64 k[2] = {i * 0x9E3779B97F4A7C15ull, i};
-        vk_bc7_cache_put(k, a + i % 32, 16);
+static void held(void) {
+    static const u64 sizes[] = {16, 4096, 1u << 20, (1u << 20) + 16, 5u << 20};
+    VkBc7CacheStats s;
+    CHECK(!vk_bc7_cache_max() && !vk_bc7_cache_find(KEY(0))); /* no cache yet */
+    vk_bc7_cache_put(KEY(0), (const u8*)"0123456789abcdef", 16);
+    CHECK(!vk_bc7_cache_find(KEY(0)));
+    CHECK(vk_bc7_cache_open(64u << 20) && vk_bc7_cache_max() == 64u << 20);
+    for (u32 i = 0; i < 5; i++) {
+        u8* p = blocks(sizes[i], i);
+        CHECK(!vk_bc7_cache_find(KEY(i)));
+        vk_bc7_cache_put(KEY(i), p, sizes[i]);
+        CHECK(reads_as(KEY(i), p, sizes[i]));
+        u8 small[16];
+        CHECK(!vk_bc7_cache_read(KEY(i), small, sizes[i] + 16)); /* another size is not this level's */
+        free(p);
     }
-    vk_bc7_cache_close();
-    CHECK(vk_bc7_cache_open(PATH, v1, 64u << 20));
-    for (u64 i = 0; i < 3000; i++) {
-        const u64 k[2] = {i * 0x9E3779B97F4A7C15ull, i};
-        CHECK(reads_as(k, a + i % 32, 16));
+    u8* odd = blocks(40, 9);
+    vk_bc7_cache_put(KEY(9), odd, 40); /* not whole blocks */
+    CHECK(!vk_bc7_cache_find(KEY(9)));
+    free(odd);
+    /* 3000 more keys: the table grows, and the first ones are still read */
+    for (u32 i = 0; i < 3000; i++) {
+        const u32 word[4] = {i, ~i, i * 7, 1};
+        vk_bc7_cache_put(KEY(100 + i), (const u8*)word, 16);
     }
-    vk_bc7_cache_close();
-    /* the index file: an entry a record, in the file's order. Gone, or of another version, the records' headers are
-       read and it is written anew; each record is found either way */
-    const u64 idx_size = size_of(IDX);
-    CHECK(idx_size == BC7_HEAD + 3001ull * 32);
-    for (int damage = 0; damage < 2; damage++) {
-        if (!damage)
-            remove(IDX);
-        else {
-            f = fopen(IDX, "r+b");
-            CHECK(f && !fseek(f, 20, SEEK_SET) && fputc(0x5a, f) != EOF && !fclose(f));
-        }
-        CHECK(vk_bc7_cache_open(PATH, v1, 64u << 20));
-        CHECK(size_of(IDX) == idx_size && reads_as(kc, c, nc));
-        for (u64 i = 0; i < 3000; i += 7) {
-            const u64 k[2] = {i * 0x9E3779B97F4A7C15ull, i};
-            CHECK(reads_as(k, a + i % 32, 16));
-        }
-        vk_bc7_cache_close();
+    u8* p = blocks(sizes[4], 4);
+    CHECK(reads_as(KEY(4), p, sizes[4]));
+    free(p);
+    for (u32 i = 0; i < 3000; i += 13) {
+        const u32 word[4] = {i, ~i, i * 7, 1};
+        CHECK(reads_as(KEY(100 + i), (const u8*)word, 16));
     }
-    remove(PATH);
-    remove(IDX);
-    free(a);
-    free(b);
-    free(c);
-    puts("PASS the cache's records come back as written, across runs, and its file holds up to damage and its bound");
+    vk_bc7_cache_stats(&s);
+    CHECK(s.stored == 3005 && s.levels == 3005 && !s.evicted && !s.refused);
+    CHECK(s.bytes == 16 + 4096 + (1u << 20) + (1u << 20) + 16 + (5u << 20) + 3000 * 16);
+    /* a new cache holds nothing of the one before */
+    CHECK(vk_bc7_cache_open(1u << 20) && !vk_bc7_cache_find(KEY(0)) && !vk_bc7_cache_find(KEY(100)));
+    vk_bc7_cache_stats(&s);
+    CHECK(!s.stored && !s.levels && !s.bytes && !s.hits);
+    vk_bc7_cache_close();
+    CHECK(!vk_bc7_cache_max() && !vk_bc7_cache_find(KEY(0)));
+    puts("PASS blocks come back as stored while the cache holds them, and a new cache holds none");
 }
 
-/* hits read on the recording thread: copied into the image when they check out, not copied when they don't, and then
-   dropped at the index's next look; with no such thread they are read at once (-1) */
-/* the reads that failed on the recording thread, as vk_bc7_cache_take_failed gives them */
-static unsigned g_failed;
-static void* g_failed_owner;
-static u64 g_failed_gva, g_failed_key[2];
-static void took_failed(void* owner, u64 gva, const u64 key[2]) {
-    g_failed++;
-    g_failed_owner = owner;
-    g_failed_gva = gva;
-    g_failed_key[0] = key[0];
-    g_failed_key[1] = key[1];
+/* a cache of four levels of 1024 bytes, past which a level needs one used less to leave */
+static void most_used(void) {
+    VkBc7CacheStats s;
+    u8* b[8];
+    for (u32 i = 0; i < 8; i++) b[i] = blocks(1024, 50 + i);
+    g_vk_present = 100;
+    CHECK(vk_bc7_cache_open(4096));
+    for (u32 i = 0; i < 4; i++) vk_bc7_cache_put(KEY(i), b[i], 1024);
+    g_vk_present = 110;
+    vk_bc7_cache_put(KEY(4), b[4], 1024); /* used once, as the four held: none yields */
+    vk_bc7_cache_stats(&s);
+    CHECK(!vk_bc7_cache_find(KEY(4)) && s.refused == 1 && !s.evicted && s.bytes == 4096 && s.levels == 5);
+    for (u32 i = 0; i < 4; i++) CHECK(reads_as(KEY(i), b[i], 1024)); /* each now used twice, in this present */
+    vk_bc7_cache_put(KEY(4), b[4], 1024);                            /* twice too: still none used less */
+    CHECK(!vk_bc7_cache_find(KEY(4)));
+    vk_bc7_cache_put(KEY(4), b[4], 1024); /* three times, but the game is on the four (this present) */
+    CHECK(!vk_bc7_cache_find(KEY(4)));
+    g_vk_present = 111;
+    vk_bc7_cache_put(KEY(4), b[4], 1024); /* the present after: still theirs */
+    CHECK(!vk_bc7_cache_find(KEY(4)));
+    g_vk_present = 112;
+    vk_bc7_cache_put(KEY(4), b[4], 1024); /* two presents on: one level used less goes, and only one */
+    vk_bc7_cache_stats(&s);
+    CHECK(reads_as(KEY(4), b[4], 1024) && s.evicted == 1 && s.refused == 4 && s.bytes == 4096);
+    u32 left = 0;
+    for (u32 i = 0; i < 4; i++) left += vk_bc7_cache_find(KEY(i)) == 1024;
+    CHECK(left == 3);
+    /* a level larger than what the ones that yield hold takes none of them */
+    g_vk_present = 120;
+    u8* big = blocks(4096, 99);
+    for (u32 n = 0; n < 4; n++)
+        vk_bc7_cache_put(KEY(5), big, 4096); /* used 4 times: the three used twice yield, KEY(4) not */
+    vk_bc7_cache_stats(&s);
+    CHECK(!vk_bc7_cache_find(KEY(5)) && s.evicted == 1 && s.bytes == 4096 && vk_bc7_cache_find(KEY(4)) == 1024);
+    for (u32 n = 0; n < 4; n++) vk_bc7_cache_put(KEY(5), big, 4096); /* 8 times: all four yield */
+    vk_bc7_cache_stats(&s);
+    CHECK(reads_as(KEY(5), big, 4096) && s.evicted == 5 && s.bytes == 4096);
+    vk_bc7_cache_put(KEY(6), big, 8192); /* past the bound alone: never kept, nothing goes for it */
+    CHECK(!vk_bc7_cache_find(KEY(6)) && vk_bc7_cache_find(KEY(5)) == 4096);
+    free(big);
+    /* the counts halve every BC7_AGE_PRESENTS presents: the level used 9 times yields to one used 5 times after one
+       halving, not before */
+    g_vk_present += 2;
+    for (u32 n = 0; n < 4; n++) vk_bc7_cache_put(KEY(7), b[7], 1024);
+    CHECK(!vk_bc7_cache_find(KEY(7)));
+    g_vk_present += BC7_AGE_PRESENTS; /* KEY(5): 9 to 4; KEY(7): 4 to 2 */
+    vk_bc7_cache_put(KEY(7), b[7], 1024);
+    vk_bc7_cache_put(KEY(7), b[7], 1024);
+    CHECK(!vk_bc7_cache_find(KEY(7)) && vk_bc7_cache_find(KEY(5)) == 4096); /* 4 uses against 4 */
+    vk_bc7_cache_put(KEY(7), b[7], 1024);
+    CHECK(reads_as(KEY(7), b[7], 1024) && !vk_bc7_cache_find(KEY(5)));
+    vk_bc7_cache_close();
+    for (u32 i = 0; i < 8; i++) free(b[i]);
+    puts("PASS past its bound the cache keeps the levels used most, lets none go that the last two presents used, "
+         "and halves the counts with time");
 }
 
+static void low_memory(void) {
+    VkBc7CacheStats s;
+    u8* b[4];
+    for (u32 i = 0; i < 4; i++) b[i] = blocks(2048, 70 + i);
+    g_vk_present = 0xFFFFFFF0u; /* the count of presents wraps */
+    CHECK(vk_bc7_cache_open(1u << 20));
+    vk_bc7_cache_put(KEY(0), b[0], 2048);
+    vk_bc7_cache_put(KEY(1), b[1], 2048);
+    g_vk_present += 0x20;
+    vk_bc7_cache_put(KEY(2), b[2], 2048);
+    CHECK(reads_as(KEY(1), b[1], 2048));
+    g_vk_present += 1;
+    vk_bc7_cache_put(KEY(3), b[3], 2048);
+    CHECK(vk_bc7_cache_release(g_vk_present - 1) == 2048); /* KEY(0) alone was last used before the present before */
+    vk_bc7_cache_stats(&s);
+    CHECK(!vk_bc7_cache_find(KEY(0)) && s.released == 2048 && s.bytes == 3 * 2048 && s.levels == 4);
+    CHECK(reads_as(KEY(1), b[1], 2048) && reads_as(KEY(2), b[2], 2048) && reads_as(KEY(3), b[3], 2048));
+    CHECK(vk_bc7_cache_release(g_vk_present + 1) == 3 * 2048 && !vk_bc7_cache_release(g_vk_present + 1));
+    vk_bc7_cache_put(KEY(0), b[0], 2048); /* encoded again: kept again */
+    CHECK(reads_as(KEY(0), b[0], 2048));
+    vk_bc7_cache_close();
+    for (u32 i = 0; i < 4; i++) free(b[i]);
+    puts("PASS the system's low memory word frees the blocks no recent present used, and they are kept again later");
+}
+
+/* hits copied on the recording thread: queued, then the level leaves the cache (for one used more, at a low memory
+   word, at the cache's close), then the packets run: each copy still finds its blocks, freed only after it */
 static void later(void) {
-    const u64 v1[2] = {1, 2};
-    const u64 ka[2] = {10, 20}, kb[2] = {30, 40}, kc[2] = {50, 60};
-    const u64 na = 48, nb = (5u << 20) / 2 + 16; /* one piece, three */
-    u8 *a = blocks(na, 4), *b = blocks(nb, 5), *dst = malloc((size_t)nb);
-    int owner;
-    remove(PATH);
-    remove(IDX);
-    CHECK(vk_bc7_cache_open(PATH, v1, 64u << 20));
-    vk_bc7_cache_put(ka, a, na);
-    vk_bc7_cache_put(kb, b, nb);
-    vk_bc7_cache_close();
-    FILE* f = fopen(PATH, "r+b"); /* a byte of b's blocks changed on disk */
-    CHECK(f && !fseek(f, (long)(BC7_HEAD + BC7_REC + na + BC7_REC + 9), SEEK_SET));
-    int byte = fgetc(f);
-    CHECK(byte != EOF && !fseek(f, -1, SEEK_CUR) && fputc(byte ^ 1, f) != EOF && !fclose(f));
-    CHECK(vk_bc7_cache_open(PATH, v1, 64u << 20));
-    const VkCommandBuffer cb = (VkCommandBuffer)(uintptr_t)8;
-    const VkBuffer buf = (VkBuffer)(uintptr_t)16;
-    const VkImage img = (VkImage)(uintptr_t)24;
+    VkBc7CacheStats s;
+    u8* b[3];
+    u8 dst[3][1024];
     const VkBufferImageCopy copy = {.bufferOffset = 4096};
-    const VkImageLayout L = VK_IMAGE_LAYOUT_GENERAL; /* as with unified image layouts */
-    /* before the recording thread runs: read at once, and the next read once it runs goes there */
-    CHECK(vk_bc7_cache_read_later(cb, ka, na, dst, 1, 4096, buf, img, L, &copy, NULL, 0) == -1);
-    CHECK(!vk_bc7_cache_failed_pending());
-    g_threaded = 1;
-    CHECK(vk_bc7_cache_read_later(cb, ka, na, dst, 1, 4096, buf, img, L, &copy, NULL, 0) == 1);
-    CHECK(g_copies == 1 && g_copy_at == 4096 && g_copy_layout == L && !memcmp(dst, a, (size_t)na));
-    CHECK(vk_bc7_cache_read_later(cb, ka, na, dst, 1, 4096, buf, VK_NULL_HANDLE, L, &copy, NULL, 0) == 1 &&
-          g_copies == 1);
-    CHECK(vk_bc7_cache_read_later(cb, ka, 16, dst, 1, 4096, buf, img, L, &copy, NULL, 0) == 0); /* another size */
-    CHECK(vk_bc7_cache_read_later(cb, kc, na, dst, 1, 4096, buf, img, L, &copy, NULL, 0) == 0); /* not there */
-    CHECK(vk_bc7_cache_find(kb) == nb);
-    CHECK(vk_bc7_cache_read_later(cb, kb, nb, dst, 1, 4096, buf, img, L, &copy, &owner, 0x1234000) == 1 &&
-          g_copies == 1);
-    CHECK(!vk_bc7_cache_find(kb) && vk_bc7_cache_find(ka) == na);
-    CHECK(vk_bc7_cache_failed_pending());  /* until its owner has it */
-    vk_bc7_cache_take_failed(took_failed); /* given to its owner once */
-    CHECK(g_failed == 1 && g_failed_owner == &owner && g_failed_gva == 0x1234000 && same(g_failed_key, kb));
-    CHECK(!vk_bc7_cache_failed_pending());
-    vk_bc7_cache_take_failed(took_failed);
-    CHECK(g_failed == 1);
-    u64 hits, stored, restarts, bytes;
-    vk_bc7_cache_stats(&hits, &stored, &restarts, &bytes);
-    CHECK(hits == 2);
-    vk_bc7_cache_put(kb, b, nb); /* encoded again, and kept again at another place */
-    CHECK(vk_bc7_cache_read_later(cb, kb, nb, dst, 1, 4096, buf, img, L, &copy, &owner, 0x1234000) == 1 &&
-          g_copies == 2 && !memcmp(dst, b, (size_t)nb));
-    vk_bc7_cache_take_failed(took_failed);
-    CHECK(g_failed == 1);
-    /* the rate of the reads so far: none for nothing, and a whole budget's worth before any read was timed */
-    CHECK(!vk_bc7_cache_read_ns(0) && vk_bc7_cache_read_ns(1u << 20) < 1000000000ull);
+    for (u32 i = 0; i < 3; i++) b[i] = blocks(1024, 90 + i);
+    g_vk_present = 500;
+    CHECK(vk_bc7_cache_open(2048));
+    vk_bc7_cache_put(KEY(0), b[0], 1024);
+    vk_bc7_cache_put(KEY(1), b[1], 1024);
+    g_threaded = 0; /* no such thread: the caller reads them itself */
+    CHECK(vk_bc7_cache_read_later(NULL, KEY(0), 1024, dst[0], 0, 0, NULL, NULL, 7, &copy) == -1);
+    g_threaded = g_defer = 1;
+    g_copies = 0;
+    CHECK(vk_bc7_cache_read_later(NULL, KEY(2), 1024, dst[2], 0, 0, NULL, NULL, 7, &copy) == 0); /* not held */
+    CHECK(vk_bc7_cache_read_later(NULL, KEY(0), 512, dst[0], 0, 0, NULL, NULL, 7, &copy) == 0);  /* another size */
+    CHECK(vk_bc7_cache_read_later(NULL, KEY(0), 1024, dst[0], 0, 0, NULL, (VkImage)(uintptr_t)1, 7, &copy) == 1);
+    CHECK(vk_bc7_cache_read_later(NULL, KEY(1), 1024, dst[1], 0, 0, NULL, VK_NULL_HANDLE, 7, &copy) == 1);
+    CHECK(g_ndeferred == 2 && !g_copies);
+    g_vk_present += 2;
+    for (u32 n = 0; n < 3; n++) vk_bc7_cache_put(KEY(2), b[2], 1024); /* used 3 times: KEY(0), used twice, goes */
+    CHECK(vk_bc7_cache_find(KEY(2)) == 1024 && vk_bc7_cache_find(KEY(0)) + vk_bc7_cache_find(KEY(1)) == 1024);
+    CHECK(vk_bc7_cache_release(g_vk_present + 1) == 2048); /* and the rest at a low memory word */
+    CHECK(g_ndeferred == 5);
+    vk_bc7_cache_stats(&s);
+    CHECK(!s.hits);
+    run_deferred(); /* the two copies, then the three frees: a build with a memory checker reads freed blocks here */
+    CHECK(!memcmp(dst[0], b[0], 1024) && !memcmp(dst[1], b[1], 1024));
+    CHECK(g_copies == 1 && g_copy_at == 4096 && g_copy_layout == 7); /* no copy without an image */
+    vk_bc7_cache_stats(&s);
+    CHECK(s.hits == 2);
+    /* a close with a copy queued */
+    vk_bc7_cache_put(KEY(0), b[0], 1024);
+    memset(dst[0], 0, sizeof dst[0]);
+    CHECK(vk_bc7_cache_read_later(NULL, KEY(0), 1024, dst[0], 0, 0, NULL, NULL, 7, &copy) == 1);
     vk_bc7_cache_close();
-    g_threaded = 0;
-    CHECK(vk_bc7_cache_open(PATH, v1, 64u << 20));
-    CHECK(vk_bc7_cache_read_later(cb, ka, na, dst, 1, 4096, buf, img, L, &copy, NULL, 0) == -1 && reads_as(ka, a, na));
+    run_deferred();
+    CHECK(!memcmp(dst[0], b[0], 1024));
+    g_threaded = g_defer = 0;
+    for (u32 i = 0; i < 3; i++) free(b[i]);
+    puts("PASS a hit queued for the recording thread is copied from its blocks however the level left the cache");
+}
+
+static void bound(void) {
+    CHECK(bc7_share(0, 0) == 256ull << 20 && bc7_share(0, 64ull << 30) == 256ull
+                                                                              << 20); /* a system that doesn't tell */
+    CHECK(bc7_share(1, 256ull << 20) == 64ull << 20);                                 /* the least */
+    CHECK(bc7_share(1, 4000ull << 20) == 500ull << 20);                               /* a phone of 4 GB */
+    CHECK(bc7_share(1, 8ull << 30) == 1ull << 30);
+    CHECK(bc7_share(1, 16ull << 30) == 2ull << 30 && bc7_share(1, 64ull << 30) == 2ull << 30); /* the most */
+    CHECK(vk_bc7_cache_open(0));
+    SnxU64 total = 0;
+    CHECK(vk_bc7_cache_max() == bc7_share(snx_memory_total(&total), total));
     vk_bc7_cache_close();
-    remove(PATH);
-    remove(IDX);
-    free(a);
-    free(b);
-    free(dst);
-    puts("PASS hits read on the recording thread are copied when they check out, and given back when they don't");
+    puts("PASS the bound is an eighth of the machine's memory, from 64 MiB to 2 GiB, and 256 MiB where it is not told");
+}
+
+/* a file an earlier version kept the cache in: said with its path and size, and left as it is; none, nothing said */
+static void old_file(void) {
+    static const char path[] = "bc7_cache_test_old.vkbc7";
+    u8* p = blocks(3u << 19, 5); /* 1.5 MiB */
+    FILE* f = fopen(path, "wb");
+    CHECK(f && fwrite(p, 1, 3u << 19, f) == 3u << 19 && !fclose(f));
+    g_said[0] = 0;
+    CHECK(vk_bc7_cache_old_file(path));
+    CHECK(!strcmp(g_said,
+                  "vulkan: bc7_cache_test_old.vkbc7 (1.5 MB) is a BC7 cache file of an earlier version, which this "
+                  "one does not read or write: the BC7 cache is held in memory now. The game's Delete Old "
+                  "Caches in the launcher deletes it\n"));
+    f = fopen(path, "rb"); /* still there, whole */
+    CHECK(f && !fseek(f, 0, SEEK_END) && ftell(f) == 3 << 19 && !fclose(f));
+    remove(path);
+    g_said[0] = 0;
+    CHECK(!vk_bc7_cache_old_file(path) && !g_said[0]);
+    free(p);
+    puts("PASS a BC7 cache file of an earlier version is said with its path and size, and left as it is");
 }
 
 int main(void) {
     keys();
-    file();
+    old_file();
+    held();
+    most_used();
+    low_memory();
     later();
-    printf("All %u BC7 cache checks passed\n", checks);
+    bound();
+    printf("bc7_cache: %u checks passed\n", checks);
     return 0;
 }

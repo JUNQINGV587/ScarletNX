@@ -25,11 +25,14 @@
 #include <string.h>
 #include <stdatomic.h>
 #include "common/gpu/vk/vk_common.h"
+#include "nx/gpu/vk/gpuprof_gap.h"
 #include "nx/gpu/vk/gpuprof_setting.h"
+#include "nx/gpu/vk/gpuprof_time.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/runtime/options.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
+#include "nx/runtime/platform/tracy.h"
 
 #define GP_QUERIES 16384 /* timestamps per frame slot: two per pass, two per dispatch */
 #define GP_DISP    4096  /* dispatches timed per frame slot */
@@ -52,6 +55,7 @@ typedef struct {
     u32 passes, dispatches;
     u64 xfers;
     u64 cpu;    /* CLOCK_MONOTONIC at its submit */
+    u64 cpu0;   /* and at its begin: from then on it held recorded work */
     u64 value;  /* its value on the graphics timeline */
     int why;    /* VK_SUB_* */
     /* the command buffer its begin went in: an end skipped while timing was off (stats turned off and on again
@@ -71,26 +75,34 @@ typedef struct {
     u64 ns, passes, draws;
 } GpKey;
 
-/* the passes that took the most, by what they had: their target, the draws in them and what was recorded in the gap
-   before them (copies, barriers, dispatches). A pass that costs milliseconds at a few thousand pixels is a stall or a
-   gap, not its pixels, and this says which of the three it was */
+/* The slow passes, by what they had: their target and the gap before them (copies and dispatches; a barrier is an
+   ordinary part of a pass). A pass that costs milliseconds at a few thousand pixels is a stall or a gap, not its
+   pixels, and this says which it was: the target and its size are the pixels, the gap is the stall, and the draws are
+   what the CPU asked the GPU to do. Each entry sums the passes of one shape, and keeps the most any one of them had.
+   Only passes of 0.3 ms or more are kept: a pass of a tenth of a millisecond says nothing about a frame. The table
+   keeps the mean time of a pass, not the window's total for it, since a stall of one frame is what this looks for.
+   A pass that runs a thousand times and stays cheap is the other table's line (g_key, summed per target) */
 #define GP_SLOW 8
 typedef struct {
-    u64 gva, ns;
-    u32 w, h, fmt, draws, xfers, barriers, dispatches;
-    u64 n;
+    u64 gva, ns, n;
+    u32 w, h, fmt;
+    u32 gap; /* what the gap before it held: 1 copies, 2 dispatches */
+    u32 draws, xfers, barriers, dispatches; /* the most any one of them had */
 } GpSlow;
 static GpSlow g_slow[GP_SLOW];
 static void gp_slow(const GpPass* p, u64 ns) {
     u32 worst = 0;
-    if (ns < 300000) return; /* under 0.3 ms says nothing about a frame */
-    for (u32 i = 0; i < GP_SLOW; i++) { /* the same pass again: summed with it */
+    const u32 gap = (p->xfers != 0) | (p->dispatches != 0) << 1;
+    if (ns < 300000) return;
+    for (u32 i = 0; i < GP_SLOW; i++) { /* the same pass again: summed with it, and its worst kept */
         GpSlow* s = &g_slow[i];
-        if (s->n && s->gva == p->gva && s->w == p->w && s->h == p->h && s->fmt == p->fmt && s->draws == p->draws &&
-            s->xfers == p->xfers && s->barriers == p->barriers && s->dispatches == p->dispatches) {
-            s->ns += ns, s->n++;
-            return;
-        }
+        if (!s->n || s->gva != p->gva || s->w != p->w || s->h != p->h || s->fmt != p->fmt || s->gap != gap) continue;
+        s->ns += ns, s->n++;
+        if (p->draws > s->draws) s->draws = p->draws;
+        if (p->xfers > s->xfers) s->xfers = p->xfers;
+        if (p->barriers > s->barriers) s->barriers = p->barriers;
+        if (p->dispatches > s->dispatches) s->dispatches = p->dispatches;
+        return;
     }
     for (u32 i = 0; i < GP_SLOW; i++) { /* the least of them, an empty one first, gives way to a pass that costs more */
         const GpSlow* s = &g_slow[i];
@@ -101,9 +113,22 @@ static void gp_slow(const GpPass* p, u64 ns) {
         if (!g_slow[worst].n || s->ns / s->n < g_slow[worst].ns / g_slow[worst].n) worst = i;
     }
     if (g_slow[worst].n && ns <= g_slow[worst].ns / g_slow[worst].n) return;
-    g_slow[worst] = (GpSlow){p->gva, ns, p->w, p->h, p->fmt, p->draws, p->xfers, p->barriers, p->dispatches, 1};
+    g_slow[worst] = (GpSlow){.gva = p->gva,
+                             .ns = ns,
+                             .n = 1,
+                             .w = p->w,
+                             .h = p->h,
+                             .fmt = p->fmt,
+                             .gap = gap,
+                             .draws = p->draws,
+                             .xfers = p->xfers,
+                             .barriers = p->barriers,
+                             .dispatches = p->dispatches};
 }
-static int g_on = -1;
+/* The value in effect, -1 until it is worked out, and what it was worked out for: log's value may change during a
+   run, and the GPU thread and the recording thread both ask. Read relaxed, as the stats box's setting is */
+static _Atomic int g_on = -1;
+static _Atomic int g_asked = -1;
 static GpSlot* g_slot[VK_FRAMES];
 static GpKey g_key[GP_KEYS];
 static u64 g_pass_ns, g_span_ns, g_frames, g_lost;
@@ -139,6 +164,15 @@ static const char* const g_idle_plot[IDLE_N] = {"gpu idle: waited", "gpu idle: f
                                                 "gpu idle: queued"};
 static u64 g_idle_ns[IDLE_N], g_idles[IDLE_N], g_busy_ns, g_subs, g_sub_why[VK_SUB_N];
 static u64 g_round_ns[VK_WAIT_N]; /* IDLE_WAITED by the kind of the CPU's wait */
+/* The idle time before a submission while it already held recorded work (from its begin to its submit): what
+   submitting its commands as they were recorded could have run, up to the submission's own GPU time, by its VK_SUB_*,
+   and the part of it before a submission the CPU then waited for (a round trip that much shorter) */
+static u64 g_fill_ns[VK_SUB_N], g_fill_waited_ns;
+static u64 g_idle_subs_all, g_fill_all_ns; /* the submissions gp_idle placed and their fill since the start (tests) */
+void vk_gpuprof_fill_totals(u64* subs, u64* fill_ns) {
+    *subs = g_idle_subs_all;
+    *fill_ns = g_fill_all_ns;
+}
 /* The busy time by what the submissions held: rendering passes, else dispatches, else copies, else nothing. Most of
    one game's submissions held no pass, so the passes' times said nothing of most of the GPU's */
 enum { HOLD_PASSES, HOLD_DISPATCHES, HOLD_COPIES, HOLD_NOTHING, HOLD_N };
@@ -181,17 +215,21 @@ int vk_gpuprof_calibrated(void) {
 }
 
 static int gp_on(void) {
-    if (g_on < 0) {
-        char say[640];
-        /* log=3's counters are the same work as the setting's: the CPU's per resource, and the GPU's a pass */
-        int by_log = g_settings.log_level >= 3, asked = g_settings.gpu_profile || by_log;
-        char by[32];
+    /* log=3's counters are the same work as the setting's: the CPU's per resource, and the GPU's a pass */
+    int by_log = g_settings.log_level >= 3, asked = g_settings.gpu_profile || by_log;
+    if (atomic_load_explicit(&g_on, memory_order_relaxed) < 0 ||
+        asked != atomic_load_explicit(&g_asked, memory_order_relaxed)) {
+        /* log's value may change during a run (it is not a startup setting) */
+        char say[640], by[32];
         if (by_log && !g_settings.gpu_profile)
             snprintf(by, sizeof by, "log=%d", g_settings.log_level);
         else
             snprintf(by, sizeof by, "vk_gpu_profile=%d", g_settings.gpu_profile);
-        g_on = vk_gpuprof_setting(asked, by, g_vk.props.limits.timestampComputeAndGraphics, g_vk.has_portability,
-                                  g_vk.props.deviceName, say, sizeof say);
+        atomic_store_explicit(&g_asked, asked, memory_order_relaxed);
+        atomic_store_explicit(&g_on,
+                              vk_gpuprof_setting(asked, by, g_vk.props.limits.timestampComputeAndGraphics,
+                                                 g_vk.has_portability, g_vk.props.deviceName, say, sizeof say),
+                              memory_order_relaxed);
         if (say[0]) WARN("%s\n", say);
     }
     if (g_dead) return 0;
@@ -199,9 +237,11 @@ static int gp_on(void) {
        of a client no server has connected to, so a --tracy run waiting for a GUI would otherwise pay a query pool
        reset and two timestamps for every pass, a read-back at each recycle, and keep none of it. */
     if (snx_tracy_attached()) return g_vk.props.limits.timestampComputeAndGraphics;
-    return g_on;
+    return atomic_load_explicit(&g_on, memory_order_relaxed);
 }
 int vk_gpuprof_timed(void) { return g_vk.gfx_timestamp_bits && !g_dead; }
+/* whether the profile is on and its report will log: gates the recorder's command-kind count, which runs on every
+   command it drains */
 u64 vk_gpuprof_busy_ns(void) { return atomic_load_explicit(&g_stats_busy.ns, memory_order_relaxed); }
 /* the frame's command buffers timed: for the profile (gp_on), or for the stats box, which shows */
 static int gp_timed(void) {
@@ -270,8 +310,12 @@ void vk_gpuprof_cb_begin(VkCommandBuffer cb) {
         g_lost++;
         return;
     }
-    g->sub[g->nsub] =
-        (GpSub){.q0 = g->ops.used, .passes = g->npass, .dispatches = (u32)g_dispatched, .xfers = g_rec_xfers, .cb = cb};
+    g->sub[g->nsub] = (GpSub){.q0 = g->ops.used,
+                              .passes = g->npass,
+                              .dispatches = (u32)g_dispatched,
+                              .xfers = g_rec_xfers,
+                              .cb = cb,
+                              .cpu0 = gp_host_ns()};
     gp_stamp(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, g->ops.pool, g->ops.used++);
     g->nsub++;
     g_cur_cb = cb;
@@ -352,8 +396,10 @@ static int op_begin(VkCommandBuffer cb, u32 kind, u64 key, i64 site, u64 bytes) 
     x->q0 = x->q1 = 0;
     gp_stamp(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, o->pool, o->used);
     if (snx_tracy_attached()) {
-        char name[64];
-        snprintf(name, sizeof name, "gpu %s %llx", g_kind_name[kind], (unsigned long long)key);
+        char name[80];
+        const char* prefix = ctx == VK_GPU_CTX_COMPUTE ? "gpu compute" : "gpu graphics";
+        /* the queue and the operation's kind and key (hash, or the recording site for a copy) in one name */
+        snprintf(name, sizeof name, "%s: %s %llx", prefix, g_kind_name[kind], (unsigned long long)key);
         x->q0 = snx_tracy_gpu_zone_begin(name, 0x3d8f4a, ctx, &x->ep);
     }
     return 1;
@@ -398,7 +444,7 @@ void vk_gpuprof_compute_begin(GpOps* o, VkCommandBuffer cb) {
     rec_CmdWriteTimestamp2(cb, VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, o->pool, 0);
     o->used = 2;
     if (snx_tracy_attached())
-        o->span0 = snx_tracy_gpu_zone_begin("gpu compute batch", 0x2f9e8f, VK_GPU_CTX_COMPUTE, &o->span_ep);
+        o->span0 = snx_tracy_gpu_zone_begin("gpu compute: batch", 0x2f9e8f, VK_GPU_CTX_COMPUTE, &o->span_ep);
 }
 void vk_gpuprof_compute_submit(GpOps* o, VkCommandBuffer cb) {
     if (!o->used) return;
@@ -419,11 +465,11 @@ static void gpc_times(const u64* ts, u32 n, u16 span0, u16 span1, u64 ep) {
        latches at the announcement, so a context announced without one is never sent calibration events: the
        server would assert on a context it was told is uncalibrated. */
     if (snx_tracy_gpu_context(VK_GPU_CTX_COMPUTE, have ? gpu : last, g_vk.props.limits.timestampPeriod, have,
-                              "compute")) {
-        snx_tracy_gpu_cal_announce(&g_ccs_cal, have, have ? cpu : 0); /* the anchor is the announcement's pair */
+                              "gpu compute")) {
+        snx_tracy_gpu_cal_announce(&g_ccs_cal, have, have ? cpu : 0, have ? gpu : 0); /* the anchor is the announcement's pair */
     }
     if (have) {
-        i64 delta = snx_tracy_gpu_cal_delta(&g_ccs_cal, cpu);
+        i64 delta = snx_tracy_gpu_cal_delta(&g_ccs_cal, cpu, gpu);
         if (delta > 0) snx_tracy_gpu_calibrate(gpu, delta, VK_GPU_CTX_COMPUTE);
     } else
         snx_tracy_gpu_sync(last, VK_GPU_CTX_COMPUTE);
@@ -456,9 +502,31 @@ static GpDKey* gp_dkey(u32 kind, u64 key, i64 site) {
     }
     return NULL;
 }
-/* the CPU waits for the timeline's value (kind: VK_WAIT_*) */
+/* vk.h's one name of each kind of the CPU's wait for the GPU serves the timeline zone's text, the log's waits and
+   the plots, so a kind reads the same in every report */
+static char g_round_plot[VK_WAIT_N][64];
+static const char* round_plot_name(int k) {
+    if (!g_round_plot[k][0]) snprintf(g_round_plot[k], sizeof g_round_plot[k], "gpu round: %s ms", g_vk_wait_name[k]);
+    return g_round_plot[k];
+}
+/* the two stall plots have one series for each kind of wait, named from that same table */
+static char g_stall_ms_plot[VK_WAIT_N][64], g_stalls_plot[VK_WAIT_N][64];
+static const char* stall_ms_plot_name(int k) {
+    if (!g_stall_ms_plot[k][0])
+        snprintf(g_stall_ms_plot[k], sizeof g_stall_ms_plot[k], "vk pres gpu stall ms: %s", g_vk_wait_name[k]);
+    return g_stall_ms_plot[k];
+}
+static const char* stalls_plot_name(int k) {
+    if (!g_stalls_plot[k][0])
+        snprintf(g_stalls_plot[k], sizeof g_stalls_plot[k], "vk pres gpu stalls: %s", g_vk_wait_name[k]);
+    return g_stalls_plot[k];
+}
+/* the CPU waits for the timeline's value (kind: VK_WAIT_*). The reason is the kind: which wait held this present
+   back. This runs before the wait itself, so the zone ends before the blocking semaphore wait in cmd.c. */
 void vk_gpuprof_waited(u64 value, int kind) {
-    if (g_on <= 0) return;
+    if (gp_on() <= 0) return; /* worked out here too: the first wait after log changes is classified as well */
+    SNX_ZONE_TV(z_wait_why, "vk pres gpu wait", (u32)(kind >= 0 && kind < VK_WAIT_N ? kind : VK_WAIT_N),
+                "%s", kind >= 0 && kind < VK_WAIT_N ? g_vk_wait_name[kind] : "unknown");
     g_waited[value % GP_WAITS].value = value;
     g_waited[value % GP_WAITS].kind = kind + 1;
 }
@@ -488,8 +556,11 @@ void vk_gpuprof_pass_begin(VkCommandBuffer cb, const Surf* rt, const Surf* zt) {
     g_in_pass = 1;
     p->q0 = p->q1 = 0;
     if (snx_tracy_attached()) {
-        char name[48] = "gpu pass";
-        if (s) snprintf(name, sizeof name, "gpu pass %ux%u fmt %u", s->w, s->h, (u32)s->f.vk);
+        char name[96] = "gpu graphics: pass";
+        /* the target's size, format and address (the key the per-target sums use) say which pass this was */
+        if (s)
+            snprintf(name, sizeof name, "gpu graphics: pass %ux%u fmt %u target %llx", s->w, s->h, (u32)s->f.vk,
+                     (unsigned long long)s->gva);
         p->q0 = snx_tracy_gpu_zone_begin(name, 0x3d8f4a, VK_GPU_CTX_GRAPHICS, &p->ep);
     }
 }
@@ -539,21 +610,22 @@ static void gp_idle(const GpSlot* g, const u64* ts, double period) {
         g_holds[hold]++;
         g_subs++;
         g_sub_why[s->why]++;
-        if (g_last_end && b > g_last_end) {
-            /* the GPU idled from the last submission's end to this one's start: before this one was submitted, as
-               the CPU was busy, and after it */
-            u64 cut = s->cpu < g_last_end ? g_last_end : s->cpu > b ? b : s->cpu;
-            if (cut > g_last_end) {
-                int c = g_prev_kind ? IDLE_WAITED : g_prev_why == VK_SUB_PRESENT ? IDLE_FRAME : IDLE_RECORDING;
-                g_idle_ns[c] += cut - g_last_end;
-                g_idles[c]++;
-                if (g_prev_kind) g_round_ns[g_prev_kind - 1] += cut - g_last_end;
-            }
-            if (b > cut) {
-                g_idle_ns[IDLE_QUEUED] += b - cut;
-                g_idles[IDLE_QUEUED]++;
-            }
+        const VkGpGap gap = vk_gpuprof_gap(g_last_end, s->cpu0, s->cpu, b, e);
+        if (gap.before) {
+            /* the GPU idled from the last submission's end to this one's submit, as the CPU was busy */
+            int c = g_prev_kind ? IDLE_WAITED : g_prev_why == VK_SUB_PRESENT ? IDLE_FRAME : IDLE_RECORDING;
+            g_idle_ns[c] += gap.before;
+            g_idles[c]++;
+            if (g_prev_kind) g_round_ns[g_prev_kind - 1] += gap.before;
         }
+        if (gap.queued) {
+            g_idle_ns[IDLE_QUEUED] += gap.queued;
+            g_idles[IDLE_QUEUED]++;
+        }
+        g_fill_ns[s->why] += gap.fill;
+        g_fill_all_ns += gap.fill;
+        g_idle_subs_all++;
+        if (g_waited[s->value % GP_WAITS].value == s->value) g_fill_waited_ns += gap.fill;
         if (e > g_last_end) g_last_end = e;
         g_prev_why = s->why;
         g_prev_kind = g_waited[s->value % GP_WAITS].value == s->value ? g_waited[s->value % GP_WAITS].kind : 0;
@@ -571,12 +643,9 @@ static GpKey* gp_key(const GpPass* p) {
     }
     return NULL;
 }
-/* to's ticks after from's, below 0 before it, within the graphics queue's valid bits: its counter may wrap */
-static i64 gp_ticks(u64 from, u64 to) {
-    u32 bits = g_vk.gfx_timestamp_bits;
-    u64 mask = bits >= 64 ? ~0ull : (1ull << bits) - 1, d = (to - from) & mask;
-    return d > mask / 2 ? -(i64)((from - to) & mask) : (i64)d;
-}
+/* on the graphics queue, whose counter may wrap */
+static i64 gp_ticks(u64 from, u64 to) { return vk_gpuprof_ticks(g_vk.gfx_timestamp_bits, from, to); }
+static u64 gp_ns(u64 from, u64 to, double period) { return vk_gpuprof_ns(g_vk.gfx_timestamp_bits, from, to, period); }
 /* The graphics queue's busy time in the slot's submissions, into g_stats_busy.ns: the union of their spans from begin
    to end, on the whole timeline. A command buffer's begin is written once the queue reaches it, which may be before
    the one before it ended, in this frame or the last (the slots are read in the order they were used): only what runs
@@ -601,7 +670,8 @@ static void gp_busy(const GpSlot* g, const u64* ts) {
 static void gp_ops_done(GpOps* o, const u64* ts, double period, int ctx) {
     for (u32 i = 0; i < o->nop; i++) {
         GpOp* x = &o->op[i];
-        u64 ns = (u64)((double)(ts[x->qi + 1] - ts[x->qi]) * period);
+        u64 ns = vk_gpuprof_ns(ctx == VK_GPU_CTX_COMPUTE ? g_vk.compute_timestamp_bits : g_vk.gfx_timestamp_bits,
+                               ts[x->qi], ts[x->qi + 1], period);
         GpDKey* k;
         if (x->kind != VK_OP_DRAW) { /* a pass's sum has its draws in it already */
             k = gp_dkey(x->kind, x->key, x->site);
@@ -650,6 +720,7 @@ void vk_gpuprof_frame_done(u32 slot) {
        that very pair; else the GPU clock is anchored at this moment: the last timestamp was written before
        timeline_wait returned, so this is its CPU time. */
     if (snx_tracy_attached()) {
+        SNX_ZONE_V(z_trace, "vk pres gpu trace", g->nsub); /* reading the slot's queries and sending its GPU zones */
         int cal = vk_gpuprof_calibrated();
         i64 cpu = 0, gpu = 0;
         int have = cal && vk_gpuprof_clock(&cpu, &gpu);
@@ -659,11 +730,11 @@ void vk_gpuprof_frame_done(u32 slot) {
            latches at the announcement, so a context announced without one is never sent calibration events:
            the server would assert on a context it was told is uncalibrated. */
         if (snx_tracy_gpu_context(VK_GPU_CTX_GRAPHICS, have ? gpu : (i64)ts[g->ops.used - 1],
-                                  g_vk.props.limits.timestampPeriod, have, "graphics")) {
-            snx_tracy_gpu_cal_announce(&g_cal, have, have ? cpu : 0); /* the anchor is the announcement's pair */
+                                  g_vk.props.limits.timestampPeriod, have, "gpu graphics")) {
+            snx_tracy_gpu_cal_announce(&g_cal, have, have ? cpu : 0, have ? gpu : 0); /* the anchor is the announcement's pair */
         }
         if (have) {
-            i64 delta = snx_tracy_gpu_cal_delta(&g_cal, cpu);
+            i64 delta = snx_tracy_gpu_cal_delta(&g_cal, cpu, gpu);
             if (delta > 0) snx_tracy_gpu_calibrate(gpu, delta, VK_GPU_CTX_GRAPHICS);
         } else
             snx_tracy_gpu_sync((i64)ts[g->ops.used - 1], VK_GPU_CTX_GRAPHICS);
@@ -678,7 +749,7 @@ void vk_gpuprof_frame_done(u32 slot) {
     gp_ops_done(&g->ops, ts, period, VK_GPU_CTX_GRAPHICS);
     for (u32 i = 0; i < g->npass; i++) {
         const GpPass* p = &g->pass[i];
-        u64 ns = (u64)((double)(ts[p->qi + 1] - ts[p->qi]) * period);
+        u64 ns = gp_ns(ts[p->qi], ts[p->qi + 1], period);
         GpKey* k = gp_key(p);
         g_pass_ns += ns;
         gp_slow(p, ns);
@@ -691,7 +762,8 @@ void vk_gpuprof_frame_done(u32 slot) {
     for (u32 i = 1; i < g->npass; i++) {
         const GpPass* p = &g->pass[i];
         int c = p->dispatches ? 0 : p->xfers ? 1 : p->barriers ? 2 : 3;
-        u64 gns = (u64)((double)(ts[p->qi] - ts[g->pass[i - 1].qi + 1]) * period);
+        /* 0 for a pass the queue began before the one recorded before it ended */
+        u64 gns = gp_ns(ts[g->pass[i - 1].qi + 1], ts[p->qi], period);
         g_gap_ns[c] += gns;
         g_gaps[c]++;
         if (c == 1) {
@@ -702,7 +774,7 @@ void vk_gpuprof_frame_done(u32 slot) {
             g_mix_n[m] += p->kind[0] + p->kind[1] + p->kind[2];
         }
     }
-    g_span_ns += (u64)((double)(ts[g->ops.used - 1] - ts[0]) * period);
+    g_span_ns += gp_ns(ts[0], ts[g->ops.used - 1], period);
     g_frames++;
     static u64 last;
     u64 now = plat_ns();
@@ -729,9 +801,6 @@ int vk_gpuprof_clock(i64* cpu, i64* gpu) {
 /* the graphics queue's busy and idle time over the report's window, a frame (present) at a time, and the CPU's waits
    for the GPU by kind (cmd.c) */
 static void gp_idle_report(void) {
-    static const char* const why[VK_SUB_N] = {"other",    "present",   "finish", "1 ms",
-                                              "readback", "frame end", "split",  "background"};
-    static const char* const wait[VK_WAIT_N] = {"finish", "frame slot reuse", "a release or result's submit"};
     static u64 wait0[VK_WAIT_N], waits0[VK_WAIT_N], cs0;
     u64 now = plat_ns(), presents = (u32)(g_vk_present - g_present0), wall = now - g_t0;
     double f = presents ? (double)presents : 1.0;
@@ -744,21 +813,45 @@ static void gp_idle_report(void) {
             "between submissions, %.1f submissions a present\n",
             (unsigned long long)presents, (double)wall / 1e6 / f, (double)g_busy_ns / 1e6 / f,
             100.0 * (double)g_busy_ns / (double)wall, (double)idle / 1e6 / f, (double)g_subs / f);
+        LOG("vulkan: GPU   waits a present: %.1f sparse binds, %.1f compute results, %.1f ASTC uploads\n",
+            (double)g_vk_sparse_waits / f, (double)g_vk_cs_waits / f, (double)g_vk_astc_waits / f);
+        if (g_submit_count)
+            LOG("vulkan: GPU   submissions a present: %.1f, %.0f%% with an upload buffer, end %.2f us and queue submit "
+                "%.2f us each\n",
+                (double)g_submit_count / f, 100.0 * (double)g_submit_uploads / (double)g_submit_count,
+                (double)g_submit_end_ns / 1000.0 / (double)g_submit_count,
+                (double)g_submit_queue_ns / 1000.0 / (double)g_submit_count);
+        if (g_submit_count)
+            LOG("vulkan: GPU   submission in the ring %.2f us before the recorder runs it, backlog %.1f KiB (%.1f KiB "
+                "at most) when the GPU thread made it\n",
+                (double)g_submit_dwell_ns / 1000.0 / (double)g_submit_count,
+                (double)g_submit_backlog / (double)g_submit_count / 1024.0, (double)g_submit_backlog_max / 1024.0);
+        vk_rec_command_report(f, gp_on() > 0);
         for (int c = 0; c < IDLE_N; c++)
             if (g_idles[c])
                 LOG("vulkan: GPU   idle, %s: %.2f ms a present, %.1f times\n", g_idle_name[c],
                     (double)g_idle_ns[c] / 1e6 / f, (double)g_idles[c] / f);
         for (int k = 0; k < VK_WAIT_N; k++)
-            at += snprintf(line + at, sizeof line - (size_t)at, "%s %s %.2f ms (%.1f, idle after them %.2f ms)",
-                           k ? "," : "", wait[k], (double)(g_vk_wait_ns[k] - wait0[k]) / 1e6 / f,
-                           (double)(g_vk_waits[k] - waits0[k]) / f, (double)g_round_ns[k] / 1e6 / f);
+            at = snx_appendf(line, sizeof line, at, "%s %s %.2f ms (%.1f, idle after them %.2f ms)", k ? "," : "",
+                             g_vk_wait_name[k], (double)(g_vk_wait_ns[k] - wait0[k]) / 1e6 / f,
+                             (double)(g_vk_waits[k] - waits0[k]) / f, (double)g_round_ns[k] / 1e6 / f);
         LOG("vulkan: GPU   the GPU thread's waits for the graphics queue a present:%s; for the compute queue %.2f ms\n",
             line, (double)(atomic_load_explicit(&g_vk_cs_wait_ns, memory_order_relaxed) - cs0) / 1e6 / f);
         at = 0;
         for (int w = 0; w < VK_SUB_N; w++)
-            at += snprintf(line + at, sizeof line - (size_t)at, "%s %s %.1f", w ? "," : "", why[w],
-                           (double)g_sub_why[w] / f);
+            at = snx_appendf(line, sizeof line, at, "%s %s %.1f", w ? "," : "", g_vk_sub_name[w],
+                             (double)g_sub_why[w] / f);
         LOG("vulkan: GPU   submissions a present by why:%s\n", line);
+        u64 fill = 0;
+        at = 0;
+        for (int w = 0; w < VK_SUB_N; w++) {
+            fill += g_fill_ns[w];
+            at = snx_appendf(line, sizeof line, at, "%s %s %.2f", w ? "," : "", g_vk_sub_name[w],
+                             (double)g_fill_ns[w] / 1e6 / f);
+        }
+        LOG("vulkan: GPU   idle while the next submission held commands not yet submitted, up to its GPU time: %.2f "
+            "ms a present, %.2f ms of it before a submission the CPU waited for; by its why:%s\n",
+            (double)fill / 1e6 / f, (double)g_fill_waited_ns / 1e6 / f, line);
         for (int c = 0; c < HOLD_N; c++)
             if (g_holds[c])
                 LOG("vulkan: GPU   busy in submissions holding %s: %.2f ms a present, %.1f of them\n", g_hold_name[c],
@@ -766,7 +859,12 @@ static void gp_idle_report(void) {
     }
     memset(g_hold_ns, 0, sizeof g_hold_ns);
     memset(g_holds, 0, sizeof g_holds);
+    /* Finer than the window's wait totals: the mean time of one stall, and how many stalls a present. Each wait kind
+       has its own series; the zone in vk_gpuprof_waited names which of these held the present back. */
     for (int k = 0; k < VK_WAIT_N; k++) {
+        u64 dns = g_vk_wait_ns[k] - wait0[k], dw = g_vk_waits[k] - waits0[k];
+        SNX_PLOT(stall_ms_plot_name(k), dw ? (double)dns / 1e6 / (double)dw : 0.0);
+        SNX_PLOT(stalls_plot_name(k), presents ? (double)dw / (double)presents : 0.0);
         wait0[k] = g_vk_wait_ns[k];
         waits0[k] = g_vk_waits[k];
     }
@@ -774,8 +872,14 @@ static void gp_idle_report(void) {
     memset(g_idle_ns, 0, sizeof g_idle_ns);
     memset(g_idles, 0, sizeof g_idles);
     memset(g_round_ns, 0, sizeof g_round_ns);
+    memset(g_fill_ns, 0, sizeof g_fill_ns);
+    g_fill_waited_ns = 0;
     memset(g_sub_why, 0, sizeof g_sub_why);
     g_busy_ns = g_subs = 0;
+    g_vk_sparse_binds = g_vk_sparse_waits = 0;
+    g_vk_cs_waits = g_vk_astc_waits = 0;
+    g_submit_end_ns = g_submit_queue_ns = g_submit_uploads = g_submit_count = 0;
+    g_submit_dwell_ns = g_submit_backlog = g_submit_backlog_max = 0;
     g_t0 = now;
     g_present0 = g_vk_present;
 }
@@ -787,16 +891,23 @@ static int key_cmp(const void* a, const void* b) {
     u64 x = ((const GpKey*)a)->ns, y = ((const GpKey*)b)->ns;
     return x < y ? 1 : x > y ? -1 : 0;
 }
+/* the slow passes by their mean, the slowest first, an empty one last however it compares */
+static int slow_cmp(const void* a, const void* b) {
+    const GpSlow *x = a, *y = b;
+    if (!x->n || !y->n) return x->n ? -1 : y->n ? 1 : 0;
+    const u64 m = x->ns / x->n, n = y->ns / y->n;
+    return m < n ? 1 : m > n ? -1 : 0;
+}
 /* The log's other breakdowns as plots too: why the CPU waited, what the busy time held, and why submissions went
    out. Each is the window's sum divided by the same presents or frames as the log. */
-static const char* const g_round_plot[VK_WAIT_N] = {"gpu round: finish ms", "gpu round: recycle ms",
-                                                    "gpu round: submit ms"};
 static const char* const g_hold_plot[HOLD_N] = {"gpu hold: passes ms", "gpu hold: dispatches ms",
                                                 "gpu hold: copies ms", "gpu hold: nothing ms"};
-static const char* const g_sub_plot[VK_SUB_N] = {"gpu submit: other",    "gpu submit: present",
-                                                 "gpu submit: finish",   "gpu submit: 1 ms",
-                                                 "gpu submit: readback", "gpu submit: frame end",
-                                                 "gpu submit: split",    "gpu submit: background"};
+/* the submission plots name their reason from vk.h's one table, as the log and cmd.c's zone do */
+static char g_sub_plot[VK_SUB_N][64];
+static const char* sub_plot_name(int k) {
+    if (!g_sub_plot[k][0]) snprintf(g_sub_plot[k], sizeof g_sub_plot[k], "gpu submit: %s", g_vk_sub_name[k]);
+    return g_sub_plot[k];
+}
 /* the window's gaps and idle time as plots: the log's sums, so a --tracy run whose setting is off still shows where
    the GPU's time went. The gaps are per frame, the idle time per present, and the busy share of the window's wall */
 static void gp_plots(void) {
@@ -810,16 +921,17 @@ static void gp_plots(void) {
     /* a Memory plot takes bytes and adds the unit itself, so send bytes per frame and let the GUI print MB */
     double p = presents ? (double)presents : 1.0;
     SNX_PLOT("copy MB", (double)(g_mix_bytes[0] + g_mix_bytes[1] + g_mix_bytes[2]) / f);
-    for (int k = 0; k < VK_WAIT_N; k++) SNX_PLOT(g_round_plot[k], (double)g_round_ns[k] / 1e6 / p);
+    /* round_plot_name builds each name from g_vk_wait_name, so a plot's kind reads as in the log */
+    for (int k = 0; k < VK_WAIT_N; k++) SNX_PLOT(round_plot_name(k), (double)g_round_ns[k] / 1e6 / p);
     for (int k = 0; k < HOLD_N; k++) SNX_PLOT(g_hold_plot[k], (double)g_hold_ns[k] / 1e6 / p);
-    for (int k = 0; k < VK_SUB_N; k++) SNX_PLOT(g_sub_plot[k], (double)g_sub_why[k] / p);
+    for (int k = 0; k < VK_SUB_N; k++) SNX_PLOT(sub_plot_name(k), (double)g_sub_why[k] / p);
 }
 /* the pass bookkeeping is file-global: vk_lock serializes recording (record.c) */
 /* the targets that took the most GPU time, then a fresh sum */
 static void gp_report(void) {
     if (!g_frames) return;
     gp_plots();
-    if (g_on <= 0) {
+    if (atomic_load_explicit(&g_on, memory_order_relaxed) <= 0) {
         /* the setting is off and the client asked for the sums: the plots have them, and the next window starts */
         memset(g_mix_ns, 0, sizeof g_mix_ns);
         memset(g_mixes, 0, sizeof g_mixes);
@@ -861,13 +973,19 @@ static void gp_report(void) {
             (unsigned long long)sorted[i].draws, (unsigned long long)sorted[i].gva, sorted[i].w, sorted[i].h,
             sorted[i].fmt);
     memset(g_key, 0, sizeof g_key);
-    for (u32 i = 0; i < GP_SLOW; i++) {
-        const GpSlow* s = &g_slow[i];
-        if (s->n)
-            LOG("vulkan: GPU   a pass of %.2f ms: target %llx %ux%u format %u, %u draws, gap before it %u copies, "
-                "%u barriers, %u dispatches (%llu of them a frame)\n",
-                (double)s->ns / 1e6 / (double)s->n, (unsigned long long)s->gva, s->w, s->h, s->fmt, s->draws,
-                s->xfers, s->barriers, s->dispatches, (unsigned long long)s->n / (unsigned long long)g_frames);
+    {
+        /* the slowest pass first: the top of this list is where a frame's GPU time goes */
+        static GpSlow slow[GP_SLOW];
+        memcpy(slow, g_slow, sizeof slow);
+        qsort(slow, GP_SLOW, sizeof *slow, slow_cmp);
+        for (u32 i = 0; i < GP_SLOW; i++) {
+            const GpSlow* s = &slow[i];
+            if (!s->n) break;
+            LOG("vulkan: GPU   a pass of %.2f ms on average, %llu of them at 0.3 ms or more: target %llx %ux%u format "
+                "%u, up to %u draws, gap before it up to %u copies, %u barriers, %u dispatches\n",
+                (double)s->ns / 1e6 / (double)s->n, (unsigned long long)s->n, (unsigned long long)s->gva, s->w, s->h,
+                s->fmt, s->draws, s->xfers, s->barriers, s->dispatches);
+        }
     }
     memset(g_slow, 0, sizeof g_slow);
     /* the dispatches by tag: compute programs by key (vulkan: compute KEY ready), and the renderer's own pipelines by
@@ -886,6 +1004,7 @@ static void gp_report(void) {
                                                    [VK_PROF_TEXCONV] = "a texture conversion",
                                                    [VK_PROF_VIC] = "a VIC composition",
                                                    [VK_PROF_XFB_INDIRECT] = "transform feedback's draw arguments",
+                                                   [VK_PROF_INDIRECT_QUADS] = "an indirect draw's quads",
                                                    [VK_PROF_QUERY_PREDICATE] = "the queries' predicates",
                                                    [VK_PROF_QUERY_COMPARE] = "a query compare",
                                                    [VK_PROF_QUERY_COUNT] = "the queries' counts",

@@ -10,6 +10,7 @@
 #include "nx/runtime/arm.h"
 #include "nx/gpu/nvn/nvn_object.h"
 #include "nx/gpu/nvn/nvn_state.h"
+#include "nx/gpu/nvn/nvn_cmd.h"
 #include "gpu/nvn/nvn.hook.h"
 #include "common/platform/thread.h" /* PMutex */
 #include "snx_settings.h"
@@ -457,6 +458,52 @@ int main(void) {
         }
         check(seg[0] != ~0u && seg[1] != ~0u && seg[0] == seg[2] && seg[1] == seg[3] && seg[0] != seg[1],
               "each command buffer cuts from segments of its own");
+    }
+
+    /* One game's scene: many command buffers, each given a few hundred bytes of command memory of its own, each with one
+       short recording it keeps. Two draws count what their records take, and a line width 12 bytes for 16 of record:
+       the tail (the second draw, the line width and a third draw) goes on in the runtime's memory after a JUMP where
+       the second draw was. Once the recording ends, the tail moves into a block of the small store and the JUMP goes
+       there: no segment stays held for it, so the next command buffer cuts from the same one again, where a segment
+       for each held them all. Recorded again over the same bytes, the last tail's piece comes back */
+    {
+        enum { N = 8 };
+        u32 ns = g_nvn.cmd.ns, np = g_nvn.cmd.np, live = 0, live0 = 0, i, k;
+        u64 hs[N];
+        int ok = 1, moved = 1;
+        for (k = 0; k < g_nvn.cmd.ns; k++) live0 += g_nvn.cmd.s[k].live; /* the earlier recordings' pieces */
+        for (int n = 0; n < N; n++) {
+            const u64 cbn = 0x70000 + (u64)n * 0xa0;
+            nvn_CommandBufferInitialize(&cpu, cbn, 0);
+            nvn_CommandBufferAddCommandMemory(&cpu, cbn, 1, 0x30000 + (u64)n * 0x400, 0x400);
+            nvn_CommandBufferBeginRecording(&cpu, cbn);
+            nvn_CommandBufferDrawArrays(&cpu, cbn, 4, 0, 3);
+            nvn_CommandBufferDrawArrays(&cpu, cbn, 4, 3, 3);
+            nvn_CommandBufferSetLineWidth(&cpu, cbn, 2.0f);
+            nvn_CommandBufferDrawArrays(&cpu, cbn, 4, 6, 3);
+            hs[n] = nvn_CommandBufferEndRecording(&cpu, cbn);
+            walk(hs[n], &a);
+            ok &= hs[n] == 0x10000 + 0x30000 + (u64)n * 0x400 && a.n == 4 && a.op[0] == OP_DRAW && a.op[1] == OP_DRAW &&
+                  a.op[2] == OP_LINE_WIDTH && a.op[3] == OP_DRAW && gr32(a.at[3] + 8 + offsetof(NvnPDraw, first)) == 6;
+            for (k = 0; k < g_nvn.cmd.ns; k++) /* the tail's records are in no segment */
+                if (a.at[1] >= g_nvn.cmd.s[k].at && a.at[1] < g_nvn.cmd.s[k].at + g_nvn.cmd.s[k].size) moved = 0;
+        }
+        for (k = 0; k < g_nvn.cmd.ns; k++) live += g_nvn.cmd.s[k].live;
+        check(ok, "a recording whose tail went on in the runtime's memory walks from its handle in the game's");
+        check(moved && live == live0, "each tail moved into the small store, and no segment holds a piece of it");
+        check(g_nvn.cmd.ns <= ns + 1 && g_nvn.cmd.np == np + N,
+              "the command buffers' tails cut from one segment, and each keeps its piece");
+        for (i = 1, k = 0; i <= g_nvn.cmd.slots; i++)
+            k += g_nvn.cmd.p[i].anchor == 0x10000 + 0x30000 && g_nvn.cmd.p[i].seg >= NVN_SPILL_SMALL;
+        check(k == 1, "the first command buffer's tail is a piece of the small store, anchored at its recording");
+        nvn_CommandBufferAddCommandMemory(&cpu, 0x70000, 1, 0x30000, 0x400);
+        nvn_CommandBufferBeginRecording(&cpu, 0x70000);
+        nvn_CommandBufferDrawArrays(&cpu, 0x70000, 4, 0, 3);
+        nvn_CommandBufferDrawArrays(&cpu, 0x70000, 4, 3, 3);
+        nvn_CommandBufferSetLineWidth(&cpu, 0x70000, 2.0f);
+        nvn_CommandBufferDrawArrays(&cpu, 0x70000, 4, 6, 3);
+        nvn_CommandBufferEndRecording(&cpu, 0x70000);
+        check(g_nvn.cmd.np == np + N, "recorded again over the same bytes, the last tail's piece comes back");
     }
 
     /* a piece of the runtime's memory a recording is still cut from: records past those written aren't there yet, so a
@@ -914,6 +961,68 @@ int main(void) {
         check(snx_ld_le32(GP(w.at[5] + 8 + offsetof(NvnPPrimRestart, index))) == 0xffff &&
                   snx_ld_le32(GP(w.at[10] + 8 + offsetof(NvnPStencil, ref))) == 7,
               "with the values recorded");
+    }
+    /* a hook module's upscale (nvn_cmd_record_upscale): nothing for a command buffer that doesn't record, a color that
+       isn't a live texture or a size of 0, else one OP_UPSCALE record with its textures' snapshots, the output's view
+       and the request's fields */
+    {
+        const u64 cbu = 0x4b400, color = 0x4b600, output = 0x4b700, view = 0x4b800, mem = 0x50000;
+        NvnTexture c = t, o = t;
+        NvnView v;
+        Walk w;
+        c.d.width = 64, c.d.height = 36, o.d.width = 128, o.d.height = 72, o.gpu = 0x123460000ull;
+        memcpy(GP(color), &c, sizeof c);
+        memcpy(GP(output), &o, sizeof o);
+        memset(&v, 0x11, sizeof v);
+        memcpy(GP(view), &v, sizeof v);
+        NvnUpscaleRequest r = {0};
+        r.tex[NVN_UPSCALE_COLOR] = color, r.tex[NVN_UPSCALE_OUTPUT] = output, r.view[NVN_UPSCALE_OUTPUT] = view;
+        r.render[0] = 64, r.render[1] = 36, r.out[0] = 128, r.out[1] = 72, r.out_base[0] = 2, r.out_base[1] = 3;
+        r.jitter[0] = 0.25f, r.pre_exposure = 1, r.reset = 1, r.flags = 0x50000;
+        nvn_CommandBufferInitialize(&cpu, cbu, 0);
+        nvn_CommandBufferAddCommandMemory(&cpu, cbu, 1, mem, 0x1000);
+        check(!nvn_cmd_record_upscale(&cpu, cbu, &r), "an upscale for a command buffer that doesn't record: none");
+        nvn_CommandBufferBeginRecording(&cpu, cbu);
+        r.tex[NVN_UPSCALE_COLOR] = view;
+        check(!nvn_cmd_record_upscale(&cpu, cbu, &r), "an upscale whose color isn't a live texture: none");
+        r.tex[NVN_UPSCALE_COLOR] = color, r.out[1] = 0;
+        check(!nvn_cmd_record_upscale(&cpu, cbu, &r), "an upscale to a size of 0: none");
+        r.out[1] = 72;
+        check(nvn_cmd_record_upscale(&cpu, cbu, &r), "an upscale recorded");
+        walk(nvn_CommandBufferEndRecording(&cpu, cbu), &w);
+        check(w.n == 1 && w.op[0] == OP_UPSCALE, "one OP_UPSCALE record");
+        NvnPUpscale p;
+        memcpy(&p, GP(w.at[0] + 8), sizeof p);
+        check(p.tex[NVN_UPSCALE_COLOR] > w.at[0] && p.tex[NVN_UPSCALE_COLOR] < w.at[0] + w.size[0] &&
+                  !memcmp(GP(p.tex[NVN_UPSCALE_COLOR]), &c, NVN_TEX_SNAP) &&
+                  !memcmp(GP(p.tex[NVN_UPSCALE_OUTPUT]), &o, NVN_TEX_SNAP),
+              "the record carries the textures' snapshots");
+        check(!p.tex[NVN_UPSCALE_DEPTH] && !p.tex[NVN_UPSCALE_MOTION] && !p.has_view[NVN_UPSCALE_COLOR] &&
+                  p.has_view[NVN_UPSCALE_OUTPUT] && !memcmp(&p.view[NVN_UPSCALE_OUTPUT], &v, sizeof v),
+              "and the output's view alone");
+        check(p.render[0] == 64 && p.render[1] == 36 && p.out[0] == 128 && p.out[1] == 72 && p.out_base[0] == 2 &&
+                  p.out_base[1] == 3 && p.jitter[0] == 0.25f && p.pre_exposure == 1 && p.reset && p.flags == 0x50000,
+              "and the request's fields");
+    }
+
+    /* The Ounce's driver (API 231) writes only the vertex attributes and streams that a bind names, each list padded to
+       an even count of words. One game's model sizes a heap by these bytes: the Switch's 68 and 64 + 4n overflowed it */
+    {
+        const u64 cbv = 0x6f000, attribs = 0x6f800, streams = 0x6f900;
+        u32 api = g_nvn.loader.api;
+        g_nvn.loader.api = 231u << 16 | 30;
+        nvn_CommandBufferInitialize(&cpu, cbv, 0);
+        nvn_CommandBufferAddCommandMemory(&cpu, cbv, 1, 0x2f000, 0x400);
+        nvn_CommandBufferBeginRecording(&cpu, cbv);
+        nvn_CommandBufferBindVertexAttribState(&cpu, cbv, 13, attribs);
+        check(nvn_CommandBufferGetCommandMemoryUsed(&cpu, cbv) == 64, "13 attributes: a header, the count and 14 words");
+        nvn_CommandBufferBindVertexStreamState(&cpu, cbv, 2, streams);
+        check(nvn_CommandBufferGetCommandMemoryUsed(&cpu, cbv) == 64 + 24, "2 streams with no divisor: 6 words");
+        gw32(streams + 8 + 4, 1); /* stream 1's divisor */
+        nvn_CommandBufferBindVertexStreamState(&cpu, cbv, 2, streams);
+        check(nvn_CommandBufferGetCommandMemoryUsed(&cpu, cbv) == 64 + 24 + 32, "and with a divisor of stream 1: 8");
+        nvn_CommandBufferEndRecording(&cpu, cbv);
+        g_nvn.loader.api = api;
     }
     if (failures) return 1;
     puts("nvn_commands: ok");

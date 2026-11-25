@@ -35,21 +35,23 @@ Generated modules include runtime ABI code. Game assets, keys and firmware are e
 | xxHash 0.8.4 (XXH3 and its x86 dispatcher, the renderer's content hashes: `src/nx/gpu/vk/xxh3.c`) | BSD-2-Clause |
 | Vulkan-Headers | Apache 2.0 |
 | volk | MIT |
-| AMD FidelityFX Super Resolution 2.2.1 (the DLSS evaluations of Switch 2 games) | MIT |
+| AMD FidelityFX Super Resolution 2.2.1 (the DLSS evaluations of Switch 2 games), with FSR 1's EASU and RCAS from its archive (the spatial upscaler) | MIT |
+| SMAA 1x by Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando Navarro and Diego Gutierrez (iryoku/smaa at 71c806a: its reference shader and its area and search textures, the anti-aliasing before a copy or a spatial upscale) | MIT |
+| NVIDIA Streamline 2.14.16's headers (`include/`, the DLSS backend of a Windows build. NVIDIA's runtime is not included: the user downloads it) | MIT |
 | KosmicKrisp (Mesa's Vulkan driver on Metal, which the macOS app carries with `SNX_KOSMICKRISP`) | MIT |
 | The Vulkan Loader (the macOS app carries it for KosmicKrisp) | Apache 2.0 |
 | AMD FidelityFX Super Resolution 1.0 (`src/common/gpu/vk/fx/ffx_a.h`, `ffx_fsr1.h`, and the EASU and RCAS shaders' constants) | MIT |
 | NVIDIA Image Scaling 1.0.3 (`src/common/gpu/vk/fx/NIS_Scaler.h`, `nis.comp`, `nis_coef.h`, and NVScaler's config) | MIT |
 | Qualcomm Snapdragon Game Super Resolution 1 (`src/common/gpu/vk/fx/sgsr1.vert`, `sgsr1.frag`) | BSD-3-Clause |
 | FXAA 3.11 (`src/common/gpu/vk/fx/fxaa.frag`), after Timothy Lottes' public domain FXAA | Public domain |
-| SMAA 1x (`src/common/gpu/vk/fx/smaa_*.frag`, `AreaTex.h`, `SearchTex.h`), Jorge Jimenez and the SMAA contributors' shader and textures, with the Vulkan GLSL form of the OpenQ4 port | MIT |
+| SMAA 1x (`src/common/gpu/vk/fx/smaa_*.frag`, and `tools/areatexgen`, the C form of the distribution's `AreaTex.py` and `SearchTex.py` that writes `AreaTex.h` and `SearchTex.h` during the build), Jorge Jimenez and the SMAA contributors' shader, textures and script, with the Vulkan GLSL form of the OpenQ4 port | MIT |
 | The shared presentation effects (`src/common/gpu/vk/present_fx.c`, `fx/fx_fsr.c`), the presented frame's upscaler and anti-aliasing, after Eden's and yuzu's FSR and SGSR wrappers | GPL-3.0-or-later, GPL-2.0-or-later |
 | SDL3 | zlib |
 | The HD rumble amplitude steps of a Switch controller (`src/nx/runtime/platform/backend/gamepad.c`), from SDL3's `src/joystick/hidapi/SDL_hidapi_switch.c`, Copyright (C) 1997-2026 Sam Lantinga, after dekuNukem's Nintendo_Switch_Reverse_Engineering `rumble_data_table.md` | zlib |
 | The AppImage's runtime (uruntime) and launcher (sharun, with Anylinux-sharun's `anylinux.so` and cross-libc-dlopen) | MIT |
 | Tracy (the profiler client, built only with `SNX_TRACY`) | BSD-3-Clause |
-| [CPMUtil](https://git.crueter.xyz/CMake/CPMUtil), crueter's, with its trimmed CPM.cmake (`cmake/cpmutil`, as Eden carries them, with four changes of ours: the configure fetches the third-party packages through it, not shipped) | LGPL-3.0-or-later ([text](../cmake/cpmutil/LICENSE)), CPM.cmake's MIT (in `cmake/cpmutil/CPM.cmake`) |
-| ENet / zstd (an Eden room's connection and its datagrams, `src/common/network/net_room.c`) | MIT / BSD-3-Clause |
+| [CPMUtil](https://git.crueter.xyz/CMake/CPMUtil), crueter's, with its trimmed CPM.cmake (`cmake/cpmutil`, as Eden carries them, with five changes of ours: the configure fetches the third-party packages through it, not shipped) | LGPL-3.0-or-later ([text](../cmake/cpmutil/LICENSE)), CPM.cmake's MIT (in `cmake/cpmutil/CPM.cmake`) |
+| ENet / zstd (an Eden room's connection and its datagrams, `src/common/network/net_room.c`; zstd also an XCZ's or NSZ's NCZ, `src/nx/runtime/driver/hactool/ncz.c`) | MIT / BSD-3-Clause |
 | miniz 3.1.2 (the zip around the launcher's Share Log, `src/gui/logzip.c`) | MIT |
 | libdeflate 1.26 (every deflate: Share Log's, the Vita driver's VPKs and eboot segments, the Android driver's APKs) | MIT |
 | HarfBuzz 15.0.0 (the Android driver's text shaping, `src/android/hwui/text.c`) | MIT ("Old MIT") |
@@ -60,9 +62,9 @@ Generated modules include runtime ABI code. Game assets, keys and firmware are e
 | lunasvg / plutovg (the splash's SVGs and the user's picture) | MIT / MIT, with FreeType's rasterizer and stroker (FreeType License) and stb (MIT or public domain) |
 | GUI menu icons (`src/gui/icons.hex`), drawn after Lucide 1.61.0's (some derived from Feather) | GPL-3.0-or-later, after Lucide's ISC and Feather's MIT (in `src/gui/FONT-NOTICE.txt`) |
 | GUI VGA BIOS font (SeaBIOS `vgafont16`, originally Joseph Gil's font collection) | Public domain |
-| GUI Latin letters past CP437 (GNU Unifont 18.0.01's 8x16 glyphs, `src/gui/unifont-latin.hex`, fitted to the VGA font) | GPL-2.0-or-later with the GNU font embedding exception, or OFL-1.1 |
-| GUI letters of game titles, the CJK and Hangul blocks (GNU Unifont 18.0.01's 16x16 and 8x16 glyphs, `src/gui/unifont-titles.hex`) | GPL-2.0-or-later with the GNU font embedding exception, or OFL-1.1 |
-| GUI wide letters the languages show past those blocks (GNU Unifont 18.0.01's 16x16 glyphs, `src/gui/unifont-wide.hex`) | GPL-2.0-or-later with the GNU font embedding exception, or OFL-1.1 |
+| GUI Latin letters past CP437 (GNU Unifont 18.0.01's 8x16 glyphs, of its `unifont_all-18.0.01.hex.gz`, downloaded by `cmake/dependencies.cmake`, fitted to the VGA font) | GPL-2.0-or-later with the GNU font embedding exception, or OFL-1.1 |
+| GUI letters of game titles, the CJK and Hangul blocks (GNU Unifont 18.0.01's 16x16 and 8x16 glyphs, of its `unifont_all-18.0.01.hex.gz`, downloaded by `cmake/dependencies.cmake`) | GPL-2.0-or-later with the GNU font embedding exception, or OFL-1.1 |
+| GUI wide letters the languages show past those blocks (GNU Unifont 18.0.01's 16x16 glyphs, of the same download) | GPL-2.0-or-later with the GNU font embedding exception, or OFL-1.1 |
 
 The GUI fonts' notices and pinned sources are preserved in
 [`src/gui/FONT-NOTICE.txt`](../src/gui/FONT-NOTICE.txt).
@@ -74,10 +76,12 @@ a source keep that source's copyright lines and license, most with the revision 
 | --- | --- | --- |
 | `src/nx/gpu/gpu.c` (safe reads of compute-inline payloads) and `src/nx/gpu/shader/emit_thread.c` (constant geometry invocation information) | Citron, Zephyron's Princess Peach: Showtime! fixes in [`acfb1dcc1ad9adf25b960c4f8f25c5bf78849406`](https://github.com/citron-neo/emulator/commit/acfb1dcc1ad9adf25b960c4f8f25c5bf78849406), `video_core/dma_pusher.cpp` and `shader_recompiler/backend/spirv/emit_spirv_context_get_set.cpp`; original code copyright 2018 and 2021 yuzu Emulator Project | GPL-2.0-or-later |
 | `src/nx/runtime/driver/hactool/storage.c` and `storage.h` (the storages added to hactool) | LibHac, as Ryubing maintains it | MIT |
+| `src/nx/runtime/driver/hactool/ncz.c` (an NCZ's layout: its sections, blocks and stream, and the counters its sections are encrypted again with) | [nsz](https://github.com/nicoboss/nsz)'s reading of its own format (`nsz/Decompressor.py`, `nsz/BlockDecompressorReader.py` at `148218ff`), Copyright (c) 2019 Nico Bosshard and Blake Warner; none of its code | MIT |
 | `src/nx/hle/filesystem/fs.c` (a save's commit: its last commit and working copy in the save's folder, the commit by two renames, the open that finishes a commit cut short) | LibHac's reading of the console's class (`FsSystem/DirectorySaveDataFileSystem.cs`, nnSdk 14.3.0), as Hyjinx carries it; none of its code | MIT |
 | `src/3ds/gpu/`, `src/3ds/audio/`, `src/3ds/services/dsp.c`, `src/3ds/services/cfg.c` (the config blocks' defaults), `src/3ds/services/hid.c` (HID's samples, their layout and pace) | Azahar (Citra) | GPL-2.0-or-later |
 | `src/3ds/gpu/present.c` (`snx_ctr_layout_rects`) | Azahar (Citra) at `11eceda5`; none of its code | GPL-3.0-or-later |
 | `src/3ds/services/fs.c` (another title's save data: the path's media and program ID, and the folder they name) | Azahar (Citra) at `6e42de8` (`core/file_sys/archive_other_savedata.cpp` and `archive_source_sd_savedata.cpp`; original code copyright 2014 to 2024 Citra Emulator Project / Azahar Emulator Project) | GPL-2.0-or-later |
+| `src/3ds/services/soc.c` (soc:U: the console's sockaddr, pollfd, addrinfo and hostent, its errno and getaddrinfo numbers, its socket options) and `ac.c` (ac:u's commands and its not-connected result) | Azahar (Citra) at `396b4c3c9`: `src/core/hle/service/soc/soc_u.cpp` and `soc_u.h`, `src/core/hle/service/ac/ac.cpp`; original code copyright 2014 to 2026 Citra Emulator Project / Azahar Emulator Project; the command layouts as libctru's (zlib) | GPL-2.0-or-later |
 | `src/3ds/services/ldr.c` and `ldr.h` (ldr:ro), `cro.c` and `cro.h` (the CRO format, its relocations, imports and exports) | Azahar (Citra) at `a4b335e`: `src/core/hle/service/ldr_ro/ldr_ro.cpp` and `ldr_ro.h`, `cro_helper.cpp` and `cro_helper.h`; original code copyright 2014 to 2025 Citra Emulator Project / Azahar Emulator Project | GPL-2.0-or-later |
 | `src/3ds/services/font.c` (APT's shared font: the LZ11 decompression, the CFNT relocation and the address it is relocated to) | Azahar (Citra) at `a4b335e` (`core/hle/service/apt/apt.cpp`, `core/hle/service/apt/bcfnt/bcfnt.cpp`) | GPL-2.0-or-later |
 | `src/3ds/loader/smdh.c` (the SMDH icon's 8x8 tiles read in Morton order) | Azahar (Citra) at `a4b335e`: `src/video_core/utils.h` (`GetMortonOffset`); original code copyright 2014 to 2025 Citra Emulator Project / Azahar Emulator Project | GPL-2.0-or-later |
@@ -117,6 +121,7 @@ a source keep that source's copyright lines and license, most with the revision 
 | `src/nx/loader/loader.c` (the defaults for a program without an NPDM) | Eden and yuzu (`file_sys/program_metadata.cpp`) | GPL-3.0-or-later, GPL-2.0-or-later |
 | `src/common/utilities/patches.c` (IPS, IPS32 and IPSwitch patches: their formats, which patch a module takes, where they write) | Eden (`file_sys/ips_layer.cpp`, its IPSwitch reading by lizzie, and `file_sys/patch_manager.cpp`) | GPL-3.0-or-later |
 | `src/nx/hle/kernel/`, `src/nx/hle/svc/`, `src/nx/memory/`, `src/nx/hle/services/`, `src/nx/hle/filesystem/` | Eden and yuzu | GPL-3.0-or-later, GPL-2.0-or-later |
+| `src/nx/runtime/platform/ctrl_request.c` (the controller applet's argument layouts: its private argument, the 4 and 8 player arguments, the result) | yuzu (`core/hle/service/am/frontend/applet_controller.h`, as Sudachi carries it) | GPL-2.0-or-later |
 | `src/nx/hle/services/nvdrv.c`, `nvdrv.h` and the `nvdrv_*.h` headers (the nvhost devices' commands and argument layouts, the ioctl encoding, the GMMU and VA layout, the syncpoint manager) | Eden and yuzu (`core/hle/service/nvdrv/`: `nvdata.h`, `core/syncpoint_manager.h`, `devices/nvmap`, `nvhost_as_gpu`, `nvhost_ctrl`, `nvhost_ctrl_gpu`, `nvhost_gpu`; `video_core/memory_manager.h`), with Skyline's parts as Eden carries them | GPL-3.0-or-later, GPL-2.0-or-later |
 | `src/nx/hle/svc/hos.svc` (the SVC declarations and type sizes) and `tools/svcgen/svcgen.c` (their parsing and register allocation) | Eden and yuzu (`tools/svc_generator.py`) | GPL-3.0-or-later, GPL-2.0-or-later |
 | `src/nx/hle/services/misc.c` (the six default Miis, from Eden's `mii/types/raw_data.cpp`, and StoreData's checksums, from Ryubing's `Mii/Helper.cs` and `Mii/Types/StoreData.cs`) | Ryujinx (the defaults as Eden carries them) | MIT ([text](../dist/licenses/Ryujinx/LICENSE.txt)) |
@@ -156,6 +161,8 @@ and package manifest: `share/licenses/`. Component license files contain the ful
 Wimsy, the mascot and the runtime's icon ([SVG metadata](../dist/wimsy.svg)): drawn by Liz, GPL-3.0-or-later.
 The splash's Fuddles ([SVG metadata](../dist/splash/wimsy-fuddles.svg)): Wimsy with Fuddles' tails, circuits and
 colours, by AO55 after Liz's Wimsy, GPL-3.0-or-later.
+The splash's Christmas Wimsy ([SVG metadata](../dist/splash/wimsy-xmas.svg)), drawn in December only: Liz's Wimsy
+in candy cane, as she asked, red wings with white dots and a striped head and leaves, by AO55, GPL-3.0-or-later.
 
 The 3DS UDS command layouts and encrypted beacon framing in `src/3ds/services/uds.c`
 are adapted from Azahar's `nwm_uds.cpp` and `uds_beacon.cpp` at

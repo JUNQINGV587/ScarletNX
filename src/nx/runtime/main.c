@@ -6,6 +6,7 @@
 #include "nx/runtime/main.h"
 #include "common/cpu/recompiler/llvm/gdb_jit.h"
 #include "common/cpu/recompiler/llvm/ir.h"
+#include "common/cpu/recompiler/x64/x64_cache.h"
 #include "common/utilities/build_info.h"
 #include "common/utilities/program_start.h"
 #include "common/utilities/cli.h"
@@ -58,6 +59,7 @@
 #include "nx/runtime/platform/plat.h"
 #include "nx/runtime/platform/tracy.h"
 #include "nx/runtime/platform/ui.h"
+#include "nx/runtime/platform/wait_screen.h"
 #include "nx/runtime/platform/unattended.h"
 #include <errno.h>
 #include <stdint.h>
@@ -630,6 +632,11 @@ static void npdm_layout(void) {
         g_shader_sm86_dump = g_settings.sm86_dump[0] ? g_settings.sm86_dump : NULL;
         clock_ounce();
         LOG("npdm: an Ounce program\n");
+        /* An Ounce program's eight cores run best with no emulated core ordering: the ordering makes each guest thread
+           yield at SVC and poll points for the priority of the core it holds, which costs the CPU its threads contend
+           with the GPU thread for. One game's race went from 8 to 24 frames a second to 16 to 35 with this off.
+           emulated_cores_mode's Auto runs it Off (kernel_emulated_cores), named here; Off and On stay the player's */
+        options_kind_value("emulated_cores_mode", "0", "an Ounce program");
     }
     if (!g_arm_mod && (g_settings.memory_gb >= 12 || g_ounce)) mem_layout_large_heap();
     if (!g_arm_mod && g_ounce) {
@@ -687,13 +694,86 @@ static void read_npdm(void) {
 
 /* ---- exit ---- */
 
-void snx_save_before_exit(void) {
+/* The renderer's save as the game closes (Renderer.save(1)): it packs the shaders and pipelines the session made, 13 s
+   for 159 MiB of them on a Ryzen 5 7500F, the window still meanwhile. On the frontend's thread with the window seen it
+   runs on a thread of its own while this one keeps the window: past SNX_WAIT_CLOSING_MS a screen in the launcher's
+   loading look says how far it is, the inputs do nothing, and a second close stops it (wait_screen.h). Elsewhere
+   (headless, the window minimized or the app in the background, the game's own exit on its thread) it runs here, with
+   nothing shown, as before. The log says how long it took and whether the screen showed */
+static char g_closing_name[0x200]; /* the game as it is shown (game_shown), which the closing's screen names */
+typedef struct {
+    _Atomic int done;
+} ExitSave;
+static void exit_save(void* arg) {
+    g_renderer->save(1);
+    atomic_store_explicit(&((ExitSave*)arg)->done, 1, memory_order_release);
+}
+static void save_renderer(int frontend) {
+    ExitSave x = {0};
+    SnxClosing w = {.began_ms = plat_ns() / 1000000u};
+    SnxRunTheme theme = {0}, look;
+    int themed = 0, shown = 0;
+    if (!frontend || !g_renderer->saving || !backend_window_shown()) {
+        g_renderer->save(1);
+        return;
+    }
+    if (plat_thread(exit_save, &x, 0)) {
+        char why[256];
+        snx_os_error(why, sizeof why);
+        WARN("exit: no thread for the shader cache's save (%s): it runs with the window still, and no screen\n", why);
+        g_renderer->save(1);
+        return;
+    }
+    while (!atomic_load_explicit(&x.done, memory_order_acquire)) {
+        const int seen = backend_window_shown();
+        /* polled only while seen: Android holds an app's poll in the background until it comes back */
+        const int closes = seen ? backend_poll_closes() : 0;
+        const u64 now = plat_ns() / 1000000u;
+        if (snx_closing_pass(&w, now, closes, seen)) g_renderer->saving_stop();
+        if (w.shown) {
+            u64 total, packed, kept;
+            SnxPrepareStep st;
+            if (!themed) { /* the launcher's look, YoRHa's built in where it can't say, with the closing's title */
+                char* dir = snx_menu_run_theme ? backend_launcher_folder() : NULL;
+                if (dir) snx_menu_run_theme(dir, &theme);
+                free(dir);
+                prepare_screen_theme(theme.ink != theme.page ? &theme : NULL, &look);
+                snprintf(look.title, sizeof look.title, "%s", "CLOSING");
+                themed = 1;
+            }
+            g_renderer->saving(&total, &packed, &kept);
+            snx_closing_step(&w, total, packed, &st);
+            ui_lock();
+#if defined(__ANDROID__) /* no window to close there */
+            prepare_screen_set(&look, g_closing_name, &st, 1, NULL, 0,
+                               "Close the app to quit now. Unsaved shaders are lost.", now);
+#else
+            prepare_screen_set(&look, g_closing_name, &st, 1, NULL, 0,
+                               "Close again to quit now. Unsaved shaders are lost.", now);
+#endif
+            ui_unlock();
+            if (g_renderer->refresh) g_renderer->refresh();
+            shown = 1;
+        }
+        plat_sleep_ns(16000000);
+    }
+    if (w.stopped_ms) {
+        u64 total, packed, kept;
+        char said[256];
+        g_renderer->saving(&total, &packed, &kept);
+        snx_closing_said(&w, total, kept, said, sizeof said);
+        LOG("exit: %s\n", said);
+    }
+    LOG("exit: the shader cache's save took %llu ms, %s\n", (unsigned long long)(plat_ns() / 1000000u - w.began_ms),
+        shown ? "its screen shown" : "too quick for its screen");
+}
+void snx_save_before_exit(int frontend) {
     static PMutex lock = PMUTEX_INIT;
     static int saved;
     pm_lock(&lock);
     if (!saved) {
         save_hints();
-        if (g_renderer && g_renderer->save) g_renderer->save(1);
+        if (g_renderer && g_renderer->save) save_renderer(frontend);
         svc_core_exit();
         jit_report();
         kernel_core_report();
@@ -771,6 +851,29 @@ void resources_text(char* out, size_t size) {
     n = strlen(out);
     if (g_renderer && g_renderer->memory_blocks && n < size)
         snprintf(out + n, size - n, ", GPU memory blocks %llu MiB", (unsigned long long)(g_renderer->memory_blocks() >> 20));
+    n = strlen(out);
+    if (n < size) snprintf(out + n, size - n, ", guest %llu MiB", (unsigned long long)(used_memory() >> 20));
+}
+/* the guest's pages in files (guest_files), before the game allocates: the disk must hold the game's memory and 2 GiB
+   more, as the system writes the changed pages out */
+static void guest_files(void) {
+    if (!g_settings.guest_files) {
+        LOG("memory: guest pages are anonymous (guest_files=0)\n");
+        return;
+    }
+    char* dir = snx_temp_root();
+    if (!dir) {
+        LOG("memory: guest pages are anonymous: no temporary folder\n");
+        return;
+    }
+    char room[1024];
+    if (mem_files_room(dir, mem_total() + (2ull << 30), room, sizeof room))
+        LOG("memory: guest pages are anonymous: %s\n", room);
+    else if (mem_files_on(dir))
+        LOG("memory: guest pages are anonymous: their files in %s failed: %s\n", dir, strerror(errno));
+    else
+        LOG("memory: guest pages in unlinked files in %s (%s)\n", dir, room);
+    free(dir);
 }
 /* log level 2: the three host threads with the most CPU time since the last line, by their names. iOS reported a CPU
    exception (90 s of CPU in 93 s) that named no thread */
@@ -813,8 +916,10 @@ static void rate_plots(const RatePlot* p, unsigned n, u64 now_ns) {
     static u64 was[RATE_PLOTS];
     static u64 last_ns;
     double secs = last_ns ? (double)(now_ns - last_ns) / 1e9 : 0.0;
+    /* a back-to-back pair of ticks only microseconds apart would divide one event by a near zero span and show a
+       rate far above the whole run's count; below a frame's time the window has no meaning */
     for (unsigned i = 0; i < n; i++) {
-        if (secs > 0) SNX_PLOT(p[i].name, (double)(p[i].now - was[i]) / p[i].per / secs);
+        if (secs >= 0.01) SNX_PLOT(p[i].name, (double)(p[i].now - was[i]) / p[i].per / secs);
         was[i] = p[i].now;
     }
     last_ns = now_ns;
@@ -849,14 +954,14 @@ static void frontend_loop(void) {
     int frames = 0, stalls = 0, rate_frames = 0;
     while (!g_quit) {
         int shown, paused;
-        SNX_ZONE(z_frontend, "frontend tick");
+        SNX_ZONE_V(z_frontend, "runtime: frontend tick", tick);
         video_poll();
         options_tv_mode_update();
         /* the game's input and its display's vsync are guest work, which a pause holds back with the rest. The vsync
            due at this tick comes after the input; those between ticks come in vsync_until */
         paused = game_paused();
         if (!paused) {
-            SNX_ZONE(z_hid, "hid update");
+            SNX_ZONE(z_hid, "hle: hid update");
             [[maybe_unused]] u64 states = hid_update();
             SNX_ZONE_VALUE(z_hid, states);
             SNX_ZONE_END(z_hid);
@@ -942,7 +1047,7 @@ static void frontend_loop(void) {
         vsync = vsync_until(next, vsync, paused);
     }
     ini_poll(1); /* the settings the game's menu changed, even over an edit of the file */
-    snx_save_before_exit();
+    snx_save_before_exit(1);
     handover_write();
     LOG("Exit.\n");
     snx_tracy_shutdown();
@@ -971,6 +1076,7 @@ static void prepare_wait(const char* title) {
     u32 was = 0;
     int shown = 0, themed = 0, n = 0, stalls = 0;
     char ended[96] = "", how[96];
+    SNX_SECTION_SCOPED_C(snx_shader_prepare, "shader preparation", 2);
     if (g_settings.prepare_shaders != 2 || !g_renderer->prepare) return;
     g_renderer->prepare(&p);
     if (p.done) { /* nothing to make (shaders are recorded, or the renderer makes none) */
@@ -1456,6 +1562,7 @@ int snx_main(int argc, char** argv) {
     if (g_code_at && plat_thread(code_resident, (void*)(uintptr_t)g_code_at, 0))
         WARN("game: its code module is not read ahead: no thread for it (%s)\n", strerror(errno));
     title = game_shown(mod->title && mod->title[0] ? mod->title : g_exename, shown, sizeof shown, why, sizeof why);
+    snprintf(g_closing_name, sizeof g_closing_name, "%s", title);
 #if defined(SNX_TRACY)
     if (g_settings.tracy_profiler) g_opt_tracy_client = 1; /* the .ini's Debug section asks for the client */
     if (g_settings.tracy_capture) g_opt_tracy_capture = 1; /* and for a capture of the run */
@@ -1506,10 +1613,17 @@ int snx_main(int argc, char** argv) {
     snx_ir_volatile_memory(g_settings.volatile_load_stores);
     snx_ir_abi_contract(g_settings.abi_contract);
     snx_ir_diagnostics(g_settings.ir_stats, g_settings.ir_dump_pc);
+    snx_x64_cache_ceiling((SnxU64)g_settings.unit_cache_ceiling * 1000000ull);
     snx_ir_branch_profile(g_settings.ir_branch_profile);
 
     fs_init(keys, title_keys); /* the npdm is read through it, and mem_init's layout comes before */
     npdm_layout(); /* the address space type's layout and the larger heap, before mem_init sizes its blocks in it */
+    /* after npdm_layout, whose kind of program gives values of its own */
+    {
+        char named[sizeof g_exedir + sizeof g_exename];
+        snprintf(named, sizeof named, "%s%s", g_exedir, g_exename); /* the program's .abi says how its code was made */
+        options_perf_notice(named);
+    }
     free(keys);
     free(title_keys);
     keys = title_keys = NULL;
@@ -1523,12 +1637,14 @@ int snx_main(int argc, char** argv) {
         mem_fit(snx_memory_available(&available) && footprint, available, footprint);
     }
     mem_gb_said();
+    guest_files();
     kernel_init();
     plat_trap_waiting(kthread_fault_lend);
     dispatch_init();
     if (g_arm_mod) arm_dispatch_init();
     load_hints();
     {
+        SNX_SECTION_SCOPED_C(snx_game_load, "game load", 1);
         int loaded = loader_load();
         if (loaded == -2)
             fatal_code(SNX_EXIT_REMAKE,

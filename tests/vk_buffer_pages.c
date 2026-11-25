@@ -123,6 +123,8 @@ void rec_CmdFillBuffer(VkCommandBuffer cb, VkBuffer buf, VkDeviceSize off, VkDev
 void rec_CmdPipelineBarrier2(VkCommandBuffer cb, const VkDependencyInfo* d) { abort(); }
 void snx_thread_name(const char* name) { abort(); }
 void vk_all_barrier(VkCommandBuffer cb) { abort(); }
+/* owned.c's: the stages a buffer barrier names */
+VkPipelineStageFlags2 vk_buffer_stages(void) { return VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT; }
 VkResult vk_buffer_create(const VkBufferCreateInfo* info, const DevMemWant* allocation, VkBuffer* buffer,
                           DevMem* memory, DevMemInfo* details) {
     abort();
@@ -218,7 +220,9 @@ u64 vk_uma_import_in(u64 cpu, u64 end, u64* hi) { abort(); }
 u64 vk_uma_import_part(u64 cpu, u64 len, int* held) { abort(); }
 int vk_uma_imports_dear(void) { abort(); }
 int vk_uma_pending(u64 gva, u64 len) { abort(); }
-int vk_uma_write(u64 gva, u64 len, u64 align, VkBuffer* buf, u64* off) { abort(); }
+int vk_uma_write(u64 gva, u64 len, u64 align, int ordered, VkBuffer* buf, u64* off) { abort(); }
+void vk_uma_order_request(void) {}
+void vk_uma_ordered(void) {}
 void vk_uma_writes_abort(void) { abort(); }
 void vk_uma_writes_commit(void) { abort(); }
 void vk_unlock(void) { abort(); }
@@ -400,7 +404,23 @@ static void check_spans(u32 count) {
     }
 }
 
+/* guest memory marked written whole, as an unmap of it is (vk_mem_changed): a 4 MiB leaf of the write tracking that has
+   no table gets its newest generation alone, and the generations by address of its pages move as a page's stamp moves
+   them (addr_gens.h: the texture memo's headers are kept by them), and no other leaf's */
+static void check_leaf_generations(void) {
+    const u64 leaf = 1ull << WW_LEAF_SHIFT, at = 5 * leaf, beside = 16 * leaf;
+    u32 inside[3], outside, now;
+    for (u32 i = 0; i < 3; i++) CHECK(addr_gens_read(ADDR_GENS_CPU, at + (u64)i * 0x1FF000 + 0x40, 32, &inside[i]));
+    CHECK(addr_gens_read(ADDR_GENS_CPU, beside, 32, &outside));
+    ww_mark_pages(at, at + leaf);
+    CHECK(!g_wleaf[5] && g_wleaf_max[5] == g_wclock); /* no table was made for it */
+    for (u32 i = 0; i < 3; i++)
+        CHECK(addr_gens_read(ADDR_GENS_CPU, at + (u64)i * 0x1FF000 + 0x40, 32, &now) && now != inside[i]);
+    CHECK(addr_gens_read(ADDR_GENS_CPU, beside, 32, &now) && now == outside);
+}
+
 int main(void) {
+    check_leaf_generations();
     /* one run */
     for (u32 i = 0; i < NPAGES; i++) g_m.pte[i] = 0x100 + i;
     check_ranges();

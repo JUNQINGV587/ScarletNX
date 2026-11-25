@@ -82,9 +82,12 @@
      after a scan faulted every protected page in again: 16 ms for 32 MiB imported, against 0.3 ms. Write tracking
      can't tell there (vk_written_since), and its users compare the bytes. A dma-buf region's pages it watches as the
      rest of guest memory (Imp.tracked): the driver pinned them once, when the udmabuf was made, and leaves the CPU's
-     page table alone; mem_migrate's mapping is registered again (ww_remapped), and its first scan reports every page
-     written. The GPU's writes in place there reach the caches as everywhere, when their submit is done
-     (vk_uma_frame_done's gpu_mem_written_cpu), not through a scan. */
+     page table alone. A region made or gone is no write: the move keeps what the tracking says of each page
+     (plat_vm_share), and a region that goes marks none (imp_destroy). Marked written whole at either, a render target
+     drawn before, its pixels not yet in memory, read as older than memory: a racing game's colour grading table,
+     drawn once as eight targets in a page, loaded as zeros, and its race drew black under the HUD. The GPU's writes in
+     place there reach the caches as everywhere, when their submit is done (vk_uma_frame_done's gpu_mem_written_cpu),
+     not through a scan. */
 #include <errno.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -97,6 +100,7 @@
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/descriptor_heaps.h"
 #include "nx/gpu/vk/pending_pages.h"
+#include "nx/gpu/vk/uma_pages.h"
 #include "nx/gpu/renderer.h"
 #include "common/gpu/vk/vk_common.h"
 #include "nx/hle/services/nvdrv.h"
@@ -106,6 +110,7 @@
 #include "nx/runtime/platform/plat.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
+#include "nx/runtime/platform/tracy.h"
 #if defined(__ANDROID__)
 #include <vulkan/vulkan_android.h>
 #endif
@@ -127,6 +132,7 @@ typedef struct {
        of it; fd -1 for an import of guest memory where it is */
     int fd;
     void* handle;
+    int stuck;   /* its pages did not all move back (imp_let_go): tried again at a present alone */
     int tracked; /* a dma-buf region (imp_make_dmabuf): the driver leaves the CPU's page table alone, and scans watch it */
     u32 rid;     /* its table of pages (Rgn) while it is in the table, 0 for none */
 } Imp;
@@ -208,8 +214,10 @@ enum { UMA_FAST_DEAD, UMA_FAST_RUN, UMA_FAST_NONE, UMA_FAST_EDGE, UMA_FAST_BLK, 
    for the GPU (the hazard count), and the GPU thread again for the page table that those threads read */
 typedef struct {
     /* the GPU thread's, under vk_lock */
+    u32 max;          /* the imports the table takes where a test asks for fewer (vk_uma_table_max), 0: UMA_MAX */
     Imp imp[UMA_MAX]; /* sorted by cpu, none overlapping, nimp of them; their dead flags under lk */
     u32 nimp;
+    _Atomic u32 untracked; /* untracked_count's */
     Imp* gone; /* dropped from the table, the driver's until the submit that last read them is done: ngone of cap; their
                   entries and count under lk too */
     u32 ngone, capgone;
@@ -265,6 +273,10 @@ typedef struct {
     u64 wait_ns[4], wait_open[4]; /* wait_by's time, and those of them that finished the submission being recorded */
     /* order's barriers by what asked for them (UMA_ORDER_*), and those of them that ended a rendering pass */
     u64 order_n[3], order_pass[3];
+    /* the front end's storage barriers (vk_uma_order_request, vk_uma_ordered): the submission of the last barrier
+       that ordered the writes in place, whether the front end asked for one since, and the writes order left to them */
+    u64 order_sub, order_left;
+    int order_asked;
     u64 refused[VK_UMA_REFUSED_N]; /* the writes in place refused, by why (vk_uma_refused) */
     u64 merges, merged;            /* regions made over others (imp_get), and the others they took over */
     /* an aliasing draw's storage bound in place (vk_uma_cover, buffer.c's alias_in_place): imp_get makes no wait
@@ -272,6 +284,9 @@ typedef struct {
        each import or chunk made or gone, never set back: the group's buffers are one region's while it holds */
     int no_wait;
     u64 would_wait, regions;
+    /* imp_let_go publishes the targets watched over a region before its pages move: meanwhile no import goes or is made
+       (drop_dead, imp_get), as those would move the table under it and could let the same region go again */
+    int letting;
     /* the programs whose dispatches go to the GPU at once (vk_uma_read_soon): open addressing, 0 for a free slot */
     u64 soon[UMA_SOON_N];
     u32 nsoon;
@@ -305,6 +320,16 @@ static_assert(offsetof(Uma, lk) - offsetof(Uma, apart0) >= UMA_LINE &&
                   offsetof(Uma, hazards) - offsetof(Uma, apart1) >= UMA_LINE,
               "two groups of Uma share a cache line");
 static Uma g_uma = {.lk = PMUTEX_INIT, .align = 4096, .out_pages = {.also = &g_pend_any}};
+/* the count of what write tracking's scans leave alone (vk_uma_import_in): imports that are not dma-buf regions, dropped
+   ones not yet destroyed, chunks of GPU memory and their views. Counted again at each change of those lists, on the
+   thread that makes it; vk_uma_import_in reads it with no lock. Where it is 0, as with every import a dma-buf region,
+   the answer is that none is there: the lock it took for that was 2% of the renderer thread in an Ounce game's race */
+static void untracked_count(void) {
+    u32 n = g_uma.nchunk + g_uma.nview;
+    for (u32 i = 0; i < g_uma.nimp; i++) n += !g_uma.imp[i].tracked;
+    for (u32 i = 0; i < g_uma.ngone; i++) n += !g_uma.gone[i].tracked;
+    atomic_store_explicit(&g_uma.untracked, n, memory_order_release);
+}
 /* this thread's: vk_uma_gpu_reads, the caller copies the in-place writes pending on the GPU */
 static _Thread_local struct {
     int gpu_reads;
@@ -318,21 +343,31 @@ int vk_uma(void) { return g_vk.mem_path == VK_MEM_PATH_UMA; }
    each frame for them (8.5 frames a second on a Radeon 890M). Its vertex and index ranges held about 120 MB of those
    imports and its constant buffers about 40 MB; copied as on a discrete GPU, 90 MB stayed and the map ran at 14.9.
    What stays imported are the pages written in place and the dispatches' storage ranges, 16 MiB windows that are far
-   dearer copied (5 frames a second). AMD's driver on Windows has no amdgpu user pointers. uma_copies overrides it */
-/* a driver that takes every import's pages again at each submission */
-static int driver_imports_dear(u32 driver_id) {
-    switch (driver_id) {
-        case VK_DRIVER_ID_MESA_RADV:
-        case VK_DRIVER_ID_AMD_OPEN_SOURCE: return 1;
-#if defined(__linux__)
-        case VK_DRIVER_ID_AMD_PROPRIETARY: return 1;
-#endif
-        default: return 0;
-    }
-}
-int vk_uma_imports_dear(void) {
+   dearer copied (5 frames a second). The drivers that take every import's pages again at each submission are the
+   extension bans' off lines on VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT (g_vk.imports_dear). uma_copies
+   overrides it */
+static int imports_dear(void) {
     if (g_settings.guest_buffers_copied) return g_settings.guest_buffers_copied == 2; /* uma_copies */
-    return driver_imports_dear(g_vk.driver_id);
+    return g_vk.imports_dear;
+}
+/* A discrete GPU reads guest memory in place across the bus, where a copy in its own memory reads many times faster:
+   with vk_memory=2 on an RTX 4090, one game's race took 46 ms of GPU time a present against 11 ms copied (its compute
+   dispatches 34.5 against 10.0 ms a frame, its passes 10.1 against 2.2). There, with host imports, what the GPU only
+   reads is copied as where imports are dear: vertices, indices and constant buffers, and read-only storage too
+   (vk_uma_storage_copied). What the GPU writes, and what a write in place is pending over, stays in place. Through
+   dma-bufs, whose import costs a submission no lookup of its pages, the vertices, indices and constant buffers are read
+   in place, unless uma_copies copies them */
+static int uma_discrete(void) { return g_vk.mem_model != VK_MEM_UMA; }
+int vk_uma_through_dmabuf(void) { return g_uma.dmabuf; }
+int vk_uma_imports_dear(void) {
+    if (!g_settings.guest_buffers_copied && uma_discrete()) return !g_uma.dmabuf;
+    return imports_dear();
+}
+/* a draw's or a dispatch's read-only storage is copied where vk_uma_imports_dear copies vertices: on a discrete GPU with
+   host imports, unless uma_copies=1 reads it in place. Elsewhere it is read in place: on a GPU that shares memory, its
+   16 MiB windows were far dearer copied (5 frames a second on one, against 14.9) */
+int vk_uma_storage_copied(void) {
+    return uma_discrete() && !g_uma.dmabuf && g_settings.guest_buffers_copied != 1 && vk_uma_imports_dear();
 }
 u64 vk_uma_bound(void) { return g_uma.bound; }
 
@@ -408,13 +443,10 @@ static int rg_blk(const Rgn* r, u64 cpu, u64 len) {
     if (!r->nblk) return 0;
     const _Atomic u64 *f = rg_front(r), *pd = rg_pend(r);
     u64 p0 = (cpu - r->cpu) >> 12, p1 = (cpu + len - 1 - r->cpu) >> 12;
-    for (u64 wi = p0 >> 6; wi <= p1 >> 6; wi++) {
-        u64 a = wi << 6 > p0 ? p0 & 63 : 0, b = (wi << 6) + 63 < p1 ? 63 : p1 & 63;
-        u64 mask = (~0ull << a) & (~0ull >> (63 - b));
+    for (u64 wi = p0 >> 6; wi <= p1 >> 6; wi++)
         if ((atomic_load_explicit(&f[wi], memory_order_relaxed) | atomic_load_explicit(&pd[wi], memory_order_relaxed)) &
-            mask)
+            vk_uma_word_mask(wi, p0, p1))
             return 1;
-    }
     return 0;
 }
 /* word wi of r's front or pend bits becomes now (bits, 1 for front): nblk follows, and bgen moves for a bit gained */
@@ -683,8 +715,15 @@ static int mem_model(void) {
    (dear): a dma-buf's import costs a submission about a microsecond, where amdgpu faults in a host pointer's pages
    again at each. On a Steam Deck a submission took 20 us with 192 MB in three dma-bufs, 346 us with it in 48 host
    pointers, and one game's race held about 180 MB of imports, its recording thread 87% in the kernel */
-int vk_uma_way(int want, int how, int model, int has_import, int has_ahb, int has_dmabuf, int dear) {
-    if (want != 2 && (want != 0 || model != VK_MEM_UMA)) return VK_UMA_WITH_NONE;
+int vk_uma_way(int want, int how, int model, int has_import, int has_ahb, int has_dmabuf, int dear, int host_discrete) {
+    /* auto reads in place on a device that shares memory, and on a discrete one through dma-bufs where host imports are
+       dear: there an import of a host pointer cost a game's race about 258 ms, and froze its boot for 45 s. And on a
+       discrete GPU with host imports where the mirror can be (host_discrete, vk_uma_choose): what the GPU only reads
+       is copied there (vk_uma_storage_copied) and its programs write in the mirror, and one game's race took 9.2 ms of
+       GPU time a present against 10.9 ms copied, with no landing or write tracking for what is read in place */
+    const int auto_in_place =
+        model == VK_MEM_UMA || (has_dmabuf && dear && how != 1) || (host_discrete && has_import && how != 2);
+    if (want != 2 && (want != 0 || !auto_in_place)) return VK_UMA_WITH_NONE;
     if (how == 2) return has_ahb ? VK_UMA_WITH_AHB : has_dmabuf ? VK_UMA_WITH_DMABUF : VK_UMA_WITH_NONE;
     if (how == 0 && has_dmabuf && dear) return VK_UMA_WITH_DMABUF;
     if (has_import) return VK_UMA_WITH_HOST;
@@ -702,18 +741,34 @@ static int dmabuf_importable(void) {
     VkExternalMemoryFeatureFlags f = p.externalMemoryProperties.externalMemoryFeatures;
     return (f & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT) && !(f & VK_EXTERNAL_MEMORY_FEATURE_DEDICATED_ONLY_BIT);
 }
+/* Windows' discrete GPU with resizable BAR (the CPU maps all of its memory), where the mirror can be (mirror.c's
+   vk_mirror_on): sparse residency of buffers and room for the mirror's buffer, as big as guest memory's address space,
+   and an eighth more for its mask. Without the mirror a discrete GPU's programs write guest memory across the bus,
+   which took 18.5 ms of GPU time a present against 10.9 copied, and auto copies there; with a small BAR window, which
+   was not measured, too. Windows alone: Linux's discrete GPUs are amdgpu's dma-bufs, or untested. Any game: the
+   mirror takes the writes of the programs that log them (an Ounce game's SM86 programs), and the other storage that
+   draws and dispatches write is kept in the GPU's memory as on the copy path (buffer.c's copy_writable), where one
+   Maxwell game's world ran at 42 to 54 frames a second against 41 to 55 copied */
+static int host_discrete(void) {
+#if defined(_WIN32)
+    if (g_vk.mem_model != VK_MEM_REBAR) return 0;
+    VkPhysicalDeviceFeatures f;
+    VkPhysicalDeviceProperties p;
+    vkGetPhysicalDeviceFeatures(g_vk.phys, &f);
+    vkGetPhysicalDeviceProperties(g_vk.phys, &p);
+    return f.sparseBinding && f.sparseResidencyBuffer && p.limits.sparseAddressSpaceSize >= AS_SIZE + AS_SIZE / 8;
+#else
+    return 0;
+#endif
+}
 int vk_uma_choose(int has_import, int has_ahb, int has_placed, int has_dmabuf) {
     int want = g_settings.guest_memory, how = g_settings.guest_memory_in_place, with;
     g_vk.mem_model = mem_model();
-    /* the driver's, before the device is made (g_vk.driver_id comes after) */
-    VkPhysicalDeviceDriverProperties dp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
-    VkPhysicalDeviceProperties2 pp = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, .pNext = &dp};
-    vkGetPhysicalDeviceProperties2(g_vk.phys, &pp);
-    int dear = g_settings.guest_buffers_copied ? g_settings.guest_buffers_copied == 2 : driver_imports_dear(dp.driverID);
+    int dear = imports_dear();
     /* a region holds whole windows: a dma-buf that can't hold one is none */
-    u64 dmabuf_max = has_dmabuf && g_vk.mem_model == VK_MEM_UMA ? plat_dmabuf_limit() : 0;
+    u64 dmabuf_max = has_dmabuf && (g_vk.mem_model == VK_MEM_UMA || dear) ? plat_dmabuf_limit() : 0;
     int can_dmabuf = dmabuf_max >= UMA_WINDOW && dmabuf_importable();
-    with = vk_uma_way(want, how, g_vk.mem_model, has_import, has_ahb, can_dmabuf, dear);
+    with = vk_uma_way(want, how, g_vk.mem_model, has_import, has_ahb, can_dmabuf, dear, host_discrete());
     int ahb_held = with == VK_UMA_WITH_NONE && how == 0 && want == 0 && g_vk.mem_model == VK_MEM_UMA && has_ahb;
     g_vk.mem_path = with == VK_UMA_WITH_NONE ? VK_MEM_PATH_COPY : VK_MEM_PATH_UMA;
     if (with == VK_UMA_WITH_NONE && !ahb_held && (want == 2 || (want == 0 && g_vk.mem_model == VK_MEM_UMA))) {
@@ -795,13 +850,15 @@ static void imp_destroy(const Imp* m) {
     vkDestroyBuffer(g_vk.dev, m->buf, NULL);
     vkFreeMemory(g_vk.dev, m->mem, NULL);
     if (m->fd >= 0) plat_gpu_buffer_free(m->fd, m->handle, m->size); /* a region's, whose pages moved off it */
-    vk_mem_changed(m->cpu, m->size); /* no scan watched its pages: what the CPU wrote there meanwhile counts */
+    /* no scan watched its pages: what the CPU wrote there meanwhile counts. A dma-buf region's were watched */
+    if (!m->tracked) vk_mem_changed(m->cpu, m->size);
 }
 /* dropped import i destroyed, then out of the list, which write tracking reads (vk_lock held) */
 static void gone_out(u32 i) {
     imp_destroy(&g_uma.gone[i]);
     pm_lock(&g_uma.lk);
     g_uma.gone[i] = g_uma.gone[--g_uma.ngone];
+    untracked_count();
     pm_unlock(&g_uma.lk);
 }
 /* the dropped imports whose last reader is done are destroyed (vk_lock held) */
@@ -835,10 +892,12 @@ static void imp_drop(u32 i) {
         g_uma.capgone = cap;
     }
     g_uma.gone[g_uma.ngone++] = g_uma.imp[i];
+    untracked_count();
     g_uma.dropped++;
     g_uma.regions++;
     memmove(&g_uma.imp[i], &g_uma.imp[i + 1], sizeof *g_uma.imp * (size_t)(g_uma.nimp - i - 1));
     g_uma.nimp--;
+    untracked_count();
     pm_unlock(&g_uma.lk);
 }
 /* the import at i goes from the table (imp_drop), and a region's pages still in its buffer first move back into the
@@ -846,19 +905,61 @@ static void imp_drop(u32 i) {
    commands read the buffer as it was (vk_lock held) */
 static void region_writes_land(u64 lo, u64 hi);
 static int region_writes_wait(u64 lo, u64 hi);
-static void imp_let_go(u32 i) {
+static u32 imp_find(u64 cpu);
+/* 1 when the import at i went, 0 when it stays: a region with trapped pages where no publish may be (publish 0) */
+static int imp_let_go(u32 i, int publish) {
     const Imp* m = &g_uma.imp[i];
     int r;
+    if (m->stuck && !publish) return 0;
+    /* A watch over a render target on a region's pages (vk_own_watch) traps them, and the move back below copies them
+       under mem.c's lock and vk_lock. That copy faulted: the trap thread, which takes faults one at a time, waited in
+       another thread's landing there for vk_lock, and never took it. The targets pending there are published first, in
+       place, their copies done, and their watches go (mem_unmigrate). Only at the present (vk_uma_frame) or a let-go of
+       all (publish): elsewhere this runs in a draw's setup (bind, imp_get), which must not end its pass or wait for the
+       GPU, and there the region stays until the present. The publish can kill imports (vk_uma_owning): the region is
+       looked up again, and it is gone when it was let go meanwhile. mem_unmigrate lands what is left there */
+    if (m->fd >= 0 && own_trapped(m->cpu, m->size)) {
+        if (!publish || g_uma.letting || mem_lock_held()) return 0;
+        const u64 cpu = m->cpu, size = m->size;
+        g_uma.letting = 1;
+        vk_rt_publish_over(cpu, size);
+        region_writes_land(cpu, cpu + size); /* a dead region's too: its other pages move back with those bytes */
+        g_uma.letting = 0;
+        i = imp_find(cpu);
+        if (i >= g_uma.nimp || g_uma.imp[i].cpu != cpu || g_uma.imp[i].size != size) return 1;
+        m = &g_uma.imp[i];
+    }
     pm_lock(&g_uma.lk);
     int dead = m->dead;
     pm_unlock(&g_uma.lk);
     /* the writes in place still pending there land in its buffer first, which the move back copies; a dead one's pages
-       are other pages already, which waited for them (vk_uma_mapping_begin) */
+       are other pages already, and that change waited for those anywhere in it (vk_uma_mapping_begin, vk_uma_owning) */
     if (m->fd >= 0 && !dead) region_writes_land(m->cpu, m->cpu + m->size);
-    if (m->fd >= 0 && (r = mem_unmigrate(m->cpu, m->size)) != 0)
-        WARN("vulkan: guest memory %llx+%llx stays in the buffer it moved into (error %d) until it is unmapped\n",
-             (unsigned long long)m->cpu, (unsigned long long)m->size, r);
+    if (m->fd >= 0 && dead && region_writes_wait(m->cpu, m->cpu + m->size))
+        LOG_LIMIT(4,
+                  "vulkan: the region over guest memory %llx+%llx goes with writes in place pending: they land in its "
+                  "buffer alone, and memory keeps the bytes from before them\n",
+                  (unsigned long long)m->cpu, (unsigned long long)m->size);
+    u64 moved = 0;
+    if (m->fd >= 0 && (r = mem_unmigrate(m->cpu, m->size, &moved)) != 0) {
+        /* The pages that stay are the buffer's: own.c and mem.c read them through its view, so the import stays with it
+           (freed, they read unmapped memory). Where some went back it is dead, and holds the others alone (imp_holds).
+           Tried again at a present, not in each draw's setup: the try freezes its pages */
+        WARN_LIMIT(8,
+                   "vulkan: guest memory %llx+%llx stays in the buffer it moved into (error %d, %llu KiB of it moved "
+                   "back): it is tried again at a present\n",
+                   (unsigned long long)m->cpu, (unsigned long long)m->size, r, (unsigned long long)(moved >> 10));
+        pm_lock(&g_uma.lk);
+        g_uma.imp[i].stuck = 1;
+        if (moved) {
+            g_uma.imp[i].dead = 1;
+            atomic_store_explicit(&g_uma.any_dead, 1, memory_order_release);
+        }
+        pm_unlock(&g_uma.lk);
+        return 0;
+    }
     imp_drop(i);
+    return 1;
 }
 /* mem.c: host pages under guest memory [a, a + size) are other pages now (under its lock). The imports on them hold the
    old ones */
@@ -885,27 +986,48 @@ static void imp_kill(u32 i, int dead) {
     pm_lock(&g_uma.lk);
     memmove(&g_uma.imp[i], &g_uma.imp[i + 1], sizeof *g_uma.imp * (size_t)(g_uma.nimp - i - 1));
     g_uma.nimp--;
+    untracked_count();
     pm_unlock(&g_uma.lk);
     g_uma.dropped++;
     g_uma.regions++;
 }
-/* the dead ones go from the driver (vk_lock held) */
-static void drop_dead(void) {
+/* whether the import at i is dead (its pages are other pages now) */
+static int imp_dead(u32 i) {
     pm_lock(&g_uma.lk);
-    int any = atomic_load_explicit(&g_uma.any_dead, memory_order_relaxed);
-    atomic_store_explicit(&g_uma.any_dead, 0, memory_order_relaxed);
+    const int dead = g_uma.imp[i].dead;
     pm_unlock(&g_uma.lk);
-    if (!any) return;
-    for (u32 i = g_uma.nimp; i-- > 0;) {
-        pm_lock(&g_uma.lk);
-        int dead = g_uma.imp[i].dead;
-        pm_unlock(&g_uma.lk);
-        if (dead && g_uma.imp[i].fd >= 0)
-            imp_let_go(i); /* its buffer keeps the bytes recorded commands read: no hurry */
-        else if (dead)
-            imp_kill(i, 1);
-    }
+    return dead;
 }
+/* the dead ones go from the driver (vk_lock held), the last first; a region under a watch only where it may publish
+   (imp_let_go). Not while a region's let-go publishes (letting). A let-go can take other imports with it, so each is
+   looked for again. any_dead stays set while a dead one is left, and until the end: the fast path (vk_uma_read) reads
+   no region then, and bind's imp_get takes a dead one only for the pages it still holds */
+/* whether the import at i holds [cpu, cpu + len) (in it) still: alive, or a dead region whose pages there nothing
+   replaced, its buffer's pages side by side (mem_ext_is). A dead region under a watch stays until the present
+   (imp_let_go), and the GPU reads and writes what it still holds in place as before */
+static int imp_holds(u32 i, u64 cpu, u64 len) {
+    if (!imp_dead(i)) return 1;
+    const Imp* m = &g_uma.imp[i];
+    return m->tracked && !mem_lock_held() && mem_ext_is(cpu, len, (const u8*)m->handle + (cpu - m->cpu));
+}
+static void dead_go(int publish) {
+    if (g_uma.letting || !atomic_load_explicit(&g_uma.any_dead, memory_order_acquire)) return;
+    for (u32 i = g_uma.nimp; i-- > 0;) {
+        if (i >= g_uma.nimp) i = g_uma.nimp - 1;
+        if (!imp_dead(i)) continue;
+        if (g_uma.imp[i].fd >= 0)
+            imp_let_go(i, publish); /* its buffer keeps the bytes recorded commands read: no hurry */
+        else
+            imp_kill(i, 1);
+        if (!g_uma.nimp) break;
+    }
+    pm_lock(&g_uma.lk);
+    int left = 0;
+    for (u32 i = 0; i < g_uma.nimp && !left; i++) left = g_uma.imp[i].dead;
+    atomic_store_explicit(&g_uma.any_dead, left, memory_order_release);
+    pm_unlock(&g_uma.lk);
+}
+static void drop_dead(void) { dead_go(0); }
 /* the first import that ends after cpu */
 static u32 imp_find(u64 cpu) {
     u32 lo = 0, hi = g_uma.nimp;
@@ -1084,6 +1206,7 @@ static void chunk_give_back(u32 i) {
     g_uma.cgone[g_uma.ncgone++] = c;
     memmove(&g_uma.chunk[i], &g_uma.chunk[i + 1], sizeof *g_uma.chunk * (size_t)(g_uma.nchunk - i - 1));
     g_uma.nchunk--;
+    untracked_count();
     pm_unlock(&g_uma.lk);
     g_uma.chunks_gone++;
     g_uma.regions++;
@@ -1131,6 +1254,7 @@ static int placed_commit(u64 a, u64 size) {
     memmove(&g_uma.chunk[i + 1], &g_uma.chunk[i], sizeof *g_uma.chunk * (size_t)(g_uma.nchunk - i));
     g_uma.chunk[i] = m;
     g_uma.nchunk++;
+    untracked_count();
     pm_unlock(&g_uma.lk);
     g_uma.chunks_made++;
     g_uma.regions++;
@@ -1160,6 +1284,7 @@ static void view_unmap(u64 a, u64 size) {
             g_uma.view[i] = (View){v.dst, v.src, lo - v.dst};
             g_uma.view[i + 1] = (View){hi, v.src + (hi - v.dst), v.dst + v.size - hi};
             g_uma.nview++;
+            untracked_count();
             i += 2;
         } else if (v.dst < lo) { /* its head stays */
             g_uma.view[i].size = lo - v.dst;
@@ -1170,6 +1295,7 @@ static void view_unmap(u64 a, u64 size) {
         } else { /* all of it */
             memmove(&g_uma.view[i], &g_uma.view[i + 1], sizeof *g_uma.view * (size_t)(g_uma.nview - i - 1));
             g_uma.nview--;
+            untracked_count();
         }
         pm_unlock(&g_uma.lk);
     }
@@ -1248,6 +1374,7 @@ static int placed_view(u64 dst, u64 src, u64 size) {
         memmove(&g_uma.view[i + 1], &g_uma.view[i], sizeof *g_uma.view * (size_t)(g_uma.nview - i));
         g_uma.view[i] = (View){dst + at, s, n};
         g_uma.nview++;
+        untracked_count();
         pm_unlock(&g_uma.lk);
         at += n;
     }
@@ -1412,7 +1539,14 @@ static const char* region_make(Imp* m, u64 cpu, u64 size) {
         plat_gpu_buffer_free(fd, handle, size);
         return snx_vk_result_str(g_uma.import_result);
     }
-    if ((r = mem_migrate(cpu, size, fd)) != 0) {
+    /* a mapping of the memfd's pages (plat_gpu_buffer), which own.c reads a watch's bytes through; an
+       AHardwareBuffer has none */
+#if defined(__ANDROID__)
+    u8* view = NULL;
+#else
+    u8* view = (u8*)handle;
+#endif
+    if ((r = mem_migrate(cpu, size, fd, view)) != 0) {
         vkDestroyBuffer(g_vk.dev, m->buf, NULL);
         vkFreeMemory(g_vk.dev, m->mem, NULL);
         plat_gpu_buffer_free(fd, handle, size);
@@ -1457,7 +1591,9 @@ static int imp_can(u64 lo, u64 hi) {
    copied) */
 static u32 imp_get(u64 cpu, u64 len) {
     u32 i = imp_find(cpu);
-    if (i < g_uma.nimp && g_uma.imp[i].cpu <= cpu && cpu + len <= g_uma.imp[i].cpu + g_uma.imp[i].size) return i;
+    if (i < g_uma.nimp && g_uma.imp[i].cpu <= cpu && cpu + len <= g_uma.imp[i].cpu + g_uma.imp[i].size)
+        return imp_holds(i, cpu, len) ? i : ~0u; /* a dead one only for the pages it still holds: else copied */
+    if (g_uma.letting) return ~0u; /* a region's let-go publishes (imp_let_go): copied */
     /* the windows the range touches, and the imports they meet, as one import. Not over a chunk of placed memory,
        which the driver maps already: a range across its edge is copied */
     u64 lo = cpu & ~(UMA_WINDOW - 1), hi = (cpu + len + UMA_WINDOW - 1) & ~(UMA_WINDOW - 1);
@@ -1490,15 +1626,23 @@ static u32 imp_get(u64 cpu, u64 len) {
         g_uma.imp_why[hi - lo > cap ? 3 : 4]++;
         return ~0u;
     }
-    if (g_uma.nimp - (last - first) >= UMA_MAX) { /* full: the least recently used goes */
-        u32 old = 0;
-        for (u32 k = 1; k < g_uma.nimp; k++)
-            if ((i32)(g_uma.imp[k].used - g_uma.imp[old].used) < 0) old = k;
+    if (g_uma.nimp - (last - first) >= (g_uma.max ? g_uma.max : UMA_MAX)) { /* full: the least recently used goes */
+        /* of those with no page trapped: a region under a watch stays until the present (imp_let_go), and the table
+           stayed full, every new range copied, for as long as the oldest one was such. All trapped: the oldest */
+        u32 old = 0, pick = g_uma.nimp;
+        for (u32 k = 0; k < g_uma.nimp; k++) {
+            const Imp* c = &g_uma.imp[k];
+            if ((i32)(c->used - g_uma.imp[old].used) < 0) old = k;
+            if ((pick == g_uma.nimp || (i32)(c->used - g_uma.imp[pick].used) < 0) && !c->stuck &&
+                (c->fd < 0 || !own_trapped(c->cpu, c->size)))
+                pick = k;
+        }
+        if (pick < g_uma.nimp) old = pick;
         if (g_uma.no_wait && region_writes_wait(g_uma.imp[old].cpu, g_uma.imp[old].cpu + g_uma.imp[old].size)) {
             g_uma.would_wait++;
             return ~0u;
         }
-        imp_let_go(old);
+        imp_let_go(old, 0); /* one under a watch stays until the present */
         g_uma.imp_why[5]++;
         return ~0u; /* the indexes moved: the next lookup makes it */
     }
@@ -1552,6 +1696,7 @@ static u32 imp_get(u64 cpu, u64 len) {
     memmove(&g_uma.imp[first + 1], &g_uma.imp[first], sizeof *g_uma.imp * (size_t)(g_uma.nimp - first));
     g_uma.imp[first] = m;
     g_uma.nimp++;
+    untracked_count();
     g_uma.regions++;
     pm_unlock(&g_uma.lk);
     if (opened) plat_ww_close(GP(lo), hi - lo);
@@ -1560,7 +1705,7 @@ static u32 imp_get(u64 cpu, u64 len) {
 
 /* ------------------------------------------------------------ the renderer's side */
 static void hz_mark(u64 cpu, u64 len);
-static void order(u64 cpu, u64 len, int write);
+static void order(u64 cpu, u64 len, int write, int ordered);
 static void note_read(u64 cpu, u64 len);
 static int bind(u64 cpu, u64 len, u64 align, VkBuffer* buf, u64* off);
 /* The GPU range [gva, gva + len) bound where it is in guest memory, at an offset that is a multiple of align: 1 with
@@ -1580,7 +1725,7 @@ int vk_uma_get(u64 gva, u64 len, u64 align, VkBuffer* buf, u64* off) {
         return 0;
     }
     if (!bind(cpu, len, align, buf, off)) return 0;
-    order(cpu, len, 0);
+    order(cpu, len, 0, 1);
     note_read(cpu, len);
     return 1;
 }
@@ -1647,7 +1792,7 @@ static void read_in(const Rgn* r, u64 cpu, u64 len, int ordered, VkBuffer* buf, 
     g_uma.hits++;
     g_uma.hit_bytes += len;
     hz_mark(cpu, len);
-    if (ordered) order(cpu, len, 0);
+    if (ordered) order(cpu, len, 0, 1);
     note_read(cpu, len);
 }
 int vk_uma_read(u64 gva, u64 len, u64 align, VkBuffer* buf, u64* off) {
@@ -1734,10 +1879,15 @@ u64 vk_uma_check_diffs(void) { return g_uma.check_diffs; }
 /* ------------------------------------------------------------ writes in place */
 /* A barrier before what reads [cpu, cpu + len) in place, when it was written in place since the last one, or before
    what writes it, when it was read or written: the console's GPU runs its work in order. Outside a rendering pass,
-   which a barrier for these stages can't be recorded in */
+   which a barrier for these stages can't be recorded in.
+   A write (ordered 0) over what was read or written since the last barrier, all of it in this submission, gets none
+   while the front end gives its own storage barriers (nvn_storage_order 1 and 2) and asked for none since: draws may
+   overlap there, as on the copies' path (buffer.c's gfx_gpu_src). With a barrier for each, one game's world ended
+   160 rendering passes a present here, nearly all of them for draws that wrote the same range one after another. A
+   read of a write still gets its barrier */
 static const Out* newest_out(u64 cpu, u64 n);
 enum { UMA_ORDER_NOW, UMA_ORDER_BEFORE, UMA_ORDER_OVER }; /* order_n's: what the barrier is for */
-static void order(u64 cpu, u64 len, int write) {
+static void order(u64 cpu, u64 len, int write, int ordered) {
     const u64 since = g_uma.barrier_no;
     const int written = st_since(UMA_WSEQ, cpu, len, since);
     const int read = write && st_since(UMA_RSEQ, cpu, len, since);
@@ -1747,6 +1897,10 @@ static void order(u64 cpu, u64 len, int write) {
             check_differs(write ? "a write's barrier" : "a read's barrier", cpu, len, written || read, was);
     }
     if (!written && !read) return;
+    if (write && !ordered && !g_uma.order_asked && g_uma.order_sub == vk_submit_number()) {
+        g_uma.order_left++;
+        return;
+    }
     /* the statistics: a write over a read or a write, else a read of a write still pending in the submission being
        recorded, or of one from an earlier submission (pending or done), which the last barrier came before. The pages
        are what the tables stamp */
@@ -1759,9 +1913,19 @@ static void order(u64 cpu, u64 len, int write) {
     g_uma.order_n[why]++;
     if (vk_render_begun()) g_uma.order_pass[why]++;
     vk_render_end();
-    vk_all_barrier(vk_cmd());
+    vk_all_barrier_by(VK_BAR_UMA, vk_cmd());
     g_uma.barrier_no++;
     g_uma.barriers++;
+    g_uma.order_sub = vk_submit_number();
+    g_uma.order_asked = 0;
+}
+void vk_uma_order_request(void) { g_uma.order_asked = 1; }
+u64 vk_uma_barrier_count(void) { return g_uma.barriers; }
+void vk_uma_ordered(void) {
+    if (!vk_uma()) return;
+    g_uma.barrier_no++;
+    g_uma.order_sub = vk_submit_number();
+    g_uma.order_asked = 0;
 }
 static void note_read(u64 cpu, u64 len) {
     Seen* m = &g_uma.rmemo[(u32)(((cpu ^ (len << 32)) * 0x9E3779B97F4A7C15ull) >> 56)];
@@ -1771,7 +1935,7 @@ static void note_read(u64 cpu, u64 len) {
     if (g_uma.chk) write_pages_stamp(&g_uma.chk->read, cpu, len, g_uma.barrier_no + 1);
 }
 void vk_uma_refused(int why) { g_uma.refused[why]++; }
-int vk_uma_write(u64 gva, u64 len, u64 align, VkBuffer* buf, u64* off) {
+int vk_uma_write(u64 gva, u64 len, u64 align, int ordered, VkBuffer* buf, u64* off) {
     u64 cpu = 0;
     if (!vk_uma()) return 0;
     if (!len || gmmu_run(gva, len, &cpu) < len) {
@@ -1792,7 +1956,7 @@ int vk_uma_write(u64 gva, u64 len, u64 align, VkBuffer* buf, u64* off) {
         g_uma.refused[why]++;
         return 0;
     }
-    order(cpu, len, 1);
+    order(cpu, len, 1, ordered);
     g_uma.prep[g_uma.nprep++] = (Out){gva, cpu, len, 0};
     return 1;
 }
@@ -1875,7 +2039,7 @@ void vk_uma_frame_done(u64 frame) {
 void vk_uma_host_barrier(VkCommandBuffer cb, u64 frame) {
     if (!g_uma.nout || g_uma.out[g_uma.nout - 1].sub != frame) return;
     VkMemoryBarrier2 b = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
-                          .srcStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                          .srcStageMask = vk_buffer_stages(), /* the writes in place of buffers' writers */
                           .srcAccessMask = VK_ACCESS_2_MEMORY_WRITE_BIT,
                           .dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT,
                           .dstAccessMask = VK_ACCESS_2_HOST_READ_BIT};
@@ -1926,28 +2090,37 @@ static void wait_out_why(const Out* o, int why) {
     const u64 sub = o->sub, t0 = plat_ns();
     atomic_fetch_add_explicit(&g_uma.wait_by[why], 1, memory_order_relaxed);
     g_uma.out_waits++;
+    /* vk_uma_mem_need_cpu's callers (a video decoder's and VIC's picture) hold nothing of the frame across it: the
+       thread that records the frame takes vk_lock meanwhile, where that wait held it up for each picture of a video */
+    const int let_go = why == 2; /* mem-need-cpu */
     if (sub > vk_last_submit()) {
         g_uma.open_waits++;
         g_uma.wait_open[why]++;
         read_soon_add(o->prog);
-        vk_finish();
+        if (let_go)
+            vk_finish_letting_go();
+        else
+            vk_finish();
     } else {
+        const int paused = let_go && vk_lock_pause();
         vk_wait_submit(sub);
+        vk_lock_resume(paused);
         vk_land_through(sub);
     }
     g_uma.wait_ns[why] += plat_ns() - t0;
 }
 /* The writes in place pending in the regions over guest memory [lo, hi) done, before their pages change or move back:
    a region's buffer is the guest's memory until then, and its readers are waited for by nobody (quiesce), as the buffer
-   keeps the bytes they read; a write landing after the change would land in the buffer alone (vk_lock held) */
+   keeps the bytes they read; a write landing after the change would land in the buffer alone (vk_lock held). Those
+   anywhere in such a region, not only over [lo, hi): a page of it that changes takes the whole region with it
+   (pages_replaced), and its other pages move back with the bytes the buffer holds then (imp_let_go) */
 static const Out* region_writes_newest(u64 lo, u64 hi) {
     const Out* newest = NULL;
     if (!atomic_load_explicit(&g_uma_any, memory_order_relaxed)) return NULL;
     for (u32 i = 0; i < g_uma.nimp; i++) {
         const Imp* m = &g_uma.imp[i];
         if (m->fd < 0 || m->cpu >= hi || lo >= m->cpu + m->size) continue;
-        u64 a = m->cpu > lo ? m->cpu : lo, b = m->cpu + m->size < hi ? m->cpu + m->size : hi;
-        newest = newer_out(newest, newest_out(a, b - a));
+        newest = newer_out(newest, newest_out(m->cpu, m->size));
     }
     return newest;
 }
@@ -1982,12 +2155,28 @@ void vk_uma_mem_need_cpu(u64 cpu, u64 len) {
     vk_unlock();
 }
 void vk_uma_gpu_reads(int on) { t_uma.gpu_reads = on; }
+/* a question with no change: a dead import (its pages other pages now) holds nothing, and goes at the next drop_dead.
+   Letting it go here moved the pages of a region under a watch from rt_watch (vk_own_watch), with vk_lock held */
 int vk_uma_held(u64 cpu, u64 len) {
     if (!vk_uma() || !len) return 0;
     if (g_uma.nchunk && placed_of(&cpu, len)) return 1;
-    drop_dead();
     u32 i = imp_find(cpu);
-    return i < g_uma.nimp && g_uma.imp[i].cpu <= cpu && cpu + len <= g_uma.imp[i].cpu + g_uma.imp[i].size;
+    return i < g_uma.nimp && g_uma.imp[i].cpu <= cpu && cpu + len <= g_uma.imp[i].cpu + g_uma.imp[i].size &&
+           imp_holds(i, cpu, len);
+}
+int vk_uma_region_held(u64 cpu, u64 len) {
+    if (!vk_uma() || !len || cpu + len < cpu) return 0;
+    if (g_uma.nchunk && chunk_meets(cpu, cpu + len)) return 0;
+    for (u64 at = cpu, end = cpu + len; at < end;) { /* no change, as vk_uma_held */
+        const u32 i = imp_find(at);
+        if (i >= g_uma.nimp) return 0;
+        const Imp* m = &g_uma.imp[i];
+        if (m->cpu > at || !m->tracked) return 0; /* a gap, or an import of guest memory where it is */
+        const u64 to = m->cpu + m->size < end ? m->cpu + m->size : end;
+        if (!imp_holds(i, at, to - at)) return 0; /* dead, and not its pages there */
+        at = m->cpu + m->size;
+    }
+    return 1;
 }
 int vk_uma_none_why(u64 cpu, u64 len) {
     if (!vk_uma() || !len) return VK_UMA_NONE_OFF;
@@ -2004,20 +2193,19 @@ int vk_uma_none_why(u64 cpu, u64 len) {
 int vk_uma_publish(u64 cpu, u64 len, VkBuffer src, u64 off) {
     VkBuffer ib;
     u64 io;
-    /* bind, which asks imp_get for the import and makes it when there is none: asked for one first (vk_uma_held),
-       this could never make the first one, and answered 0 for every span that had none, which the caller then
-       landed as a readback of its own with a wait for the queue. 0 stands for no import to be had.
-       An open rendering pass takes it too: the copy is recorded outside one, and ending the pass for it broke the pass
-       a frame's draws share, a samples report after every draw ending it once each */
-    if (!vk_uma() || vk_render_open() || !bind(cpu, len, 1, &ib, &io)) return 0;
+    if (!vk_uma_held(cpu, len) || !bind(cpu, len, 1, &ib, &io)) return 0; /* no import made for it */
+    /* a landing the import takes instead of a trap: the bytes copied into it, and why there was no trap */
+    SNX_ZONE_T(z, "vk mem uma publish", "%s", "no owner or trap, import holds the bytes");
+    SNX_ZONE_VALUE(z, len);
     vk_render_end();
     VkCommandBuffer cb = vk_cmd();
-    vk_all_barrier(cb); /* the producer's writes, and what read or wrote the bytes in place before, first */
+    vk_all_barrier_by(VK_BAR_UMA,
+                      cb); /* the producer's writes, and what read or wrote the bytes in place before, first */
     VkBufferCopy c = {off, io, len};
     rec_CmdCopyBuffer(cb, src, ib, 1, &c);
     /* and what comes after it, before it is set up: a draw that reads the result in the next pass reads it there,
        with no barrier of its own to end that pass for (order) */
-    vk_all_barrier(cb);
+    vk_all_barrier_by(VK_BAR_UMA, cb);
     out_add(0, cpu, len);
     g_uma.barrier_no += 2;
     g_uma.barriers += 2;
@@ -2160,13 +2348,13 @@ void vk_uma_init(void) {
 /* each present (vk_lock held): imports unused for long go, and every 600 presents the statistics */
 void vk_uma_frame(void) {
     if (!vk_uma()) return;
-    drop_dead();
+    dead_go(1); /* the regions under a watch too: no draw is being set up */
     gone_reap();
     chunk_reap();
     rgn_reap();
     if (g_vk_present % 60 == 0)
-        for (u32 i = g_uma.nimp; i-- > 0;)
-            if ((u32)(g_vk_present - g_uma.imp[i].used) > UMA_IDLE) imp_let_go(i);
+        for (u32 i = g_uma.nimp; i-- > 0;) /* a let-go can take others with it (imp_let_go) */
+            if (i < g_uma.nimp && (u32)(g_vk_present - g_uma.imp[i].used) > UMA_IDLE) imp_let_go(i, 1);
     if (g_vk_present % 600) return;
     u64 bytes = 0;
     for (u32 i = 0; i < g_uma.nimp; i++) bytes += g_uma.imp[i].size;
@@ -2206,7 +2394,7 @@ void vk_uma_frame(void) {
        in place, each a finish when the write was not submitted yet */
     LOG("vulkan:   order of the reads and writes in place, a present: %.2f barriers before a read of this "
         "submission's write (%.2f ended a pass), %.2f of an earlier submission's (%.2f), %.2f before a write over a "
-        "read or write (%.2f); writes in place refused over 600 presents: %llu a result pending, %llu owned, %llu "
+        "read or write (%.2f), %.2f writes left to the front end's barriers; writes in place refused over 600 presents: %llu a result pending, %llu owned, %llu "
         "compute pending, %llu storage image, %llu release, %llu not one run, %llu draw full, %llu runtime-written "
         "(front), %llu no import; %llu regions merged (%llu taken over); waits for writes in place: %llu region "
         "(%.1f ms, %llu finishes), %llu mem-need (%.1f ms, %llu), %llu mem-need-cpu (%.1f ms, %llu), %llu "
@@ -2214,7 +2402,7 @@ void vk_uma_frame(void) {
         (double)g_uma.order_n[UMA_ORDER_NOW] / 600, (double)g_uma.order_pass[UMA_ORDER_NOW] / 600,
         (double)g_uma.order_n[UMA_ORDER_BEFORE] / 600, (double)g_uma.order_pass[UMA_ORDER_BEFORE] / 600,
         (double)g_uma.order_n[UMA_ORDER_OVER] / 600, (double)g_uma.order_pass[UMA_ORDER_OVER] / 600,
-        (unsigned long long)g_uma.refused[VK_UMA_REFUSED_RESULT],
+        (double)g_uma.order_left / 600, (unsigned long long)g_uma.refused[VK_UMA_REFUSED_RESULT],
         (unsigned long long)g_uma.refused[VK_UMA_REFUSED_OWNED],
         (unsigned long long)g_uma.refused[VK_UMA_REFUSED_COMPUTE],
         (unsigned long long)g_uma.refused[VK_UMA_REFUSED_IMAGE],
@@ -2257,6 +2445,7 @@ void vk_uma_frame(void) {
     memset(g_uma.fast_miss, 0, sizeof g_uma.fast_miss);
     memset(g_uma.order_n, 0, sizeof g_uma.order_n);
     memset(g_uma.order_pass, 0, sizeof g_uma.order_pass);
+    g_uma.order_left = 0;
     memset(g_uma.refused, 0, sizeof g_uma.refused);
     memset(g_uma.wait_ns, 0, sizeof g_uma.wait_ns);
     memset(g_uma.wait_open, 0, sizeof g_uma.wait_open);
@@ -2324,7 +2513,7 @@ void vk_uma_mapping_end(void) {
 u64 vk_uma_import_in(u64 cpu, u64 end, u64* hi) {
     u64 lo = end;
     *hi = end;
-    if (!vk_uma() || cpu >= end) return end;
+    if (!vk_uma() || cpu >= end || !atomic_load_explicit(&g_uma.untracked, memory_order_acquire)) return end;
     pm_lock(&g_uma.lk);
     /* the first import a scan leaves alone: not a dma-buf region, whose pages the driver doesn't take again at each
        submission (an ordinary shared mapping of a memfd, which a scan protects and watches, as wp.c's probe found on
@@ -2429,14 +2618,17 @@ void vk_uma_before_write(u64 gva, u64 len) {
         len -= n;
     }
 }
-/* a save state's load: every import goes */
+void vk_uma_table_max(u32 n) { g_uma.max = n < UMA_MAX ? n : 0; }
+/* a save state's load: every import goes, but a region the host cannot move back (imp_let_go) */
 void vk_uma_forget_all(void) {
-    for (u32 i = g_uma.nimp; i-- > 0;) imp_let_go(i);
+    for (u32 i = g_uma.nimp; i-- > 0;) /* a let-go can take others with it (imp_let_go) */
+        if (i < g_uma.nimp) imp_let_go(i, 1);
 }
 int vk_uma_can_dmabuf(void) { return vk_uma() && g_uma.can_dmabuf; }
 int vk_uma_migrate(int on) {
     if (!vk_uma() || (on == 2 && !g_uma.can_dmabuf)) return 0;
-    for (u32 i = g_uma.nimp; i-- > 0;) imp_let_go(i); /* the other way's go first */
+    for (u32 i = g_uma.nimp; i-- > 0;) /* the other way's go first */
+        if (i < g_uma.nimp) imp_let_go(i, 1);
     g_uma.migrate = on != 0;
     g_uma.dmabuf = on == 2;
     g_uma.region_max = on == 2 && g_uma.dmabuf_max < UMA_REGION_MAX ? g_uma.dmabuf_max : UMA_REGION_MAX;

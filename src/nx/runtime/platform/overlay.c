@@ -1,13 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 #include "nx/runtime/platform/overlay.h"
+#include "nx/runtime/platform/ctrl_applet.h"
+#include "nx/runtime/platform/tracy.h"
 #include "nx/runtime/platform/backend.h"
 #include "nx/runtime/platform/fatal_screen.h"
 #include "nx/runtime/platform/gamepad.h"
 #include "nx/runtime/platform/hotkeys.h"
+#include "nx/runtime/platform/hud.h"
 #include "nx/runtime/platform/plat.h" /* the notices' lock */
 #include "nx/runtime/platform/prepare_screen.h"
 #include "nx/runtime/platform/stats.h"
+#include "nx/runtime/platform/unattended.h"
 #include "nx/runtime/platform/vpad.h"
 #include "nx/runtime/options.h"
 #include "nx/gpu/renderer.h"
@@ -102,7 +106,7 @@ static int entry_rows(int e) {
     return n;
 }
 enum { S_SAVE, S_LOAD, S_DELETE, S_BACK, S_COUNT };              /* a slot's page's, the auto slot without Save */
-enum { P_PLAYER, P_SWAP, P_DEADZONE, P_RUMBLE, P_BACKGROUND, P_MAP, P_BACK, P_COUNT }; /* the gamepads' page's */
+enum { P_PLAYER, P_SWAP, P_DEADZONE, P_RUMBLE, P_BACKGROUND, P_MAP, P_ASSIGN, P_BACK, P_COUNT }; /* the gamepads' */
 /* the controls page's items */
 enum {
     C_SHOW,
@@ -137,6 +141,7 @@ static const char* const PADS[P_COUNT] = {SNX_GAMEPAD_PLAYERS,
                                           "gamepad_rumble",
                                           "gamepad_background",
                                           SNX_GAMEPAD_MAP,
+                                          "Assign players",
                                           "Back"};
 /* F1's page: the runtime's keys as set (hotkeys.h; backend/sdl3.c's hotkey and menu_event) and the game's buttons on
    the keyboard (its keymap), a row each with the icon the launcher's F1 box gives what it does (src/gui/main.c's
@@ -155,7 +160,7 @@ static const struct {
             {GUI_ICON_SAVE, HOTKEY_SAVE_STATE, NULL, "save to the slot"},
             {GUI_ICON_ROTATE_CCW, HOTKEY_LOAD_STATE, NULL, "load the slot"},
             {GUI_ICON_LAYERS, HOTKEY_NEXT_SLOT, NULL, "the next slot"},
-            {GUI_ICON_BUG, HOTKEY_TRACY, NULL, "Tracy, 60 s"}, /* a build with SNX_TRACY has its key */
+            {GUI_ICON_BUG, HOTKEY_TRACY, NULL, "Tracy capture"}, /* a build with SNX_TRACY has its key */
             {GUI_ICON_PLAY, HOTKEY_PAUSE, NULL, "pause, resume"},
             {GUI_ICON_MONITOR, HOTKEY_FULLSCREEN, NULL, "fullscreen"}, /* with its second key */
             {GUI_ICON_ACTIVITY, HOTKEY_STATS, NULL, "stats off/on"},
@@ -227,7 +232,13 @@ static int page, focus, top; /* top: the first item showing */
 static OverlaySlot slots[OVERLAY_SLOTS_MAX];
 static int nslots = 1, slot_at, ask, slots_stale;
 /* what the question asks besides the OVERLAY_ codes it gives back: the on-screen controls put back */
-enum { ASK_RESET = -1, ASK_CLEAN = -2 };
+enum { ASK_RESET = -1, ASK_CLEAN = -2, ASK_RECORD = -3 };
+/* the Save states page's rows after the slots: player 1's input recorded to a slot and one played back (unattended.h),
+   then Back. The arrows choose the slot a row shows (0 none, else 1 to 9) and nothing happens before Enter takes it */
+enum { T_RECORD, T_REPLAY, T_BACK, T_COUNT };
+enum { TAS_SLOTS = 9 };
+static int tas_pick[2], tas_frames[TAS_SLOTS + 1]; /* the rows' choices; each slot's recording in frames, as the page
+                                                      opens and a row is taken: 0 none, -1 a file that is none */
 static u32 slots_gen; /* counts the lists given: the picture is set again */
 /* the notifications showing, a line each, the oldest first (overlay_toast) */
 #define TOAST_KEY 64
@@ -299,12 +310,22 @@ static int shortcuts(void) {
     for (a = 0; a < HOTKEY_COUNT; ++a) n += hotkey_row(a) != NULL;
     return n;
 }
+/* row i of the Save states page as a T_ row, -1 for a slot's */
+static int tas_row(int i) { return page == PAGE_STATES && i >= nslots ? i - nslots : -1; }
+/* the slots of the recordings read and the rows' choices back to what runs now */
+static void tas_read(void) {
+    char why[200];
+    for (int s = 1; s <= TAS_SLOTS; ++s) tas_frames[s] = unattended_slot_frames(s, why, sizeof why);
+    tas_pick[T_RECORD] = unattended_recording();
+    tas_pick[T_REPLAY] = unattended_replaying();
+}
+static void tas_shown(int row, char* out, size_t n);
 static int items(void) {
     return page == PAGE_MAIN        ? main_count()
            : page == PAGE_SHORTCUTS ? shortcuts() + 1
            : page == PAGE_CONTROLS  ? C_COUNT
            : page == PAGE_PADS      ? P_COUNT
-           : page == PAGE_STATES    ? nslots + 1
+           : page == PAGE_STATES    ? nslots + T_COUNT
            : page == PAGE_SLOT      ? S_COUNT - !slot_at
            : page == PAGE_ASK       ? 2
            : page == PAGE_KEYS      ? keys_rows()
@@ -318,7 +339,10 @@ static void page_open(int p) {
     focus = top = 0;
     listening = 0;
     refused[0] = 0;
-    if (p == PAGE_STATES) slots_stale = 1;
+    if (p == PAGE_STATES) {
+        slots_stale = 1;
+        tas_read();
+    }
 }
 static _Atomic int display_percent = 100; /* set on the event thread, read by the renderer's */
 /* A screen of fingers, as the backend says (a phone's): an item's row is a finger's high at the least, the launcher's
@@ -398,7 +422,8 @@ static int page_picked(void) {
 }
 /* a number, stepped by the arrows around it, not a word; a slider's is its own (INI_SLIDER) */
 static int arrows(const IniOpt* o) {
-    if (!o || o->type == INI_TEXT) return 0; /* a text's words are stepped as words, one with none only read */
+    /* a text's words are stepped as words, one with none or of boxes only read */
+    if (!o || o->type == INI_TEXT || (o->flags & INI_BOXES)) return 0;
     return o->type == INI_FLOAT || (!(o->flags & INI_SLIDER) && (!o->words || strchr(o->words, '#')));
 }
 static const IniOpt* slider(int i) {
@@ -481,14 +506,13 @@ static void row_now(const IniOpt* o, char* out, size_t n) {
    next start for one read then. A text without words is only read */
 static int section_step(const IniOpt* o, int step) {
     char now[PICK_TEXT], to[PICK_TEXT];
+    if (o->flags & INI_BOXES) return OVERLAY_NONE; /* a set of items, whose boxes the launcher's Settings have */
     row_now(o, now, sizeof now);
     if (o->type == INI_INT)
         snprintf(to, sizeof to, "%d", ini_step(o, atoi(now), step));
-    else if (o->type == INI_FLOAT) {
-        double unit = o->hi - o->lo > 2 ? 0.25 : 0.05, v = strtod(now, NULL);
-        v = (double)(long long)((v + step * unit) / unit + (step > 0 ? 0.5 : -0.5)) * unit;
-        snprintf(to, sizeof to, "%g", v < o->lo ? o->lo : v > o->hi ? o->hi : v);
-    } else if (!text_step(o, now, step, to, sizeof to))
+    else if (o->type == INI_FLOAT)
+        snprintf(to, sizeof to, "%g", ini_float_step(strtod(now, NULL), o->lo, o->hi, step));
+    else if (!text_step(o, now, step, to, sizeof to))
         return OVERLAY_NONE;
     ini_set_apply(o->key, to);
     return OVERLAY_NONE;
@@ -501,7 +525,9 @@ static void label(int i, char* text, size_t size, char* value, size_t vsize) {
     if (o && page == PAGE_SECTION) { /* any type; one read when the game starts says so */
         char now[PICK_TEXT], word[OVERLAY_COLS_MAX];
         row_now(o, now, sizeof now);
-        if (o->type == INI_INT)
+        if (o->flags & INI_BOXES)
+            snprintf(word, sizeof word, "%s", now);
+        else if (o->type == INI_INT)
             ini_word(o, atoi(now), word, sizeof word);
         else if (o->type == INI_TEXT)
             text_word(o, now, word, sizeof word);
@@ -544,8 +570,10 @@ static void label(int i, char* text, size_t size, char* value, size_t vsize) {
         return;
     }
     if (page == PAGE_STATES) {
-        if (i == nslots) {
-            snprintf(text, size, "Back");
+        if (tas_row(i) >= 0) {
+            static const char* const tas_items[T_COUNT] = {"Record input", "Play input", "Back"};
+            snprintf(text, size, "%s", tas_items[tas_row(i)]);
+            if (tas_row(i) < T_BACK) tas_shown(tas_row(i), value, vsize);
             return;
         }
         if (i)
@@ -568,6 +596,7 @@ static void label(int i, char* text, size_t size, char* value, size_t vsize) {
                  : ask == OVERLAY_EXIT ? "Exit"
                  : ask == ASK_RESET    ? "Reset"
                  : ask == ASK_CLEAN    ? "Clean"
+                 : ask == ASK_RECORD   ? "Record"
                                        : "Delete");
         return;
     }
@@ -592,7 +621,7 @@ static void label(int i, char* text, size_t size, char* value, size_t vsize) {
     snprintf(text, size, "%s", page == PAGE_PADS ? PADS[i] : CONTROLS[i]);
     if ((page == PAGE_CONTROLS && i == C_BUTTONS) || (page == PAGE_PADS && i == P_MAP)) snprintf(value, vsize, ">");
 }
-/* ---- the button map page: NieR's CONTROLS, pad_screen.c's layout over the picture ---- */
+/* ---- the button map page: CONTROLS, pad_screen.c's layout over the picture ---- */
 static SnxPadScreen map;
 static SnxPadDrawing map_drawing; /* as last drawn: what a tap lands on */
 static int map_swallow;           /* the press the page took: no menu key */
@@ -726,6 +755,60 @@ static void map_draw(SnxUiList* l, int sw, int sh) {
                     p->kind == SNX_PAD_SHAPE_BAR && p->style == SNX_PAD_STYLE_PLAIN ? UI_SOFT : fill);
     }
 }
+/* what a T_ row says: what runs, and what its choice would do */
+static void tas_shown(int row, char* out, size_t n) {
+    int now = row == T_RECORD ? unattended_recording() : unattended_replaying(), pick = tas_pick[row];
+    if (!now && !pick)
+        snprintf(out, n, "Off");
+    else if (pick == now)
+        snprintf(out, n, row == T_RECORD ? "Slot %d, recording" : "Slot %d, playing", pick);
+    else if (!pick)
+        snprintf(out, n, "Off: Enter ends slot %d", now);
+    else
+        snprintf(out, n, row == T_RECORD && tas_frames[pick] != 0 ? "Slot %d, over its recording" : "Slot %d", pick);
+}
+/* a T_ row's choice a slot on (step), round 0 and 1 to TAS_SLOTS; a play's goes past the slots with no recording */
+static void tas_step(int row, int step) {
+    int at = tas_pick[row], n = TAS_SLOTS + 1;
+    do at = (at + (step < 0 ? n - 1 : 1)) % n;
+    while (row == T_REPLAY && at && tas_frames[at] <= 0 && at != tas_pick[row]);
+    tas_pick[row] = at;
+    changed();
+}
+/* a T_ row's slot set (0 ends it), what came of it said */
+static void tas_apply(int row, int slot) {
+    char why[200] = "", said[OVERLAY_COLS_MAX + 1];
+    int ok = row == T_RECORD ? unattended_record_from_menu(slot, why, sizeof why)
+                             : unattended_replay_from_menu(slot, why, sizeof why);
+    if (!ok)
+        snprintf(said, sizeof said, "%s", why);
+    else if (slot)
+        snprintf(said, sizeof said, row == T_RECORD ? "Recording to slot %d" : "Playing slot %d", slot);
+    else
+        snprintf(said, sizeof said, "%s", row == T_RECORD ? "Recording ended" : "Playing ended");
+    overlay_notice(MAIN_ICONS[M_STATES], said);
+    tas_read();
+    changed();
+}
+/* Enter on a T_ row: the slot it shows taken, or what runs ended. A recording over another is asked first */
+static void tas_take(int row) {
+    int now = row == T_RECORD ? unattended_recording() : unattended_replaying();
+    int to = tas_pick[row] == now ? 0 : tas_pick[row];
+    if (!to && !now) return;
+    if (row == T_RECORD && to && tas_frames[to] != 0) {
+        ask = ASK_RECORD;
+        page = PAGE_ASK;
+        focus = 1; /* Cancel */
+        top = 0;
+        return;
+    }
+    tas_apply(row, to);
+}
+static void tas_ask_done(void) {
+    page = PAGE_STATES;
+    focus = nslots + T_RECORD;
+    keep_in_view();
+}
 /* the item i done, or its value stepped (step -1 or 1; 0 for a select, which steps up) */
 static int act(int i, int step) {
     const IniOpt* o = setting(i);
@@ -787,6 +870,13 @@ static int act(int i, int step) {
                                      : PAGE_CONTROLS);
         return OVERLAY_NONE;
     }
+    if (tas_row(i) >= 0 && tas_row(i) < T_BACK) {
+        if (step)
+            tas_step(tas_row(i), step);
+        else
+            tas_take(tas_row(i));
+        return OVERLAY_NONE;
+    }
     if (step) return OVERLAY_NONE;
     if (page == PAGE_SETTINGS && i < nentries) { /* an entry: its rows */
         entry_at = i;
@@ -826,6 +916,11 @@ static int act(int i, int step) {
         page_open(PAGE_MAIN);
         return OVERLAY_NONE;
     }
+    if (page == PAGE_ASK && i == 0 && ask == ASK_RECORD) {
+        tas_ask_done();
+        tas_apply(T_RECORD, tas_pick[T_RECORD]);
+        return OVERLAY_NONE;
+    }
     if (page == PAGE_ASK && i == 0 && ask == ASK_RESET) {
         vpad_reset_layout();
         page_open(PAGE_CONTROLS);
@@ -854,7 +949,9 @@ static int act(int i, int step) {
         page = PAGE_ASK;
         focus = 1; /* Cancel */
         top = 0;
-    } else if (page == PAGE_PADS && i == P_MAP)
+    } else if (page == PAGE_PADS && i == P_ASSIGN)
+        return OVERLAY_CONTROLLERS; /* the controller applet's dialog, the game paused */
+    else if (page == PAGE_PADS && i == P_MAP)
         map_open();
     else /* Back */
         overlay_back();
@@ -875,7 +972,7 @@ void overlay_slots_set(const OverlaySlot* given, int n) {
     memcpy(slots, given, sizeof *slots * (size_t)nslots);
     for (i = nslots; i < n; ++i) free(given[i].thumb);
     if (slot_at >= nslots) slot_at = 0;
-    if (page == PAGE_STATES && focus > nslots) focus = nslots;
+    if (page == PAGE_STATES && focus > nslots + T_BACK) focus = nslots + T_BACK;
     slots_stale = 0;
     ++slots_gen;
     keep_in_view();
@@ -913,7 +1010,7 @@ static void toast_out(int i) {
 }
 /* text after icon on the line of its subject (key, a setting's; "" for another, whose icon is its subject), or a new
    one under the others */
-static void toast_give(unsigned icon, const char* key, const char* text, u64 now_ns) {
+static void toast_give(unsigned icon, const char* key, const char* text, u64 now_ns, u32 ms) {
     int i;
     toasts_drop(now_ns);
     for (i = 0; i < ntoasts; ++i)
@@ -932,10 +1029,12 @@ static void toast_give(unsigned icon, const char* key, const char* text, u64 now
     /* a line already in keeps its fade in: its words change, it does not come in again */
     snprintf(toasts[i].text, sizeof toasts[i].text, "%s", text);
     toasts[i].icon = icon;
-    toasts[i].until = now_ns + (u64)SNX_OVERLAY_TOAST_MS * 1000000u;
+    toasts[i].until = now_ns + (u64)ms * 1000000u;
     toasts_changed();
 }
-void overlay_toast(unsigned icon, const char* text, u64 now_ns) { toast_give(icon, "", text, now_ns); }
+void overlay_toast(unsigned icon, const char* text, u64 now_ns) {
+    toast_give(icon, "", text, now_ns, SNX_OVERLAY_TOAST_MS);
+}
 int overlay_toasting(u64 now_ns) { return now_ns < atomic_load_explicit(&toasts_until, memory_order_relaxed); }
 unsigned overlay_setting_icon(const char* key) {
     int s, t;
@@ -949,7 +1048,7 @@ unsigned overlay_setting_icon(const char* key) {
     return GUI_ICON_NONE;
 }
 void overlay_setting_toast(const char* key, const char* text, u64 now_ns) {
-    toast_give(overlay_setting_icon(key), key, text, now_ns);
+    toast_give(overlay_setting_icon(key), key, text, now_ns, SNX_OVERLAY_TOAST_MS);
 }
 unsigned overlay_key_icon(int action) {
     size_t i;
@@ -1097,11 +1196,134 @@ static struct {
         int pad;
         char ok[OVERLAY_INPUT_NAME], back[OVERLAY_INPUT_NAME];
     } input;
+    /* a save state's load (overlay_loading): its slot's words, when the box came, and whether it shows (LOADING), or
+       waits for the game's frame (LOADED); the rows of its box */
+    struct {
+        char slot[OVERLAY_COLS_MAX + 1];
+        u64 since_ns;
+        _Atomic int state; /* read unlocked by the present, which takes ui_lock only while there is one */
+        DialogRows rows;
+    } loading;
+    /* the settings' notice (overlay_settings_notice) until the game's first frame takes it, under notice_lock */
+    struct {
+        char game[1024], global[1024], kind[256];
+        _Atomic int waiting; /* given, not yet taken: the present reads it unlocked */
+    } settings;
 } g_overlay
 #ifdef __ANDROID__
     = {.input = {1, "A", "B"}}
 #endif
 ;
+enum { LOADING_NONE, LOADING_SHOWN, LOADING_LOADED };
+void overlay_settings_notice(const char* game, const char* global, const char* kind) {
+    pm_lock(&notice_lock);
+    snprintf(g_overlay.settings.game, sizeof g_overlay.settings.game, "%s", game);
+    snprintf(g_overlay.settings.global, sizeof g_overlay.settings.global, "%s", global);
+    snprintf(g_overlay.settings.kind, sizeof g_overlay.settings.kind, "%s", kind);
+    atomic_store_explicit(&g_overlay.settings.waiting, game[0] || global[0] || kind[0], memory_order_release);
+    pm_unlock(&notice_lock);
+}
+int overlay_settings_waiting(void) { return atomic_load_explicit(&g_overlay.settings.waiting, memory_order_relaxed); }
+/* the key that starts at list (", " between) and the next one's start into *next */
+static size_t key_at(const char* list, const char** next) {
+    size_t len = strcspn(list, ",");
+    *next = list + len;
+    while (**next == ',' || **next == ' ') ++*next;
+    return len;
+}
+/* keys of list from at as line's text, ", " between, cols letters at most (one key at the least, cut there): how many */
+static int line_keys(const char* at, int keys, int cols, char* line) {
+    size_t used = 0;
+    int n = 0;
+    line[0] = 0;
+    while (*at && (keys < 0 || n < keys)) {
+        const char* next;
+        size_t len = key_at(at, &next), need = used + (used ? 2 : 0) + len;
+        if (used && need > (size_t)cols) break;
+        snprintf(line + used, (size_t)cols + 1 - used, "%s%.*s", used ? ", " : "", (int)len, at);
+        used = need < (size_t)cols ? need : (size_t)cols;
+        ++n;
+        at = next;
+    }
+    return n;
+}
+/* how many keys list holds, ", " between */
+static int keys_in(const char* list) {
+    int n = 0;
+    for (const char* next; *list; list = next, ++n) key_at(list, &next);
+    return n;
+}
+int overlay_settings_lines(const char* game, const char* global, const char* kind, int cols,
+                           unsigned icon[OVERLAY_SETTINGS_LINES],
+                           char text[OVERLAY_SETTINGS_LINES][OVERLAY_COLS_MAX + 1]) {
+    const char* lists[3] = {game, global, kind};
+    const unsigned icons[3] = {GUI_ICON_GAMEPAD_2, GUI_ICON_GLOBE, GUI_ICON_INFO};
+    /* what the kind's keys are, after them on its last line: no file nor command line gave them */
+    const char* const after[3] = {"", "", ", for this kind of game"};
+    int n = 0;
+    if (cols > OVERLAY_COLS_MAX) cols = OVERLAY_COLS_MAX;
+    for (int k = 0; k < 3; ++k) {
+        const char *at = lists[k], *last = at;
+        int later = 0, took = 0, first = n;
+        for (int j = k + 1; j < 3; ++j) later += lists[j][0] != 0; /* a line kept for each list after it */
+        int room = OVERLAY_SETTINGS_LINES - n - later, width = cols - (int)strlen(after[k]);
+        if (width < 1) width = cols; /* a line too narrow for the words after the keys: its keys, the words cut */
+        for (; *at && room > 0; --room, ++n) {
+            last = at;
+            took = line_keys(at, -1, width, text[n]);
+            icon[n] = icons[k];
+            for (int i = 0; i < took; ++i) key_at(at, &at);
+        }
+        if (*at) { /* keys left: the last line says how many, as many of its own keys left out as that takes */
+            int left = keys_in(at);
+            for (int keep = took; keep >= 0; --keep) {
+                char more[24];
+                snprintf(more, sizeof more, "+%d more", left + took - keep);
+                line_keys(last, keep, width, text[n - 1]);
+                size_t used = strlen(text[n - 1]);
+                if (keep && used + 2 + strlen(more) > (size_t)width) continue;
+                snprintf(text[n - 1] + used, (size_t)width + 1 - used, "%s%s", used ? ", " : "", more);
+                break;
+            }
+        }
+        if (n > first && after[k][0]) {
+            size_t used = strlen(text[n - 1]);
+            if (used < (size_t)cols) snprintf(text[n - 1] + used, (size_t)cols + 1 - used, "%s", after[k]);
+        }
+    }
+    return n;
+}
+void overlay_settings_start(u64 now_ns) {
+    unsigned icon[OVERLAY_SETTINGS_LINES];
+    char text[OVERLAY_SETTINGS_LINES][OVERLAY_COLS_MAX + 1];
+    int n = 0;
+    pm_lock(&notice_lock);
+    if (atomic_load_explicit(&g_overlay.settings.waiting, memory_order_acquire))
+        n = overlay_settings_lines(g_overlay.settings.game, g_overlay.settings.global, g_overlay.settings.kind,
+                                   OVERLAY_COLS_MAX, icon, text);
+    atomic_store_explicit(&g_overlay.settings.waiting, 0, memory_order_relaxed);
+    pm_unlock(&notice_lock);
+    for (int i = 0; i < n; ++i) {
+        char subject[16];
+        snprintf(subject, sizeof subject, "@settings %d", i); /* a line each, apart from any setting's own */
+        toast_give(icon[i], subject, text[i], now_ns, SNX_OVERLAY_SETTINGS_MS);
+    }
+}
+void overlay_loading(const char* slot, u64 shown_ns) {
+    snprintf(g_overlay.loading.slot, sizeof g_overlay.loading.slot, "%s", slot ? slot : "");
+    g_overlay.loading.since_ns = shown_ns;
+    atomic_store_explicit(&g_overlay.loading.state, LOADING_SHOWN, memory_order_relaxed);
+}
+void overlay_loading_done(void) {
+    if (overlay_loading_shown()) atomic_store_explicit(&g_overlay.loading.state, LOADING_LOADED, memory_order_relaxed);
+}
+void overlay_loading_end(void) { atomic_store_explicit(&g_overlay.loading.state, LOADING_NONE, memory_order_relaxed); }
+int overlay_loading_shown(void) {
+    return atomic_load_explicit(&g_overlay.loading.state, memory_order_relaxed) != LOADING_NONE;
+}
+void overlay_game_drew(void) {
+    if (atomic_load_explicit(&g_overlay.loading.state, memory_order_relaxed) == LOADING_LOADED) overlay_loading_end();
+}
 void overlay_input_keys(void) {
     if (!g_overlay.input.pad) return;
     g_overlay.input.pad = 0;
@@ -1563,6 +1785,9 @@ int overlay_back(void) {
     } else if (page == PAGE_ASK && ask == OVERLAY_EXIT) {
         page_open(PAGE_MAIN);
         focus = exit_row();
+    } else if (page == PAGE_ASK && ask == ASK_RECORD) {
+        tas_ask_done();
+        tas_read(); /* the choice back to what runs */
     } else if (page == PAGE_ASK && ask == ASK_CLEAN) {
         page_open(PAGE_MAIN);
         focus = main_row(M_CLEAN);
@@ -1652,6 +1877,8 @@ static void menu_dialog(Dialog* d, char (*text)[OVERLAY_COLS_MAX + 1], char (*va
     d->para[0].text = page == PAGE_PADS ? pads_hint(pads, size / 2) : page < PAGE_SLOT ? hints[page] : pads;
     d->para[0].rgba = UI_SOFT;
     d->paras = 1;
+    if (page == PAGE_STATES && tas_row(focus) >= 0 && tas_row(focus) < T_BACK)
+        d->para[0].text = "Left and Right choose a slot, Enter takes it. The game waits while this page is open.";
     if (page_picked()) { /* with fingers, a tap on the line takes the focused row's pick out (overlay_tap) */
         d->para[1].text = fingers ? "*: set for this game alone. Tap here: the row in focus back to Global."
                                   : "*: set for this game alone. Y or Delete: back to Global.";
@@ -1690,6 +1917,12 @@ static void menu_dialog(Dialog* d, char (*text)[OVERLAY_COLS_MAX + 1], char (*va
         snprintf(title, size / 2, "SCARLETNX  /  CLEAN OLD SETTINGS?");
         snprintf(pads, size / 2, "%d key%s this version does not use go from the game's .ini and its own picks.", n,
                  n == 1 ? "" : "s");
+    } else if (page == PAGE_ASK && ask == ASK_RECORD) {
+        snprintf(title, size / 2, "SCARLETNX  /  RECORD OVER SLOT %d?", tas_pick[T_RECORD]);
+        if (tas_frames[tas_pick[T_RECORD]] > 0)
+            snprintf(pads, size / 2, "Its recording, %d frames, is replaced.", tas_frames[tas_pick[T_RECORD]]);
+        else
+            snprintf(pads, size / 2, "Its file, which is no recording, is replaced.");
     } else if (page >= PAGE_SLOT) {
         char name[16];
         if (slot_at)
@@ -1774,6 +2007,8 @@ int overlay_tap(float x, float y, int sw, int sh) {
     /* a value's row: a tap on its last five columns (the right arrow's) steps it up, a tap anywhere left of them
        down */
     if (arrows(setting(focus))) return act(focus, col < at.cols - 5 ? -1 : 1);
+    /* Record input and Play input: a tap on the last five columns chooses the next slot, one anywhere else takes it */
+    if (tas_row(focus) >= 0 && tas_row(focus) < T_BACK && col >= at.cols - 5) return act(focus, 1);
     return act(focus, 0);
 }
 /* whether x, y lies on the open menu's panel on the picture overlay_place last had: a page, not the button map's or
@@ -1907,9 +2142,15 @@ static const char* pads_hint(char* out, size_t size) {
 static float toast_width(int i, float cw) {
     return cw * (float)(strlen(toasts[i].text) + 2 + (toasts[i].icon != GUI_ICON_NONE ? 3 : 0));
 }
-static void toast_draw(SnxUiList* l, int sw, int sh, const float* stats, int span[OVERLAY_TOASTS + 1]) {
+/* whether the boxes a and b (x, y, w, h each) have a point in common */
+static int boxes_meet(const float a[4], const float b[4]) {
+    return a[0] < b[0] + b[2] && a[0] + a[2] > b[0] && a[1] < b[1] + b[3] && a[1] + a[3] > b[1];
+}
+static void toast_draw(SnxUiList* l, int sw, int sh, const float* stats, const float* debug,
+                       int span[OVERLAY_TOASTS + 1]) {
     int px, py, s, i, right = 0;
     float cw, ch, x, y, w = 0, h;
+    SNX_ZONE_V(z_toast, "plat overlay toast lay", (u64)ntoasts);
     overlay_place(sw, sh, &px, &py, &s);
     s = stats_scale(s);
     cw = 8.0f * (float)s;
@@ -1921,14 +2162,16 @@ static void toast_draw(SnxUiList* l, int sw, int sh, const float* stats, int spa
     h = ch * (float)ntoasts;
     /* the stats' box (x, y, w, h; NULL for none) in that corner too: the bands go under it, from its left, half a
        line apart, where they would lie on it; in the picture's top right corner, each to its edge, when there is no
-       room under the box */
-    if (stats && x < stats[0] + stats[2] && x + w > stats[0] && y < stats[1] + stats[3] && y + h > stats[1]) {
+       room under it and under the Debug list, where that is */
+    if (stats && boxes_meet((const float[4]){x, y, w, h}, stats)) {
         x = stats[0];
         y = stats[1] + stats[3] + ch / 2;
-        if (y + h > (float)sh) {
-            right = 1;
-            y = ch;
-        }
+    }
+    /* the Debug list's (debug) too, which is under the stats' box when both are shown */
+    if (debug && boxes_meet((const float[4]){x, y, w, h}, debug)) y = debug[1] + debug[3] + ch / 2;
+    if (y + h > (float)sh) {
+        right = 1;
+        y = ch;
     }
     for (i = 0; i < ntoasts; ++i) {
         float at = right ? (float)sw - cw - toast_width(i, cw) : x, row = y + (float)i * ch;
@@ -1989,6 +2232,8 @@ static struct {
     int n, sw, sh, percent, boxed;
     int span[OVERLAY_TOASTS + 1]; /* each line's first quad, and the end of them (toast_draw) */
     float stats[4];               /* the stats' box it was placed for, when boxed */
+    float debug[4];               /* the Debug list's, when listed */
+    int listed;
     u32 given, version;
 } g_toast;
 static void watch(const void* var) {
@@ -2004,6 +2249,7 @@ static int watched_same(void) {
 }
 static void menu_lay(int sw, int sh, const MenuKey* key) {
     static DialogRows rows_of; /* the renderer's */
+    SNX_ZONE_TV(z_menu, "plat overlay menu lay", (u64)key->what, "dialog %d", (int)key->what);
     char text[VISIBLE][OVERLAY_COLS_MAX + 1], value[VISIBLE][OVERLAY_COLS_MAX + 1], pads[2 * OVERLAY_COLS_MAX + 64];
     SnxUiList l = {g_menu.q, 0, MENU_QUADS};
     Dialog d;
@@ -2033,8 +2279,33 @@ static void menu_lay(int sw, int sh, const MenuKey* key) {
     g_menu.laid = 1;
     ++g_menu.version;
 }
+/* a save state's load: the shade over the whole picture, its alpha the fade's (the first faded span, which the
+   notifications' come after), then the box and its ring, on the row of its words */
+static void loading_draw(SnxUiList* l, int sw, int sh, u64 now_ns) {
+    const u64 in = now_ns > g_overlay.loading.since_ns ? (now_ns - g_overlay.loading.since_ns) / 1000000u : 0;
+    const unsigned alpha = in >= OVERLAY_LOADING_FADE_MS ? 128 : (unsigned)(128 * in / OVERLAY_LOADING_FADE_MS);
+    const DialogPara para[2] = {{"Loading the save state", UI_INK, 0, 0, 0, 0},
+                                {g_overlay.loading.slot, UI_SOFT, 0, 1, 0, 0}};
+    const int first = l->n;
+    Dialog d;
+    DialogDrawn at;
+    ui_fill(l, 0, 0, (float)sw, (float)sh, 0xFF000000u);
+    ui_fade_set(first, l->n, alpha);
+    memset(&d, 0, sizeof d);
+    d.title = "SCARLETNX  /  SAVE STATES";
+    memcpy(d.para, para, sizeof para);
+    d.paras = 2;
+    dialog_draw(l, sw, sh, &d, g_overlay.loading.rows, &at);
+    {
+        const float cw = 8.0f * (float)at.scale, ch = 16.0f * (float)at.scale;
+        ui_loading_ring(l, at.box.x + at.box.w - cw * 3, at.box.y + ch * 2, at.scale, now_ns / 1000000u, 0,
+                        UI_RGB(SNX_GUI_THEME_YORHA_DIM), UI_SOFT, UI_INK);
+    }
+}
 void overlay_draw(SnxUiList* l, int sw, int sh, u64 now_ns) {
     MenuKey key;
+    int before = l->n; /* the list's quads before this overlay's, so the plot counts only the overlay's own */
+    SNX_ZONE(z_draw, "plat overlay draw");
     if (atomic_load_explicit(&notice_given, memory_order_acquire)) {
         pm_lock(&notice_lock);
         if (notice[0]) overlay_toast(notice_icon, notice, now_ns);
@@ -2046,6 +2317,8 @@ void overlay_draw(SnxUiList* l, int sw, int sh, u64 now_ns) {
         page == PAGE_MAP) { /* the button map's page shows what the pads hold as they hold it */
         map_draw(l, sw, sh);
         g_menu.laid = 0;
+        SNX_ZONE_VALUE(z_draw, 3); /* button map */
+        SNX_PLOT("plat overlay quads", (double)(l->n - before));
         return;
     }
     memset(&key, 0, sizeof key);
@@ -2054,6 +2327,7 @@ void overlay_draw(SnxUiList* l, int sw, int sh, u64 now_ns) {
     key.what = atomic_load_explicit(&shown, memory_order_relaxed)                ? MENU_PAGE
                : atomic_load_explicit(&g_overlay.kb_shown, memory_order_relaxed) ? MENU_KB
                                                                                  : MENU_NONE;
+    SNX_ZONE_VALUE(z_draw, key.what); /* 0: toasts only, 1: menu, 2: keyboard, 3: map */
     key.changes = atomic_load_explicit(&g_changes, memory_order_acquire);
     if (key.what != MENU_NONE) {
         key.hotkeys = hotkeys_version();
@@ -2064,17 +2338,27 @@ void overlay_draw(SnxUiList* l, int sw, int sh, u64 now_ns) {
         if (!g_menu.laid || memcmp(&key, &g_menu.key, sizeof key) || !watched_same()) menu_lay(sw, sh, &key);
         ui_append_kept(l, &(SnxUiList){g_menu.q, g_menu.n, g_menu.n}, g_menu.version, &g_menu, NULL);
     }
+    if (overlay_loading_shown()) loading_draw(l, sw, sh, now_ns);
+    if (!atomic_load_explicit(&shown, memory_order_relaxed) &&
+        ctrl_dialog_shown()) { /* the controller applet's, under the menu */
+        int px, py, scale;
+        overlay_place(sw, sh, &px, &py, &scale);
+        ctrl_dialog_draw(l, sw, sh, scale);
+    }
     toasts_drop(now_ns);
     if (ntoasts) {
         int percent = overlay_display_percent(), first = l->n, i;
-        float stats[4] = {0};
-        int boxed = stats_box_drawn(stats); /* the stats' box, which it keeps clear of */
+        float stats[4] = {0}, debug[4] = {0};
+        int boxed = stats_box_drawn(stats), listed = hud_box_drawn(debug); /* both kept clear of */
         if (g_toast.given != toast_version || g_toast.sw != sw || g_toast.sh != sh || g_toast.percent != percent ||
-            g_toast.boxed != boxed || memcmp(g_toast.stats, stats, sizeof stats) || !g_toast.version) {
+            g_toast.boxed != boxed || g_toast.listed != listed || memcmp(g_toast.stats, stats, sizeof stats) ||
+            memcmp(g_toast.debug, debug, sizeof debug) || !g_toast.version) {
             SnxUiList t = {g_toast.q, 0, (int)(sizeof g_toast.q / sizeof *g_toast.q)};
-            toast_draw(&t, sw, sh, boxed ? stats : NULL, g_toast.span);
+            toast_draw(&t, sw, sh, boxed ? stats : NULL, listed ? debug : NULL, g_toast.span);
             g_toast.boxed = boxed;
+            g_toast.listed = listed;
             memcpy(g_toast.stats, stats, sizeof stats);
+            memcpy(g_toast.debug, debug, sizeof debug);
             g_toast.n = t.n;
             g_toast.given = toast_version;
             g_toast.sw = sw;
@@ -2086,6 +2370,7 @@ void overlay_draw(SnxUiList* l, int sw, int sh, u64 now_ns) {
         for (i = 0; i < ntoasts; ++i) /* as one fades: its quads the same, their alpha moving; whole, no span */
             ui_fade_set(first + g_toast.span[i], first + g_toast.span[i + 1], (unsigned)overlay_toast_alpha(i, now_ns));
     }
+    SNX_PLOT("plat overlay quads", (double)(l->n - before));
 }
 int overlay_error_hit(const SnxOverlayRect* r, float x, float y) {
     return r && r->w > 0 && r->h > 0 && x >= r->x && x < r->x + r->w && y >= r->y && y < r->y + r->h;

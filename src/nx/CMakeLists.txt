@@ -50,9 +50,9 @@ snx_svcgen(snx_kernel)
 snx_component(hle hle/services/services.c hle/services/audren.c hle/services/audren_dsp.c hle/services/sm.c hle/services/am.c hle/services/gsv.c hle/services/native_video.c hle/services/native_video_core.c hle/services/native_video_decoder.c hle/services/set.c  hle/services/acc.c hle/services/users.c hle/services/audio.c
               hle/services/misc.c hle/services/ldr.c hle/services/network/bsd.c hle/services/network/dns.c
               hle/services/network/nifm.c hle/services/network/ssl.c hle/services/network/ldn.c hle/services/network/room.c hle/filesystem/fs.c hle/services/hid.c hle/services/hid_motion.c hle/services/hid_touch.c hle/services/vi.c hle/services/nvdrv.c
-              hle/hook/hook.c hle/hook/family.c hle/hook/jump.c hle/hook/ext_skyline.c hle/hook/libc.c hle/hook/alloc.c hle/hook/sync.c hle/hook/os_sync.c hle/hook/libc_std.c hle/hook/libc_wide.c hle/hook/libc_fmt.c hle/hook/libcxx_string.c hle/hook/gs.c hle/hook/diag.c hle/hook/codec.c hle/hook/audio_stream.c hle/hook/verify.c hle/hook/version.c
+              hle/hook/hook.c hle/hook/module.c hle/hook/module_lib.c hle/hook/family.c hle/hook/jump.c hle/hook/ext_skyline.c hle/hook/libc.c hle/hook/alloc.c hle/hook/sync.c hle/hook/os_sync.c hle/hook/libc_std.c hle/hook/libc_wide.c hle/hook/libc_fmt.c hle/hook/libcxx_string.c hle/hook/gs.c hle/hook/diag.c hle/hook/codec.c hle/hook/audio_stream.c hle/hook/verify.c hle/hook/version.c
               nn/ro.c nn/fs.c nn/time.c nn/pl.c nn/pl_font.c nn/pctl.c nn/nsd.c nn/ngc.c nn/prepo.c
-              nn/audio.c nn/audio_renderer.c nn/codec.c)
+              nn/audio.c nn/audio_renderer.c nn/codec.c nn/tvmr_jpeg.c)
 # the shared fonts' stand-ins (cmake/shared_fonts.cmake), which nn/pl.c hands out
 target_sources(snx_hle PRIVATE "${PROJECT_BINARY_DIR}/generated/shared_fonts.c")
 if(APPLE)
@@ -62,7 +62,8 @@ if(APPLE)
     target_link_libraries(snx_hle PUBLIC "-framework VideoToolbox" "-framework CoreMedia" "-framework CoreVideo")
 endif()
 # the hooks' adapters and table, generated from hle/hook/hooks.hook and the game patches' address hooks
-# (patches/*.hook), whose handlers are the .c files beside them
+# (patches/*.hook), whose handlers are the .c files beside them. patches/modules.c lists the hook modules
+# (hle/hook/module.h)
 include("${PROJECT_SOURCE_DIR}/cmake/hookgen.cmake")
 snx_hookgen(snx_hle A32_MARKED)
 # the native hooks of mods' trampolines (hle/hook/ext_skyline.hooks), a table of their own for ext_skyline.c
@@ -85,9 +86,9 @@ target_link_libraries(snx_video PRIVATE FFmpeg::avcodec)
 # hwopus (hle/services/audio.c) decodes Opus with FFmpeg too; acc's user picture is a splash drawing (cmake/splash.cmake)
 include("${PROJECT_SOURCE_DIR}/cmake/splash.cmake")
 target_link_libraries(snx_hle PRIVATE FFmpeg::avcodec OpenSSL::SSL snx_splash)
-snx_component(gpu gpu/gpu.c gpu/guest_pools.c gpu/guest_textures.c gpu/maxwell/engines.c gpu/maxwell/mme.c gpu/maxwell/compute.c gpu/maxwell/fermi2d.c gpu/maxwell/dma.c gpu/maxwell/write_pages.c gpu/draw_state.c gpu/maxwell/draw_state.c gpu/maxwell/maxwell3d.c gpu/renderer.c
+snx_component(gpu gpu/gpu.c gpu/gpu_queue.c gpu/guest_pools.c gpu/guest_textures.c gpu/maxwell/engines.c gpu/maxwell/mme.c gpu/maxwell/compute.c gpu/maxwell/fermi2d.c gpu/maxwell/dma.c gpu/maxwell/write_pages.c gpu/draw_state.c gpu/maxwell/draw_state.c gpu/maxwell/maxwell3d.c gpu/renderer.c
               gpu/nvn/nvn_loader.c gpu/nvn/nvn_object.c gpu/nvn/nvn_cmd.c gpu/nvn/nvn_queue.c gpu/nvn/nvn_dlss.c
-              gpu/nvn/nvn_tex.c gpu/nvn/nvn_driver.c gpu/nvn/nvn_tic.c gpu/nvn/nvn_replay.c gpu/nvn/nvn_draw.c gpu/nvn/nvn_copy.c gpu/nvn/nvn_state.c
+              gpu/nvn/nvn_tex.c gpu/nvn/nvn_driver.c gpu/nvn/nvn_tic.c gpu/nvn/nvn_replay.c gpu/nvn/nvn_trace.c gpu/nvn/nvn_draw.c gpu/nvn/nvn_copy.c gpu/nvn/nvn_state.c
               gpu/nvn/nvn_save.c
               gpu/gl/gl_census.c
               gpu/gl/gl_loader.c gpu/gl/gl_egl.c gpu/gl/gl_calls.c gpu/gl/gl_program_calls.c gpu/gl/gl_host_program.c gpu/gl/gl_object_calls.c
@@ -108,13 +109,16 @@ include("${PROJECT_SOURCE_DIR}/cmake/gui_themes.cmake")
 set(platform runtime/platform/log.c runtime/platform/plat_sdl.c runtime/platform/unattended.c
              runtime/platform/backend/sdl3.c runtime/platform/audio_downmix.c
              runtime/platform/backend/gamepad.c runtime/platform/connect.c runtime/platform/tracy.c
+             runtime/platform/ctrl_applet.c runtime/platform/ctrl_request.c runtime/platform/ctrl_scan.c
+             runtime/platform/joycon2.c runtime/platform/joycon2_sdl.c runtime/platform/joycon2_session.c
+             runtime/platform/joycon2_proto.c runtime/platform/joycon2_att.c runtime/platform/joycon2_link.c
              runtime/platform/help.c runtime/platform/hotkeys.c runtime/platform/hud.c runtime/platform/overlay.c
              runtime/platform/stats.c
              runtime/platform/touch.c
              runtime/platform/audio_denoise.c
              runtime/platform/ui.c runtime/platform/vpad.c
              runtime/platform/fatal_screen.c
-             runtime/platform/prepare_screen.c runtime/platform/resources.c)
+             runtime/platform/prepare_screen.c runtime/platform/wait_screen.c runtime/platform/resources.c)
 if(WIN32)
     list(APPEND platform runtime/platform/plat_win32.c runtime/platform/profiler_win32.c)
 else()
@@ -142,11 +146,13 @@ target_compile_definitions(snx_platform PRIVATE SNX_TRACY_VERSION="${SNX_TRACY_V
 snx_component(shader gpu/shader/shader.c gpu/shader/decode.c gpu/shader/corpus.c gpu/shader/shipped.c
                      gpu/shader/direct_eval.c gpu/shader/spirv_translate.c gpu/shader/spirv_compute.c gpu/shader/structure.c
                      gpu/shader/shared_reach.c gpu/shader/registers.c gpu/shader/forms.c gpu/shader/dataflow.c
+                     gpu/shader/direct_eval.c
                      gpu/shader/emit_int.c gpu/shader/emit_float.c gpu/shader/emit_memory.c gpu/shader/emit_texture.c
-                     gpu/shader/emit_io.c gpu/shader/emit_flow.c gpu/shader/emit_thread.c gpu/shader/fuse.c
+                     gpu/shader/emit_io.c gpu/shader/emit_flow.c gpu/shader/fuse.c
+                     gpu/shader/warp_idioms.c gpu/shader/sm86_lone.c
                      gpu/shader/sm86_decode.c gpu/shader/sm86_translate.c gpu/shader/sm86_eval.c gpu/shader/advanced_blend_spirv.c
                      gpu/shader/coverage_spirv.c gpu/shader/capture_tiles_spirv.c gpu/shader/depth_stencil_spirv.c gpu/shader/write_log.c
-                     gpu/shader/minmax_spirv.c gpu/shader/hmma_bench.c)
+                     gpu/shader/minmax_spirv.c gpu/shader/hmma_bench.c gpu/shader/sm53_sail.c)
 # decode.c and sm86_decode.c include the Maxwell and SM86 decoders tools/decodetree makes from gpu/shader/sm53.decode
 # and sm86.decode (cmake/decodetree.cmake)
 include("${PROJECT_SOURCE_DIR}/cmake/decodetree.cmake")
@@ -154,10 +160,16 @@ snx_decodetree(snx_shader OUTPUT decode-sm53.inc DECODE "${CMAKE_CURRENT_SOURCE_
                OPTIONS -w 16 --static-decode=decode_sm53)
 snx_decodetree(snx_shader OUTPUT decode-sm86.inc DECODE "${CMAKE_CURRENT_SOURCE_DIR}/gpu/shader/sm86.decode"
                OPTIONS -w 16 --static-decode=decode_sm86)
+# sm86_translate.c and sm53_sail.c include the instructions sailgen's GPU mode writes from gpu/shader/sail/sm86.sail
+# and sm53.sail
+# (cmake/sailgen.cmake)
+include("${PROJECT_SOURCE_DIR}/cmake/sailgen.cmake")
+snx_sailgen_gpu(snx_shader sm86)
+snx_sailgen_gpu(snx_shader sm53)
 snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/descriptors.c gpu/vk/descriptor_heaps.c gpu/vk/descriptor_objects.c gpu/vk/cmd.c gpu/vk/record.c gpu/vk/format.c gpu/vk/surface.c gpu/vk/texture.c
-                 gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/writelog.c gpu/vk/mirror.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/table.c gpu/vk/xfb.c gpu/vk/display.c gpu/vk/compute.c
-                 gpu/vk/pending_pages.c gpu/vk/checkpoints.c gpu/vk/image_out.c gpu/vk/depth_pack.c gpu/vk/shading_rate.c gpu/vk/shading_rate_table.c gpu/vk/upscale.c gpu/vk/memory.c gpu/vk/ledger.c gpu/vk/pagespace.c gpu/vk/range_shape.c gpu/vk/tex_census.c gpu/vk/tex_report.c gpu/vk/resource_stats.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/bc7_cache.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/msaa.c gpu/vk/ui.c gpu/vk/hdr_swapchain.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/devmem.c gpu/vk/space.c gpu/vk/gpuprof.c gpu/vk/uma.c
-                 gpu/vk/ftz_probe.c gpu/vk/hmma_pick.c gpu/vk/vertex_input.c gpu/vk/pipeline_parts.c gpu/vk/pipeline_stats.c gpu/vk/shader_objects.c gpu/vk/cb_fold.c
+                 gpu/vk/buffer.c gpu/vk/writeback.c gpu/vk/writelog.c gpu/vk/mirror.c gpu/vk/pipeline.c gpu/vk/pipeline_file.c gpu/vk/render.c gpu/vk/release.c gpu/vk/query.c gpu/vk/table.c gpu/vk/xfb.c gpu/vk/indirect_quads.c gpu/vk/display.c gpu/vk/compute.c
+                 gpu/vk/pending_pages.c gpu/vk/addr_gens.c gpu/vk/pool_map.c gpu/vk/pool_map_gpu.c gpu/vk/checkpoints.c gpu/vk/image_out.c gpu/vk/depth_pack.c gpu/vk/shading_rate.c gpu/vk/shading_rate_table.c gpu/vk/upscale.c gpu/vk/memory.c gpu/vk/ledger.c gpu/vk/pagespace.c gpu/vk/range_shape.c gpu/vk/tex_census.c gpu/vk/tex_report.c gpu/vk/resource_stats.c gpu/vk/renderdoc.c gpu/vk/astc.c gpu/vk/bc7_cache.c gpu/vk/blocklinear.c gpu/vk/texconv.c gpu/vk/owned.c gpu/vk/nvdec.c gpu/vk/dma.c gpu/vk/blit.c gpu/vk/msaa.c gpu/vk/ui.c gpu/vk/hdr_swapchain.c gpu/texture/blocklinear.c gpu/texture/depth.c gpu/vk/vic.c gpu/vk/devmem.c gpu/vk/space.c gpu/vk/gpuprof.c gpu/vk/stamp.c gpu/vk/uma.c
+                 gpu/vk/ftz_probe.c gpu/vk/hmma_pick.c gpu/vk/vertex_input.c gpu/vk/pipeline_parts.c gpu/vk/pipeline_stats.c gpu/vk/shader_objects.c gpu/vk/cb_fold.c gpu/vk/cb_dynamic.c
                  gpu/vk/draw_texture.c gpu/vk/draw_texture_shader.c gpu/vk/host_program.c gpu/vk/tess_passthrough.c gpu/vk/varying_geometry.c gpu/vk/present_quad.c gpu/vk/capture.c gpu/vk/depth_shadow.c gpu/vk/predraw.c
                  gpu/vk/tensor.c
                  "${volk_SOURCE_DIR}/volk.c")
@@ -168,7 +180,7 @@ snx_component(vk gpu/vk/renderer.c gpu/vk/device.c gpu/vk/descriptors.c gpu/vk/d
 include("${PROJECT_SOURCE_DIR}/cmake/glsl.cmake")
 # vk_hash (gpu/vk/cmd.c); the device setup the 3DS and the Vita share (src/common/gpu/vk); the shader file's units
 # (gpu/vk/pipeline_file.c)
-target_link_libraries(snx_vk PUBLIC snx_xxhash snx_vk_common snx_fsr2 PRIVATE snx_zstd)
+target_link_libraries(snx_vk PUBLIC snx_xxhash snx_vk_common snx_fsr2 snx_upscaler PRIVATE snx_zstd)
 # the vk_ext_* table (g_vk_extension_settings) its device takes (gpu/vk/device.c, common/gpu/vk/device_settings.h)
 target_link_libraries(snx_vk PUBLIC snx_settings_runtime)
 # AMD FidelityFX Super Resolution 2.2.1 (cmake/dependencies.cmake): AMD's library and Vulkan backend as they are
@@ -193,6 +205,43 @@ target_include_directories(snx_fsr2 PRIVATE "${snx_fsr2_api_dir}" "${PROJECT_SOU
 set_source_files_properties(${snx_fsr2_amd} PROPERTIES COMPILE_OPTIONS
                             "${snx_third_party_flags};-include;${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/fsr2/fsr2_compat.h")
 target_link_libraries(snx_fsr2 PUBLIC snx_vk_common)
+# the runtime's upscalers behind one interface (gpu/vk/upscaler, docs/layers/gpu/upscalers.md): FSR 2 through snx_fsr2,
+# the filtered copy and the spatial upscaler. Their compute passes are compiled from GLSL at build time, the spatial
+# ones with AMD's FSR 1 header from FSR 2's package, patched (.patch/fidelityfx-fsr2/0002-fsr1-easu-glsl.patch). Like
+# snx_fsr2 it knows no renderer, so tests/vk_upscaler.c links it alone
+add_library(snx_upscaler STATIC gpu/vk/upscaler/upscaler.c gpu/vk/upscaler/passes.c gpu/vk/upscaler/reproject.c
+                          gpu/vk/upscaler/dlss.cpp)
+target_link_libraries(snx_upscaler PUBLIC snx_fsr2 snx_vk_common)
+# DLSS through NVIDIA Streamline (gpu/vk/upscaler/dlss.cpp) in a Windows build: Streamline's headers only, its loader
+# taken from the user's folder at run time. Windows' own libraries check NVIDIA's signature
+if(WIN32)
+    target_include_directories(snx_upscaler SYSTEM PRIVATE "${snx_streamline_include}")
+    target_compile_definitions(snx_upscaler PRIVATE SNX_STREAMLINE)
+    target_link_libraries(snx_upscaler PRIVATE wintrust crypt32)
+endif()
+foreach(snx_pass copy easu rcas)
+    snx_glsl_spirv(snx_upscaler SOURCE gpu/vk/upscaler/up_${snx_pass}.comp NAME up_${snx_pass}_spv
+                   HEADER nx/gpu/vk/upscaler/upscaler_spv.h DEFINES FFX_GLSL=1 FFX_GPU=1 FFX_HALF=0
+                   INCLUDES "${snx_fsr2_api_dir}/shaders")
+endforeach()
+# motion vectors from depth and a camera matrix (gpu/vk/upscaler/reproject.c), for callers without motion vectors
+snx_glsl_spirv(snx_upscaler SOURCE gpu/vk/upscaler/up_reproject.comp NAME up_reproject_spv
+               HEADER nx/gpu/vk/upscaler/upscaler_spv.h)
+# SMAA before a copy or a spatial upscale (cmake/dependencies.cmake), the passes of one source (up_smaa.comp): the
+# picture's copy (3), the edges (0), the blending weights (1, with SMAA_FAST for the Low and Medium presets), the
+# blending (2, with SMAA_REPROJECTION for T2x), T2x's velocity (4) and its resolve (5). The C side takes the area and
+# search textures
+foreach(snx_smaa prep:3: edges:0: weights:1: weights_fast:1:SMAA_FAST=1 blend:2: blend_t2x:2:SMAA_REPROJECTION=1
+                 velocity:4: resolve:5:SMAA_REPROJECTION=1)
+    string(REPLACE ":" ";" snx_smaa "${snx_smaa}")
+    list(GET snx_smaa 0 snx_smaa_name)
+    list(GET snx_smaa 1 snx_smaa_pass)
+    list(GET snx_smaa 2 snx_smaa_more)
+    snx_glsl_spirv(snx_upscaler SOURCE gpu/vk/upscaler/up_smaa.comp NAME up_smaa_${snx_smaa_name}_spv
+                   HEADER nx/gpu/vk/upscaler/upscaler_spv.h DEFINES SMAA_PASS=${snx_smaa_pass} ${snx_smaa_more}
+                   INCLUDES "${SMAAShader_SOURCE_DIR}")
+endforeach()
+target_include_directories(snx_upscaler SYSTEM PRIVATE "${SMAAAreaTex_SOURCE_DIR}" "${SMAASearchTex_SOURCE_DIR}")
 snx_glsl_spirv(snx_vk SOURCE gpu/texture/astc.comp NAME astc_spv HEADER nx/gpu/texture/astc_spv.h)
 # ASTC blocks straight into BC7 blocks, for a GPU that samples BC7 and not ASTC (gpu/vk/astc.c), in the encoder's
 # builds: the full one; the fast one, every mode only where mode 6 is not close, for large levels; mode 6 alone for the
@@ -300,6 +349,7 @@ snx_glsl_spirv(snx_vk SOURCE gpu/vk/query_predicate.comp NAME query_predicate_sp
                HEADER nx/gpu/vk/query_predicate_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/query_count.comp NAME query_count_spv HEADER nx/gpu/vk/query_count_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/xfb_indirect.comp NAME xfb_indirect_spv HEADER nx/gpu/vk/xfb_indirect_spv.h)
+snx_glsl_spirv(snx_vk SOURCE gpu/vk/indirect_quads.comp NAME indirect_quads_spv HEADER nx/gpu/vk/indirect_quads_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/depth_pack.comp NAME depth_pack_spv HEADER nx/gpu/vk/depth_pack_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/shading_rate.comp NAME shading_rate_spv HEADER nx/gpu/vk/shading_rate_spv.h)
 snx_glsl_spirv(snx_vk SOURCE gpu/vk/mirror_harvest.comp NAME mirror_harvest_spv HEADER nx/gpu/vk/mirror_harvest_spv.h)
@@ -373,6 +423,8 @@ include("${PROJECT_SOURCE_DIR}/cmake/window_icon.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/build_info.cmake")
 include("${PROJECT_SOURCE_DIR}/cmake/pad_sdl.cmake")
 target_link_libraries(snx_platform PRIVATE SDL3::SDL3 snx_window_icon snx_build_info snx_pad_sdl snx_splash snx_notice)
+# the controller applet's dialog listens for Joy-Con 2 adverts while it shows (ctrl_scan.h)
+target_link_libraries(snx_platform PRIVATE snx_ble_system)
 if(WIN32)
     target_link_libraries(snx_platform PUBLIC synchronization powrprof) # plat_wait_word's WaitOnAddress, the power notification
 endif()
@@ -381,6 +433,9 @@ if(APPLE AND NOT IOS) # plat_posix.c's power source: IOKit's notifications on Co
 endif()
 # the build is part of the key of the shader files, .vkshaders and .vkshipped (gpu/vk/pipeline.c)
 target_link_libraries(snx_vk PRIVATE snx_build_info FFmpeg::avutil) # vk/nvdec.c: FFmpeg's Vulkan device and pictures
+# and so are the translator's compile flags, where they aren't a normal build's
+include("${PROJECT_SOURCE_DIR}/cmake/shader_flags.cmake")
+snx_shader_flags_of(gpu/vk/pipeline.c)
 # the game's menu in YoRHa's colours, from src/gui/themes/yorha/theme.ini (cmake/gui_themes.cmake), and the shader
 # loading screen's when the launcher's theme can't be read
 target_include_directories(snx_platform PRIVATE "${PROJECT_BINARY_DIR}/generated")

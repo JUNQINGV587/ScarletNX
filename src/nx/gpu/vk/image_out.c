@@ -5,6 +5,7 @@
 #include <stdatomic.h>
 #include "nx/gpu/gpu.h"
 #include "nx/gpu/renderer.h"
+#include "nx/gpu/vk/addr_gens.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/pending_pages.h"
 #include "nx/hle/services/nvdrv.h"
@@ -118,6 +119,7 @@ void vk_gfx_image_record(Surf* surf, u8* original, u32 size, u64 after, const Vk
                                                          .keep = k};
     atomic_store_explicit(&g_gfx_img_any, 1, memory_order_relaxed);
     pend_add(&g_img_pages, surf->gva, size, 1);
+    if (g_settings.texture_events_shadow) addr_gens_bump(ADDR_GENS_WRITE, surf->gva, size); /* item 7b's events */
 }
 /* [cpu, cpu + n) meets the image's bytes: the first run ending past cpu starts before cpu + n */
 static int image_meets(const GfxImageOut* out, u64 cpu, u64 n) {
@@ -210,6 +212,12 @@ static void image_land(size_t index) {
     GfxImageOut* o = &g_image_out.out[index];
     u64 id = o->id, keep_size = 0;
     u8* keep = NULL;
+    /* the bytes this landing publishes, and why it had to land */
+    SNX_ZONE_TV(z, "vk mem image land", o->size, "%s, %u runs, %u bytes",
+                o->original ? "merged with the CPU's writes" : o->after ? "after the entry it goes on from" : "from its copy",
+                (unsigned)o->nruns, o->size);
+    static const char k_bytes[] = "vk mem image land bytes";
+    SNX_PLOT(k_bytes, (double)o->size);
     vk_devmem_invalidate(o->back_mem, o->back_off, o->back_size);
     vk_surf_flush_land(o->surf, o->back, o->original, o->wgen, image_followed(id) ? &keep : NULL, &keep_size);
     image_follow(id, keep, keep_size);

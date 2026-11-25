@@ -23,6 +23,7 @@
 #include "nx/hle/services/vi.h"
 #include "nx/hle/services/nvdrv.h"
 #include "nx/hle/services/native_video.h"
+#include "nx/hle/services/gsv.h"
 #include "nx/hle/services/network/network.h"
 #include "nx/hle/filesystem/fs.h"
 #include "nx/hle/hook/hook.h"
@@ -30,6 +31,7 @@
 #include "nx/nn/time.h"
 #include "nx/nn/pl.h"
 #include "nx/nn/prepo.h"
+#include "nx/nn/tvmr_jpeg.h"
 #include "nx/hle/pool.h"
 
 typedef struct {
@@ -52,6 +54,7 @@ typedef struct {
     HleMisc misc;
     HleNvdrv nvdrv;
     HleNativeVideo native_video;
+    HleGsv gsv;
     HleSet set;
     HleSm sm;
     HleVi vi;
@@ -65,6 +68,7 @@ typedef struct {
     HleTime time; /* the native nn::time (nn/time.c) */
     HlePl pl;     /* the native nn::pl (nn/pl.c) */
     HlePrepo prepo; /* the native nn::prepo (nn/prepo.c) */
+    HleTvmrJpeg tvmr_jpeg; /* the movie library's native JPEG decoder and encoder (nn/tvmr_jpeg.c) */
     /* the hooks' guest memory (hook.h); the functions hooked are the process's, in g_host */
     HleHook hook;
 } Hle;
@@ -88,11 +92,13 @@ typedef struct {
     HostVi vi;
     HostNvdrv nvdrv;
     HostNativeVideo native_video;
+    HostGsv gsv;
     HostBsd bsd;
     HostLdn ldn;
     HostSsl ssl;
     HostFs fs;
     HostHook hook;
+    HostTvmrJpeg tvmr_jpeg;
 } HleHost;
 extern HleHost g_host;
 /* The HLE's thread state: each thread's own, all zero when it starts, one member for each file that keeps any

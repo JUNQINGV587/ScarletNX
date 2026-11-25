@@ -8,6 +8,7 @@
 #include "common/utilities/bits.h"
 #include "common/utilities/spirv_emit.h"
 #include "nx/gpu/shader/translator.h"
+#include "nx/gpu/shader/warp_notes.h"
 #include <assert.h>
 #include <stdlib.h>
 
@@ -40,6 +41,7 @@ typedef struct {
     /* A pure instruction's guard while it is translated: it runs unguarded and each register, predicate and flag it
        writes keeps its old value where the guard is false, in place of a branch around it. 0 otherwise */
     u32 guard;
+    ShNotes* notes; /* NULL but where a lone lane's proof needs them */
     u32 pred[7];
     u32 cc_c, cc_o, cc_z, cc_s;
     u32 cbuf[18], cbuf_pointer[18];
@@ -82,7 +84,7 @@ typedef struct {
     u32 depth_type, depth_sampler; /* the swapped slot's depth type and element, 0 for a kind with no depth views */
     u32 swapped;                   /* 1 + the slot whose sampler is an array element for this instruction */
     u32 image[8], image_type[8];
-    u32 gbuf[16], gbuf_pointer, mbase, mbase_pointer, smap, subgroup_lane_input;
+    u32 gbuf[16], gbuf_pointer, smap, subgroup_lane_input;
     /* a compute program's write log (write_log.c, 0 for none), and its part for each global buffer + 1 (0: none): every
        store and atomic records the bytes it writes there */
     u32 wlog;
@@ -90,7 +92,7 @@ typedef struct {
     int quad; /* quad operations are declared: shader_shfl_quad's SHFL are ones */
     /* A fragment program run as one lane alone, where the stage has no subgroup: its place in its 2x2 quad (x's parity
        in bit 0, y's in bit 1, from FragCoord, as Vulkan groups the pixels of a fine derivative) and, for each axis,
-       1.0 where the other pixel of its pair along it comes after it and -1.0 where before (emit_thread.c's
+       1.0 where the other pixel of its pair along it comes after it and -1.0 where before (sail/sm53_thread_spirv.h's
        quad_read). 0 in other programs */
     u32 quad_lane, quad_sign[2];
     /* A fragment program with flow discards nothing inside its loop: a KIL or a failed alpha test sets this bool,
@@ -239,6 +241,9 @@ int shader_direct_screen_uv(const ShFlow* f, u32 index, u32 x, u32 y);
 int shader_direct_screen_ndc_uv(const ShFlow* f, u32 index, u32 x, u32 y, int* yneg);
 u32 shader_direct_screen_out(const ShFlow* f, u32* yneg);
 int shader_direct_plain_uv(const ShFlow* f, u32 index, u32 x, u32 y);
+/* the IPA at index, one that isn't indexed, multiplies what it reads by the reciprocal of a[0x7c], the interpolated
+   1 / w, in a register that holds nothing else there however control went: IPA.MUL with that MUFU.RCP's register */
+int shader_direct_ipa_over_w(const ShFlow* f, u32 index);
 u32 shader_direct_uv_out(const ShFlow* f, u32* yneg);
 u32 shader_direct_position_out(const ShFlow* f);
 int shader_direct_track_const(const ShFlow* f, u32 index, u32 reg, u32* value, int depth);
@@ -249,26 +254,12 @@ int shader_direct_track_cbuf_word(const ShFlow* f, u32 index, u32 reg, u32* bank
 int shader_direct_track_image_handle(const ShFlow* f, u32 index, u32 reg, u32* bank, u32* off, int depth);
 int shader_direct_track_image_handle_pair(const ShFlow* f, u32 index, u32 reg, u32* bank, u32* off, u32* bank2,
                                           u32* off2, int depth);
-/* the most constant buffer handles one register-handle bind chooses among (shader_direct_handle_choice) */
+/* the most constant buffer handles one TEX.B chooses among (shader_direct_handle_candidates) */
 #define SH_HANDLE_CANDIDATES 4
 int shader_direct_handle_candidates(const ShFlow* f, u32 index, u32 reg, u32* banks, u32* offs, int max);
 /* Two-word and mixed candidates for a predicated write in the use's own block. */
 int shader_direct_handle_candidates_pair(const ShFlow* f, u32 index, u32 reg, u32* banks, u32* offs, u32* bank2s,
                                          u32* off2s, u8* words, int max);
-/* The constant buffer words a runtime handle register holds, from the writes the use sees: one per path a predicated
-   write selects between. The bind samples or queries each candidate's texture and selects by the runtime word; a use
-   whose paths do not all name a handle keeps the untracked refusal. */
-typedef struct ShHandleChoice {
-    int count;
-    u32 bank[SH_HANDLE_CANDIDATES], off[SH_HANDLE_CANDIDATES];
-    u32 bank2[SH_HANDLE_CANDIDATES], off2[SH_HANDLE_CANDIDATES];
-    u8 words[SH_HANDLE_CANDIDATES];
-} ShHandleChoice;
-int shader_direct_handle_choice(const ShFlow* f, u32 index, u32 reg, ShHandleChoice* choice);
-/* The one line the runtime logs for the first program that chooses its texture: the bind, its use site, the register,
-   and each candidate's constant buffer word. */
-void shader_direct_handle_note(char* why, size_t size, const char* bind, u32 index, u32 reg,
-                               const ShHandleChoice* choice);
 int shader_al2p_predicate_unseen(const ShFlow* f, u32 at);
 u32 shader_direct_indexed_handle(const ShFlow* f, u32 index, u32 reg, int stage, u32* ldc);
 int shader_direct_bindless_matches(const ShTex* t, u32 bank, int handle_count, u32 bank2, u32 off2, u32 indexed,
@@ -277,12 +268,21 @@ int shader_direct_query_type(const ShFlow* f, int bindless, u32 bank, u32 off, u
 /* A compacted Maxwell memory-handle chain, and the probe of a use whose original definition it contains. */
 u32 shader_direct_memory_handle(const ShFlow* f, ShaderInfo* si, u32 memh_at[SH_MEMH_MAX], u32* count, u32 use,
                                 u32 reg);
+void shader_direct_memory_finish(const ShFlow* f, ShaderInfo* si, u32 memh_at[SH_MEMH_MAX], u32 count, ShTex* textures,
+                                 int texture_count);
 u32 shader_direct_memory_probe(const ShFlow* f, const ShaderInfo* si, const u32 memh_at[SH_MEMH_MAX], u32 use,
                                u32 reg);
 u32* shader_untracked_handle(ShaderInfo* si, const char* kind, const u64* insn, u32 i, u32 reg);
 u32* shader_untracked_reject(ShaderInfo* si, const u64* insn, u32 i, u32 reg, u8* gb_at, u32* pop_targets);
 int shader_legacy_varyings(const u64* insn, u32 n, u32 words, const u32* sph, int stage, ShaderInfo* si, u64** moved,
                            u32* fs_groups);
+/* warp_idioms.c: whether a compute program whose notes these are gives with each invocation a warp of its own what it
+   gives on the console, 0 with the reason in why. pop_targets: each SYNC, BRK and CONT's, NULL where they aren't known */
+int shader_lone_lane_gives(const ShFlow* f, const u32* pop_targets, const ShNotes* notes, const ShaderInfo* si,
+                           char* why, size_t size);
+/* the same of a program in pseudo instructions (warp_notes.h, sm86_lone.c) */
+int shader_lone_lane_gives_pseudo(const ShFlow* f, const ShNotes* notes, const ShaderInfo* si, const ShLanePlan* plan,
+                                  char* why, size_t size);
 /* emit_int.c */
 u32 shader_vm_select(DirectCtx* c, u32 i32_type, u32 value, u32 select);
 u32 shader_video_operand(DirectCtx* c, u32 i32_type, u32 i64_type, u32 u64_type, u32 value, u32 select);
@@ -462,7 +462,7 @@ static inline void var_write(DirectCtx* c, u32 v, u32 value) {
     c->var_dirty[v] = 1;
 }
 
-static inline u32 reg_read(DirectCtx* c, u32 r) {
+static inline u32 reg_value(DirectCtx* c, u32 r) {
     if (r >= 255) return c->zero;
     if (c->var_block[r] == c->emit.block && (c->var_val[r] || c->reg_alt_type[r])) {
         if (!c->var_val[r]) c->var_val[r] = shader_cast(c, c->u32_type, c->reg_alt[r], c->reg_alt_type[r]);
@@ -475,9 +475,15 @@ static inline u32 reg_read(DirectCtx* c, u32 r) {
     return c->var_val[r];
 }
 
+static inline u32 reg_read(DirectCtx* c, u32 r) {
+    if (c->notes && r < 255) shader_note(c->notes, r, 0);
+    return reg_value(c, r);
+}
+
 static inline void reg_write(DirectCtx* c, u32 r, u32 value) {
     if (r >= 255) return;
-    if (c->guard) value = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->u32_type, c->guard, value, reg_read(c, r));
+    if (c->notes) shader_note(c->notes, r, 1);
+    if (c->guard) value = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->u32_type, c->guard, value, reg_value(c, r));
     var_write(c, r, value);
     c->reg_alt_type[r] = 0;
 }
@@ -490,6 +496,7 @@ static inline void reg_write_as(DirectCtx* c, u32 r, u32 value, u32 type) {
         reg_write(c, r, spv_emit_unary(&c->emit, SPV_OP_BITCAST, c->u32_type, value));
         return;
     }
+    if (c->notes) shader_note(c->notes, r, 1);
     var_write(c, r, 0);
     c->reg_alt[r] = value;
     c->reg_alt_type[r] = type;
@@ -497,6 +504,7 @@ static inline void reg_write_as(DirectCtx* c, u32 r, u32 value, u32 type) {
 /* register r into register d as the block holds it (MOV): a value of another type whose bits nothing has asked for
    stays that value in d, and its bits are still not made */
 static inline void reg_copy(DirectCtx* c, u32 d, u32 r) {
+    if (c->notes && r < 255) shader_note(c->notes, r, 0);
     if (r < 255 && !c->var_val[r] && c->var_block[r] == c->emit.block && c->reg_alt_type[r])
         reg_write_as(c, d, c->reg_alt[r], c->reg_alt_type[r]);
     else
@@ -504,6 +512,7 @@ static inline void reg_copy(DirectCtx* c, u32 d, u32 r) {
 }
 static inline u32 reg_read_as(DirectCtx* c, u32 r, u32 type) {
     if (r >= 255) return shader_cast(c, type, c->zero, c->u32_type);
+    if (c->notes) shader_note(c->notes, r, 0);
     if (c->var_block[r] == c->emit.block && c->reg_alt_type[r] == type) return c->reg_alt[r];
     u32 bits = reg_read(c, r);
     c->reg_alt[r] = shader_cast(c, type, bits, c->u32_type);
@@ -550,22 +559,30 @@ static inline u32 shader_select(DirectCtx* c, u32 type, u32 condition, u32 yes, 
 }
 
 static inline u32 pred_read(DirectCtx* c, u32 p, int negative) {
+    if (c->notes && p < 7) shader_note(c->notes, VAR_PRED + p, 0);
     u32 value = p == 7 ? c->true_value : var_read(c, VAR_PRED + p);
     return negative ? cc_not(c, value) : value;
 }
 
 static inline void pred_write(DirectCtx* c, u32 p, u32 value) {
     if (p >= 7) return;
-    if (c->guard) value = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->bool_type, c->guard, value, pred_read(c, p, 0));
+    if (c->notes) shader_note(c->notes, VAR_PRED + p, 1);
+    if (c->guard)
+        value = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->bool_type, c->guard, value, var_read(c, VAR_PRED + p));
     var_write(c, VAR_PRED + p, value);
 }
 
 /* a condition code flag (its variable, c->cc_z...): its value, and written, kept as it was where a pure
    instruction's guard is false */
-static inline u32 flag_read(DirectCtx* c, u32 flag) { return var_read(c, flag_var(c, flag)); }
+static inline u32 flag_read(DirectCtx* c, u32 flag) {
+    if (c->notes) shader_note(c->notes, flag_var(c, flag), 0);
+    return var_read(c, flag_var(c, flag));
+}
 static inline void cc_store(DirectCtx* c, u32 flag, u32 value) {
-    if (c->guard) value = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->bool_type, c->guard, value, flag_read(c, flag));
-    var_write(c, flag_var(c, flag), value);
+    u32 v = flag_var(c, flag);
+    if (c->notes) shader_note(c->notes, v, 1);
+    if (c->guard) value = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->bool_type, c->guard, value, var_read(c, v));
+    var_write(c, v, value);
 }
 
 static inline u32* direct_reject(ShaderInfo* si, const char* reason) {
@@ -574,13 +591,8 @@ static inline u32* direct_reject(ShaderInfo* si, const char* reason) {
     return NULL;
 }
 
-static inline u32* direct_reject_with_buffers(ShaderInfo* si, const char* reason, u32* pop_targets, u8* gb_at) {
-    free(gb_at);
-    free(pop_targets);
-    return direct_reject(si, reason);
-}
 /* What to_spirv sets up before it writes the program's instructions and each family's function reads
-   (emit_flow, emit_io...): the types, the interface variables, the resource slots and the facts its prescan
+   (sm53_sail.c's instructions): the types, the interface variables, the resource slots and the facts its prescan
    found, each named as to_spirv names it, an array by its first element */
 typedef struct {
     ShaderInfo* si;
@@ -698,12 +710,31 @@ typedef struct {
     u8* block_start;
     ShStructure* structure;
 } Tr;
-/* each family of instructions: writes the instruction i (its word w, opcode op, and fields d, a, b) when one of its branches takes it; op_family (spirv_translate.c) sends each opcode to its family */
-void emit_flow(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
-void emit_io(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
-void emit_thread(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
-void emit_int(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
-void emit_float(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
-void emit_memory(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
-void emit_texture(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
+/* emit_memory.c's, which sail/sm53_memory_spirv.h's instructions take: the constant buffer word of a bank picked at run
+   time from first on, a global slot's bytes written at a byte offset (for its write-back), a shared word's pointer */
+u32 shader_cbuf_read_bank(DirectCtx* c, u32 first, u32 bank, u32 address);
+void shader_log_written(DirectCtx* c, int stage, u32 slot, u32 offset, u32 bytes);
+u32 shader_shared_pointer(DirectCtx* c, const Tr* t, u32 index);
+/* the instruction from SM53's Sail (sm53_sail.c, sail/sm53.sail): 1 when a root of it takes the opcode */
+int sm53_sail_emit(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
+/* whether a root of sail/sm53.sail takes the opcode: one none takes is refused */
+int sm53_sail_takes(int op);
+/* What the instructions of sail/sm53_<family>.sail run of the families' files, each as it was a branch of the family's
+   emitter: the instruction i (its word w, opcode op, and fields d, a, b) */
+/* EXIT's end of the program (emit_flow.c), which sail/sm53_flow.sail's EXIT runs */
+void shader_exit(const Tr* t, u32 i, u64 w);
+/* F2F's, F2I's and I2F's conversions (emit_float.c), which sail/sm53_float.sail's instructions run */
+void shader_f2f(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
+void shader_f2i(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
+void shader_i2f(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
+/* the texture and surface instructions' lowerings (emit_texture.c), which sail/sm53_texture.sail's run */
+void shader_tex_tld(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
+void shader_tex_surface(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
+void shader_tex_tlds(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
+void shader_tex_texs(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
+void shader_tex_tex(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
+void shader_tex_txd(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
+void shader_tex_txq(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
+void shader_tex_tmml(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
+void shader_tex_tld4(const Tr* t, u32 i, u64 w, int op, u32 d, u32 a, u32 b);
 #endif

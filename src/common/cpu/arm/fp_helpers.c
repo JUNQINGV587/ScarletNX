@@ -26,6 +26,10 @@
 #define snx_fp_round_int snx_arm_soft_round_int
 #define snx_fp_jcvt     snx_arm_soft_jcvt
 #define snx_fp_bfcvt    snx_arm_soft_bfcvt
+#define snx_fp_scale    snx_arm_soft_scale
+#define snx_fp8_widen   snx_arm_soft_fp8_widen
+#define snx_fp8_narrow  snx_arm_soft_fp8_narrow
+#define snx_fp8_dot     snx_arm_soft_fp8_dot
 #define urecpe32        snx_arm_soft_urecpe32
 #define ursqrte32       snx_arm_soft_ursqrte32
 #include "common/cpu/aarch64/cpu.h"
@@ -259,4 +263,9 @@ uint64_t snx_arm_fp(SnxArmCPU* cpu, uint64_t x, uint64_t y, uint64_t add, uint32
     }
     cpu->fpscr |= c.fpsr & 0x9f;
     return result;
+}
+/* snx_arm_fp for the x86-64 back end's blocks, whose cold calls take four arguments after the state: the op in desc's
+   bits 7:0, the width in 15:8, the param in 63:32 */
+uint64_t snx_arm_fp_x64(SnxArmCPU* cpu, uint64_t x, uint64_t y, uint64_t add, uint64_t desc) {
+    return snx_arm_fp(cpu, x, y, add, (uint32_t)desc & 255, ((uint32_t)desc >> 8) & 255, (uint32_t)(desc >> 32));
 }

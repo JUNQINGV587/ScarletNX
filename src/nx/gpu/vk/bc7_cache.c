@@ -1,108 +1,60 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* The BC7 blocks of ASTC levels encoded before (astc.c), kept across runs in one file: shader_cache/<game>.vkbc7.
-   Where the GPU samples BCn but not ASTC, a level encoded as BC7 costs the GPU 3 to 5 ms (the full encoder on 256x256,
-   the fast build on 4096x4096, docs/layers/gpu/astc.md), and the memory budget's trim evicts textures that the game then uses
-   again: one game encoded the same levels 6,000 to 14,000 times in 150 seconds. The blocks never change for the same
-   ASTC bytes, so the first encode's blocks are kept, read back from the GPU when its submission is done, and every
-   later upload of that level copies them into the image with no decode and no encode.
+/* The BC7 blocks of ASTC levels encoded before (astc.c), kept in memory while the game runs. Where the GPU samples BCn
+   but not ASTC, a level encoded as BC7 costs the GPU 3 to 5 ms (the full encoder on 256x256, the fast build on
+   4096x4096, docs/layers/gpu/astc.md), and the memory budget's trim evicts textures that the game then uses again:
+   one game encoded the same levels 6,000 to 14,000 times in 150 seconds. The blocks never change for the same ASTC
+   bytes, so an encode's blocks are kept, read back from the GPU when its submission is done, and a later upload of
+   that level copies them into the image with no decode and no encode.
 
-   The file is a header (BC7_MAGIC, BC7_FILE_VERSION and the version the caller gives: the encoder, the shaders' SPIR-V,
-   the GPU and its driver, astc.c's vk_astc_cache_open) and records appended as they are made: {u64 key[2], u64 bytes,
-   u64 check} and the blocks, bytes of them, a multiple of 16. A file of another version starts over, and so does a
-   file that would pass its bound. Only the index is in memory (an entry of 32 bytes a record): a hit reads its
-   record's blocks from the file a piece at a time, through one buffer of BC7_PIECE bytes, checks them on the way and
-   writes them into the staging memory given. A record cut short by a crash ends the reading, and the file is cut
-   there; a record whose blocks don't check out on a read is dropped from the index, and the level is encoded again.
-   The file is locked while it is open (snx_lock_file), so a second game process runs without the cache rather than
-   writes the same file.
+   Not every level is kept: the cache holds max bytes of blocks (vk_bc7_cache_open), and of the levels the game uses
+   the ones it uses most. Every key met has an entry with its count of uses (an encode stored, a read), whether its
+   blocks are held or not; a level whose blocks find no room takes the room of held levels used less than it, and is
+   not kept when there are none (BC7_SWEEP entries looked at for each, from where the last look ended: the least used
+   of the ones seen, never of all). The counts halve every BC7_AGE_PRESENTS presents, so a scene the game left makes
+   room for the one it is in. At the system's word that its memory runs short (vk_bc7_cache_release) the blocks no
+   recent present used all go. A level not held is encoded again, as if the cache had never seen it.
 
-   Beside it, <file>.idx: the same header, then the index's entries in the file's order, {u64 key[2], u64 at, u64
-   bytes} (BC7_IDX), one appended with each record. The cache opens from it, where the records' own headers lie all
-   through the file: a racing game's 91,000 records, 4.3 GB, took minutes to open off a disk whose cache had let
-   the file go, where its index is 3 MB. An entry is taken while it lies past the last one and its blocks within the
-   file; the file is cut after the last one taken (a record after it, written as a crash came before its entry, is
-   lost). Without an index of the file's version, the records' headers are read as before and the index written from
-   them.
-
-   A hit of an upload whose command buffer the recording thread records (record.c) is read on that thread
-   (vk_bc7_cache_read_later): the GPU thread looks the record up in the index and goes on, and the recording thread
-   reads and checks the blocks into staging just before it records their copy. When they don't check out, it leaves
-   the copy out, and the GPU thread drops the record from the index and, at its next present, has the texture loaded
-   again (vk_bc7_cache_take_failed), which encodes the level as a failed read at once did. Read on the GPU thread, one game's hits took that thread 1.3 s in 110 s (32,000 levels, 2.5 GB). The
-   recording thread has its own handle on the file (Bc7Reader): on Windows a read at an offset moves the file position
-   of a handle, and the GPU thread's appends go by that position */
+   A hit of an upload whose command buffer the recording thread records (record.c) is copied into staging on that
+   thread (vk_bc7_cache_read_later), in order with the copy it is for: the GPU thread only looks the entry up. Blocks
+   that leave the cache are freed by that thread too, after the copies queued before (bc7_free): everything else here
+   is the GPU thread's */
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
-#if defined(__linux__)
-#include <fcntl.h>
-#endif
-#include "common/platform/file.h"
-#include "common/platform/time.h"
-#include "common/utilities/bits.h"
 #include "common/utilities/common.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/gpu/vk/vk.h"
 
-#define BC7_MAGIC        "SNXBC7\n"
-#define BC7_FILE_VERSION 1
-#define BC7_HEAD         32u /* the header: the magic's 8 bytes, the file version (u64) and the caller's version */
-#define BC7_REC          32u /* a record's header: its key, its bytes and their check */
-/* a hit's read goes through this many bytes at a time, which stay in the CPU's cache between the read and the copy */
-#define BC7_PIECE        (1u << 20)
-#define BC7_IDX          32u /* an index file's entry */
+/* the bound where the caller names none: this share of the machine's memory, between the two, and BC7_MAX_UNKNOWN on
+   a system that doesn't tell how much it has */
+#define BC7_MAX_SHARE    8u
+#define BC7_MAX_LEAST    (64ull << 20)
+#define BC7_MAX_MOST     (2048ull << 20)
+#define BC7_MAX_UNKNOWN  (256ull << 20)
+#define BC7_SWEEP        4096u /* entries looked at for the room of one level */
+#define BC7_AGE_PRESENTS 3600u
 
-/* an index entry: a record's key and where its blocks start in the file */
 typedef struct {
     u64 key[2];
-    u64 at;   /* 0: a free slot (the header comes first) */
-    u64 size; /* 0: a record that didn't check out, whose slot stays taken so that probes go on past it */
+    u8* blocks;  /* NULL: not held */
+    u64 size;    /* the blocks' bytes; of a level not held, those of its last ones, 0 before any */
+    u32 uses;    /* 0: a free slot */
+    u32 present; /* g_vk_present at its last use */
 } Bc7Entry;
 
-/* the recording thread's side (vk_bc7_cache_read_later): its own handle and buffer, and the reads that it found did
-   not check out. The GPU thread drops their records from the index (bc7_drop_failed), and gives them to their owners
-   (vk_bc7_cache_take_failed). The atomics that both threads write each have a cache line */
 typedef struct {
-    u64 key[2], at;
-    void* owner; /* vk_bc7_cache_read_later's */
-    u64 gva;
-    int dropped; /* out of the index already */
-} Bc7Failed;
-typedef struct {
-    FILE* _Atomic f; /* atomic, the GPU thread's: NULL, the hits are read on the GPU thread */
-    PMutex m; /* failed, nfailed and cap */
-    u32 cap;
-    Bc7Failed* failed;
-    int init;  /* m made */
-    int tried; /* f opened, or that failed, since the cache opened */
-    char pad0[64];
-    _Atomic u32 nfailed; /* atomic: looked at without m */
-    char pad1[64];
-    _Atomic u64 ns; /* atomic: what the reads of both threads took */
-    char pad2[64];
-    _Atomic u64 bytes; /* atomic: what they read */
-    char pad3[64];
-    _Atomic u64 hits; /* atomic, the recording thread's */
-    u8 piece[BC7_PIECE];
-} Bc7Reader;
-
-typedef struct {
-    FILE* f;   /* NULL: no cache */
-    FILE* idx; /* the index file: NULL where it couldn't be written (the next run reads the records' headers) */
-    intptr_t lock;
-    char path[1200];
-    u64 version[2];
-    u64 end; /* where the next record goes */
-    u64 max; /* the file's bound */
     Bc7Entry* map;
-    u32 cap; /* slots in map, a power of two */
+    u32 cap; /* slots in map, a power of two; 0: no cache */
     u32 used;
-    u64 hits, stored, restarts;
-    int started_empty;   /* it held no level as it opened (vk_bc7_cache_cold) */
-    u8 piece[BC7_PIECE]; /* what a close clears ends before it */
-    Bc7Reader rd;        /* kept over a close: its failed reads go to their owners still */
+    u32 hand;  /* where the next look for room starts */
+    u32 aged;  /* g_vk_present when the counts last halved */
+    u64 max;   /* the bound, in bytes of blocks */
+    u64 bytes; /* held now */
+    u64 hits, stored, evicted, refused, released;
+    _Atomic u64 later; /* atomic, the recording thread's: the hits it copied */
 } Bc7Cache;
 static Bc7Cache g_bc7_cache;
 
@@ -123,338 +75,132 @@ void vk_bc7_key(const u64 content[2], const VkBc7Level* lv, u64 key[2]) {
     vk_hash128(words, sizeof words, key);
 }
 
-/* a payload's check: its pieces' hashes, folded */
-static u64 bc7_check_step(u64 h, u64 piece) { return snx_fnv_step(h, piece); }
-static u64 bc7_check(const u8* p, u64 size) {
-    u64 h = SNX_FNV_BASIS;
-    for (u64 o = 0; o < size; o += BC7_PIECE)
-        h = bc7_check_step(h, vk_hash(p + o, size - o < BC7_PIECE ? size - o : BC7_PIECE));
-    return h;
+/* blocks out of the cache, freed after the copies of them the recording thread still has queued */
+static void bc7_free_run(const void* arg) {
+    u8* p;
+    memcpy(&p, arg, sizeof p);
+    free(p);
+}
+static void bc7_free(u8* blocks) { vk_rec_call(bc7_free_run, &blocks, sizeof blocks); }
+static void bc7_drop(Bc7Entry* e) {
+    g_bc7_cache.bytes -= e->size;
+    bc7_free(e->blocks);
+    e->blocks = NULL;
 }
 
 /* key's slot: its entry, or the free slot where it would go */
 static Bc7Entry* bc7_slot(const u64 key[2]) {
     for (u32 i = (u32)key[0] & (g_bc7_cache.cap - 1);; i = (i + 1) & (g_bc7_cache.cap - 1)) {
         Bc7Entry* e = &g_bc7_cache.map[i];
-        if (!e->at || (e->key[0] == key[0] && e->key[1] == key[1])) return e;
+        if (!e->uses || (e->key[0] == key[0] && e->key[1] == key[1])) return e;
     }
 }
-/* the record of key at `at` in the index, over an older one of the same key: 0 when memory ran out */
-static int bc7_index(const u64 key[2], u64 at, u64 size) {
-    if ((u64)(g_bc7_cache.used + 1) * 2 > g_bc7_cache.cap) {
-        u32 cap = g_bc7_cache.cap * 2;
-        Bc7Entry *old = g_bc7_cache.map, *map = cap ? calloc(cap, sizeof *map) : NULL;
-        if (!map) return 0;
-        u32 was = g_bc7_cache.cap;
-        g_bc7_cache.map = map;
-        g_bc7_cache.cap = cap;
-        for (u32 i = 0; i < was; i++)
-            if (old[i].at) *bc7_slot(old[i].key) = old[i];
-        free(old);
-    }
+/* key's entry, made where it has none: NULL when memory ran out */
+static Bc7Entry* bc7_entry(const u64 key[2]) {
     Bc7Entry* e = bc7_slot(key);
-    g_bc7_cache.used += !e->at;
-    *e = (Bc7Entry){{key[0], key[1]}, at, size};
+    if (e->uses) return e;
+    if ((u64)(g_bc7_cache.used + 1) * 2 > g_bc7_cache.cap) {
+        const u32 was = g_bc7_cache.cap, cap = was * 2;
+        Bc7Entry *old = g_bc7_cache.map, *grown = cap ? calloc(cap, sizeof *grown) : NULL;
+        if (!grown) return NULL;
+        g_bc7_cache.map = grown;
+        g_bc7_cache.cap = cap;
+        g_bc7_cache.hand = 0;
+        for (u32 i = 0; i < was; i++)
+            if (old[i].uses) *bc7_slot(old[i].key) = old[i];
+        free(old);
+        e = bc7_slot(key);
+    }
+    *e = (Bc7Entry){.key = {key[0], key[1]}};
+    g_bc7_cache.used++;
+    return e;
+}
+
+/* the bound for a machine of total bytes of memory (known 0: the system didn't tell) */
+static u64 bc7_share(int known, u64 total) {
+    const u64 share = total / BC7_MAX_SHARE;
+    if (!known) return BC7_MAX_UNKNOWN;
+    return share < BC7_MAX_LEAST ? BC7_MAX_LEAST : share > BC7_MAX_MOST ? BC7_MAX_MOST : share;
+}
+
+int vk_bc7_cache_old_file(const char* path) {
+    const u64 size = snx_file_size(path);
+    if (!size) return 0;
+    WARN("vulkan: %s (%.1f MB) is a BC7 cache file of an earlier version, which this one does not read or write: "
+         "the BC7 cache is held in memory now. The game's Delete Old Caches in the launcher deletes it\n",
+         path, (double)size / 1048576.0);
     return 1;
-}
-
-/* the header of the file and of its index */
-static void bc7_head(u8 head[BC7_HEAD]) {
-    const u64 version = BC7_FILE_VERSION;
-    memset(head, 0, BC7_HEAD);
-    memcpy(head, BC7_MAGIC, 8);
-    memcpy(head + 8, &version, 8);
-    memcpy(head + 16, g_bc7_cache.version, 16);
-}
-/* the index file given up for this run: the next one reads the records' headers */
-static void bc7_idx_off(void) {
-    if (!g_bc7_cache.idx) return;
-    fclose(g_bc7_cache.idx);
-    g_bc7_cache.idx = NULL;
-    char path[1210];
-    snprintf(path, sizeof path, "%s.idx", g_bc7_cache.path);
-    remove(path);
-}
-/* the index file emptied to its header */
-static void bc7_idx_start_over(void) {
-    u8 head[BC7_HEAD];
-    bc7_head(head);
-    if (g_bc7_cache.idx && (snx_seek(g_bc7_cache.idx, 0) || fwrite(head, 1, BC7_HEAD, g_bc7_cache.idx) != BC7_HEAD ||
-                            fflush(g_bc7_cache.idx) || snx_cut(g_bc7_cache.idx, BC7_HEAD)))
-        bc7_idx_off();
-}
-/* a record's entry appended to the index file */
-static void bc7_idx_put(const u64 key[2], u64 at, u64 size) {
-    const u64 e[BC7_IDX / 8] = {key[0], key[1], at, size};
-    if (g_bc7_cache.idx && (fseek(g_bc7_cache.idx, 0, SEEK_END) || fwrite(e, 1, BC7_IDX, g_bc7_cache.idx) != BC7_IDX ||
-                            fflush(g_bc7_cache.idx)))
-        bc7_idx_off();
-}
-/* the index from the index file, over a file of size bytes: where its records end, 0 where the index file is not
-   this file's (another version, or not there) */
-static u64 bc7_idx_load(u64 size) {
-    u8 head[BC7_HEAD], have[BC7_HEAD];
-    bc7_head(head);
-    if (!g_bc7_cache.idx || snx_seek(g_bc7_cache.idx, 0) || fread(have, 1, BC7_HEAD, g_bc7_cache.idx) != BC7_HEAD ||
-        memcmp(head, have, BC7_HEAD))
-        return 0;
-    u64 end = BC7_HEAD, n = 0, e[(64u << 10) / 8];
-    size_t got;
-    int done = 0;
-    while (!done && (got = fread(e, 1, sizeof e, g_bc7_cache.idx)) >= BC7_IDX) {
-        for (size_t i = 0; i + BC7_IDX <= got && !done; i += BC7_IDX) {
-            const u64* r = e + i / 8;
-            /* past the last record, its blocks a whole number of 16 bytes within the file */
-            if (r[2] < end + BC7_REC || !r[3] || r[3] % 16 || r[3] > size || r[2] > size - r[3] ||
-                !bc7_index(r, r[2], r[3]))
-                done = 1;
-            else {
-                end = r[2] + r[3];
-                n++;
-            }
-        }
-        done |= got < sizeof e;
-    }
-    /* the entries taken, and nothing after them */
-    if (snx_cut(g_bc7_cache.idx, BC7_HEAD + n * BC7_IDX)) return 0;
-    return end;
-}
-/* the index file written anew from the index, its entries in the file's order */
-static int bc7_at_order(const void* a, const void* b) {
-    const u64 x = ((const Bc7Entry*)a)->at, y = ((const Bc7Entry*)b)->at;
-    return (x > y) - (x < y);
-}
-static void bc7_idx_write(void) {
-    bc7_idx_start_over();
-    if (!g_bc7_cache.idx) return;
-    Bc7Entry* all = malloc(((size_t)g_bc7_cache.used + 1) * sizeof *all);
-    if (!all) {
-        bc7_idx_off();
-        return;
-    }
-    u32 n = 0;
-    for (u32 i = 0; i < g_bc7_cache.cap; i++)
-        if (g_bc7_cache.map[i].at) all[n++] = g_bc7_cache.map[i];
-    qsort(all, n, sizeof *all, bc7_at_order);
-    for (u32 i = 0; i < n && g_bc7_cache.idx; i++) {
-        const u64 e[BC7_IDX / 8] = {all[i].key[0], all[i].key[1], all[i].at, all[i].size};
-        if (fwrite(e, 1, BC7_IDX, g_bc7_cache.idx) != BC7_IDX) bc7_idx_off();
-    }
-    if (g_bc7_cache.idx && fflush(g_bc7_cache.idx)) bc7_idx_off();
-    free(all);
-}
-
-/* the file emptied to its header, and the index with it: 0 when it couldn't be written */
-static int bc7_start_over(void) {
-    u8 head[BC7_HEAD];
-    bc7_head(head);
-    memset(g_bc7_cache.map, 0, (size_t)g_bc7_cache.cap * sizeof *g_bc7_cache.map);
-    g_bc7_cache.used = 0;
-    g_bc7_cache.end = BC7_HEAD;
-    bc7_idx_start_over();
-    return !snx_seek(g_bc7_cache.f, 0) && fwrite(head, 1, BC7_HEAD, g_bc7_cache.f) == BC7_HEAD &&
-           !fflush(g_bc7_cache.f) && !snx_cut(g_bc7_cache.f, BC7_HEAD);
-}
-
-/* the recording thread's handle closed once the reads queued before are done. It stays open where that thread does
-   not get to them (a fatal error stops it inside a packet): a read queued still takes the handle that it finds, or
-   fails with none. The failed reads stay for their owners */
-static void bc7_reader_close(void) {
-    FILE* f = atomic_load_explicit(&g_bc7_cache.rd.f, memory_order_acquire);
-    const int done = !f || vk_rec_sync_until(plat_ns() + 2000000000ull);
-    atomic_store_explicit(&g_bc7_cache.rd.f, NULL, memory_order_release);
-    if (f && done) fclose(f);
-    g_bc7_cache.rd.tried = 0;
 }
 
 void vk_bc7_cache_close(void) {
-    bc7_reader_close();
-    if (!g_bc7_cache.f) return;
-    if (g_bc7_cache.idx) fclose(g_bc7_cache.idx);
-    fclose(g_bc7_cache.f);
-    snx_unlock_file(g_bc7_cache.lock);
+    for (u32 i = 0; i < g_bc7_cache.cap; i++)
+        if (g_bc7_cache.map[i].blocks) bc7_free(g_bc7_cache.map[i].blocks);
     free(g_bc7_cache.map);
-    memset(&g_bc7_cache, 0, offsetof(Bc7Cache, piece)); /* its path and buffer make it over a megabyte */
+    g_bc7_cache.map = NULL;
+    g_bc7_cache.cap = g_bc7_cache.used = g_bc7_cache.hand = 0;
+    g_bc7_cache.max = g_bc7_cache.bytes = 0;
 }
 
-/* the cache off from now on, for why (an error writing or reading the file) */
-static void bc7_off(const char* why) {
-    WARN("vulkan: the BC7 cache %s is off for this run: %s\n", g_bc7_cache.path, why);
+int vk_bc7_cache_open(u64 max) {
     vk_bc7_cache_close();
-}
-
-int vk_bc7_cache_open(const char* path, const u64 version[2], u64 max) {
-    vk_bc7_cache_close();
-    if (snprintf(g_bc7_cache.path, sizeof g_bc7_cache.path, "%s", path) >= (int)sizeof g_bc7_cache.path) return 0;
-    int locked = snx_lock_file(path, &g_bc7_cache.lock);
-    if (locked) {
-        LOG("vulkan: the BC7 cache %s is %s: none this run\n", path,
-            locked > 0 ? "in use by another process" : "not to be locked");
-        return 0;
-    }
-    g_bc7_cache.f = snx_fopen(path, "r+b");
-    if (!g_bc7_cache.f) {
-        snx_unlock_file(g_bc7_cache.lock);
-        memset(&g_bc7_cache, 0, offsetof(Bc7Cache, piece));
-        return 0;
-    }
+    g_bc7_cache.hits = g_bc7_cache.stored = g_bc7_cache.evicted = g_bc7_cache.refused = g_bc7_cache.released = 0;
+    atomic_store_explicit(&g_bc7_cache.later, 0, memory_order_relaxed);
     g_bc7_cache.map = calloc(1024, sizeof *g_bc7_cache.map);
     if (!g_bc7_cache.map) {
-        bc7_off("out of memory");
+        WARN("vulkan: no memory for the BC7 cache's table: every ASTC level is encoded each time it loads\n");
         return 0;
     }
     g_bc7_cache.cap = 1024;
-    g_bc7_cache.max = max;
-    memcpy(g_bc7_cache.version, version, 16);
-    {
-        char idx[1210];
-        snprintf(idx, sizeof idx, "%s.idx", path);
-        g_bc7_cache.idx = snx_fopen(idx, "r+b");
-        if (!g_bc7_cache.idx) g_bc7_cache.idx = snx_fopen(idx, "w+b");
-    }
-    u64 head[BC7_HEAD / 8];
-    int same = fread(head, 1, BC7_HEAD, g_bc7_cache.f) == BC7_HEAD && !memcmp(head, BC7_MAGIC, 8) &&
-               head[1] == BC7_FILE_VERSION && head[2] == version[0] && head[3] == version[1];
-    if (!same) {
-        if (!bc7_start_over()) {
-            bc7_off("its header could not be written");
-            return 0;
-        }
-        LOG("vulkan: the BC7 cache %s starts empty\n", path);
-        g_bc7_cache.started_empty = 1;
-        return 1;
-    }
-    /* the records' headers, each where the one before it ends, until one is cut short or makes no sense. Read where
-       they lie (plat_pread), not through the stream: after a seek each read of 32 bytes filled the stream's buffer of a
-       block (128 KiB on ZFS), and a racing game's cache of 84,000 records, 4.3 GB, took minutes to open */
-    if (fseek(g_bc7_cache.f, 0, SEEK_END)) {
-        bc7_off("its size could not be read");
-        return 0;
-    }
-    const int64_t told = snx_tell(g_bc7_cache.f);
-    const u64 size = told < 0 ? 0 : (u64)told;
-    u64 at = bc7_idx_load(size), bytes = 0;
-    const int from_idx = at != 0;
-    if (from_idx)
-        for (u32 i = 0; i < g_bc7_cache.cap; i++) bytes += g_bc7_cache.map[i].at ? g_bc7_cache.map[i].size : 0;
-    else
-        at = BC7_HEAD;
-    while (!from_idx && size - at >= BC7_REC) {
-        u64 rec[BC7_REC / 8];
-        if (plat_pread(g_bc7_cache.f, rec, BC7_REC, at) != BC7_REC) break;
-        if (!rec[2] || rec[2] % 16 || rec[2] > size - at - BC7_REC) break;
-        if (!bc7_index(rec, at + BC7_REC, rec[2])) break;
-        bytes += rec[2];
-        at += BC7_REC + rec[2];
-    }
-    g_bc7_cache.end = at;
-    if (at < size && snx_cut(g_bc7_cache.f, at)) {
-        bc7_off("a record cut short could not be cut off");
-        return 0;
-    }
-    if (!from_idx) bc7_idx_write();
-#if defined(__linux__)
-    /* a hit reads one level's records, wherever they lie: the kernel's readahead past them (64 MiB a read on one USB
-       disk of 40 MB/s) took that disk from the game's own reads for seconds while a very large level's pieces loaded
-       (astc.c's bg_load) */
-    posix_fadvise(fileno(g_bc7_cache.f), 0, 0, POSIX_FADV_RANDOM);
-#endif
-    LOG("vulkan: the BC7 cache %s holds %u levels of %llu MB\n", path, g_bc7_cache.used,
-        (unsigned long long)(bytes >> 20));
-    g_bc7_cache.started_empty = !g_bc7_cache.used;
+    SnxU64 total = 0;
+    const int known = snx_memory_total(&total);
+    g_bc7_cache.max = max ? max : bc7_share(known, total);
+    g_bc7_cache.aged = g_vk_present;
+    LOG("vulkan: the BC7 cache keeps the ASTC levels the game uses most in memory, %llu MB of them at most\n",
+        (unsigned long long)(g_bc7_cache.max >> 20));
     return 1;
 }
-int vk_bc7_cache_cold(void) { return g_bc7_cache.started_empty; } /* a close clears it */
+u64 vk_bc7_cache_max(void) { return g_bc7_cache.cap ? g_bc7_cache.max : 0; }
 
-/* size bytes of key's record, its blocks at `at`, read from f through piece and checked on the way into dst: 1, 0 when
-   they don't check out, -1 when its header can't be read */
-static int bc7_read_at(FILE* f, u8* piece, const u64 key[2], u64 at, u64 size, u8* dst) {
-    u64 rec[BC7_REC / 8];
-    const u64 t0 = plat_ns();
-    /* where they lie, as the index's scan reads them: through the stream, a record of 16 KiB read a block of 128 */
-    if (plat_pread(f, rec, BC7_REC, at - BC7_REC) != BC7_REC) return -1;
-    u64 h = SNX_FNV_BASIS;
-    for (u64 o = 0; o < size && rec[0] == key[0] && rec[1] == key[1] && rec[2] == size; o += BC7_PIECE) {
-        size_t n = (size_t)(size - o < BC7_PIECE ? size - o : BC7_PIECE);
-        if (plat_pread(f, piece, n, at + o) != (int64_t)n) break;
-        h = bc7_check_step(h, vk_hash_copy(dst + o, piece, n));
+/* the counts halved, once every BC7_AGE_PRESENTS presents: one that would reach 0 stays 1, its slot taken */
+static void bc7_age(void) {
+    if (g_vk_present - g_bc7_cache.aged < BC7_AGE_PRESENTS) return;
+    g_bc7_cache.aged = g_vk_present;
+    for (u32 i = 0; i < g_bc7_cache.cap; i++) {
+        Bc7Entry* e = &g_bc7_cache.map[i];
+        if (e->uses > 1) e->uses /= 2;
     }
-    atomic_fetch_add_explicit(&g_bc7_cache.rd.ns, plat_ns() - t0, memory_order_relaxed);
-    atomic_fetch_add_explicit(&g_bc7_cache.rd.bytes, size, memory_order_relaxed);
-    return rec[0] == key[0] && rec[1] == key[1] && rec[2] == size && h == rec[3];
 }
-static void bc7_failed_log(void) {
-    LOG_LIMIT(8, "vulkan: a record of the BC7 cache did not check out: dropped, its level is encoded again\n");
-}
-/* the records of the reads that the recording thread found did not check out, dropped from the index: probes go on
-   past them, and the next upload of their levels encodes them. Only the record that was read: one written since at
-   another place stays */
-static void bc7_drop_failed(void) {
-    if (!atomic_load_explicit(&g_bc7_cache.rd.nfailed, memory_order_acquire) || !g_bc7_cache.map) return;
-    pm_lock(&g_bc7_cache.rd.m);
-    for (u32 i = 0; i < atomic_load_explicit(&g_bc7_cache.rd.nfailed, memory_order_relaxed); i++) {
-        Bc7Failed* x = &g_bc7_cache.rd.failed[i];
-        Bc7Entry* e = x->dropped ? NULL : bc7_slot(x->key);
-        if (e && e->at == x->at) e->size = 0;
-        x->dropped = 1;
-    }
-    pm_unlock(&g_bc7_cache.rd.m);
-}
-
-int vk_bc7_cache_failed_pending(void) {
-    return atomic_load_explicit(&g_bc7_cache.rd.nfailed, memory_order_acquire) != 0;
-}
-void vk_bc7_cache_take_failed(void (*fn)(void* owner, u64 gva, const u64 key[2])) {
-    if (!atomic_load_explicit(&g_bc7_cache.rd.nfailed, memory_order_acquire)) return;
-    bc7_drop_failed();
-    pm_lock(&g_bc7_cache.rd.m);
-    Bc7Failed* failed = g_bc7_cache.rd.failed;
-    const u32 n = atomic_load_explicit(&g_bc7_cache.rd.nfailed, memory_order_relaxed);
-    g_bc7_cache.rd.failed = NULL;
-    g_bc7_cache.rd.cap = 0;
-    atomic_store_explicit(&g_bc7_cache.rd.nfailed, 0, memory_order_release);
-    pm_unlock(&g_bc7_cache.rd.m);
-    for (u32 i = 0; i < n; i++) fn(failed[i].owner, failed[i].gva, failed[i].key);
-    free(failed);
-}
-
-/* key's entry when it holds size bytes, after the reads that failed are out of the index: NULL when it doesn't */
-static Bc7Entry* bc7_entry(const u64 key[2], u64 size) {
-    bc7_drop_failed();
-    Bc7Entry* e = bc7_slot(key);
-    return e->at && size && e->size == size ? e : NULL;
+static void bc7_used(Bc7Entry* e) {
+    bc7_age();
+    if (e->uses < UINT32_MAX) e->uses++;
+    e->present = g_vk_present;
 }
 
 u64 vk_bc7_cache_find(const u64 key[2]) {
-    if (!g_bc7_cache.f) return 0;
-    bc7_drop_failed();
+    if (!g_bc7_cache.cap) return 0;
     const Bc7Entry* e = bc7_slot(key);
-    return e->at ? e->size : 0;
+    return e->uses && e->blocks ? e->size : 0;
+}
+static Bc7Entry* bc7_held(const u64 key[2], u64 size) {
+    if (!g_bc7_cache.cap || !size) return NULL;
+    Bc7Entry* e = bc7_slot(key);
+    return e->uses && e->blocks && e->size == size ? e : NULL;
 }
 
 int vk_bc7_cache_read(const u64 key[2], u8* dst, u64 size) {
-    if (!g_bc7_cache.f) return 0;
-    Bc7Entry* e = bc7_entry(key, size);
+    Bc7Entry* e = bc7_held(key, size);
     if (!e) return 0;
-    const int r = bc7_read_at(g_bc7_cache.f, g_bc7_cache.piece, key, e->at, size, dst);
-    if (r < 0) {
-        bc7_off("a record could not be read");
-        return 0;
-    }
-    if (!r) {
-        bc7_failed_log();
-        e->size = 0;
-        return 0;
-    }
+    memcpy(dst, e->blocks, (size_t)size);
+    bc7_used(e);
     g_bc7_cache.hits++;
     return 1;
 }
 
-/* a read on the recording thread, and the copy that it is for */
+/* a hit's copy on the recording thread: the blocks into staging, then the copy that they are for */
 typedef struct {
-    u64 key[2], at, size, off, gva;
+    const u8* blocks;
     u8* dst;
-    void* owner;
+    u64 size, off;
     VkCommandBuffer cb;
     VkBuffer buf;
     VkImage img;
@@ -464,96 +210,87 @@ typedef struct {
 } Bc7Later;
 static void bc7_later_run(const void* p) {
     const Bc7Later* l = p;
-    FILE* f =
-        atomic_load_explicit(&g_bc7_cache.rd.f, memory_order_acquire); /* NULL once the cache closed: then it fails */
-    if (f && bc7_read_at(f, g_bc7_cache.rd.piece, l->key, l->at, l->size, l->dst) > 0) {
-        /* staging may not be host coherent, and its submission's flush (cmd.c's rings_flush) came before this */
-        vk_devmem_flush(l->mem, l->off, l->size);
-        if (l->img) vkCmdCopyBufferToImage(l->cb, l->buf, l->img, l->layout, 1, &l->copy);
-        atomic_fetch_add_explicit(&g_bc7_cache.rd.hits, 1, memory_order_relaxed);
-        return;
-    }
-    if (f) bc7_failed_log();
-    pm_lock(&g_bc7_cache.rd.m);
-    if (atomic_load_explicit(&g_bc7_cache.rd.nfailed, memory_order_relaxed) == g_bc7_cache.rd.cap) {
-        const u32 cap = g_bc7_cache.rd.cap ? g_bc7_cache.rd.cap * 2 : 16;
-        Bc7Failed* grown = realloc(g_bc7_cache.rd.failed, (size_t)cap * sizeof *grown);
-        if (grown) {
-            g_bc7_cache.rd.failed = grown;
-            g_bc7_cache.rd.cap = cap;
-        }
-    }
-    /* out of memory: its record stays, and its next read fails again */
-    if (atomic_load_explicit(&g_bc7_cache.rd.nfailed, memory_order_relaxed) < g_bc7_cache.rd.cap) {
-        g_bc7_cache.rd.failed[atomic_load_explicit(&g_bc7_cache.rd.nfailed, memory_order_relaxed)] =
-            (Bc7Failed){{l->key[0], l->key[1]}, l->at, l->owner, l->gva, 0};
-        atomic_store_explicit(&g_bc7_cache.rd.nfailed,
-                              atomic_load_explicit(&g_bc7_cache.rd.nfailed, memory_order_relaxed) + 1,
-                              memory_order_release);
-    }
-    pm_unlock(&g_bc7_cache.rd.m);
+    memcpy(l->dst, l->blocks, (size_t)l->size);
+    /* staging may not be host coherent, and its submission's flush (cmd.c's rings_flush) came before this */
+    vk_devmem_flush(l->mem, l->off, l->size);
+    if (l->img) vkCmdCopyBufferToImage(l->cb, l->buf, l->img, l->layout, 1, &l->copy);
+    atomic_fetch_add_explicit(&g_bc7_cache.later, 1, memory_order_relaxed);
 }
-
 int vk_bc7_cache_read_later(VkCommandBuffer cb, const u64 key[2], u64 size, u8* dst, DevMem mem, u64 off, VkBuffer buf,
-                            VkImage img, VkImageLayout layout, const VkBufferImageCopy* copy, void* owner, u64 gva) {
-    if (!g_bc7_cache.f) return 0;
-    /* the recording thread's handle, at the first read once that thread runs: the cache can open before it starts */
-    if (!atomic_load_explicit(&g_bc7_cache.rd.f, memory_order_acquire) && !g_bc7_cache.rd.tried && vk_rec_threaded()) {
-        g_bc7_cache.rd.tried = 1;
-        if (!g_bc7_cache.rd.init) {
-            pm_init(&g_bc7_cache.rd.m);
-            g_bc7_cache.rd.init = 1;
-        }
-        FILE* f = snx_fopen(g_bc7_cache.path, "rb");
-        if (!f) LOG("vulkan: the BC7 cache's hits are read on the GPU thread: a second handle on it failed\n");
-#if defined(__linux__)
-        /* no readahead past a record, as for the cache's own handle (vk_bc7_cache_open) */
-        else
-            posix_fadvise(fileno(f), 0, 0, POSIX_FADV_RANDOM);
-#endif
-        atomic_store_explicit(&g_bc7_cache.rd.f, f, memory_order_release);
-    }
-    if (!atomic_load_explicit(&g_bc7_cache.rd.f, memory_order_acquire)) return -1;
-    const Bc7Entry* e = bc7_entry(key, size);
+                            VkImage img, VkImageLayout layout, const VkBufferImageCopy* copy) {
+    if (!vk_rec_threaded()) return -1;
+    Bc7Entry* e = bc7_held(key, size);
     if (!e) return 0;
-    const Bc7Later l = {{key[0], key[1]}, e->at, size, off, gva, dst, owner, cb, buf, img, layout, mem, *copy};
+    const Bc7Later l = {e->blocks, dst, size, off, cb, buf, img, layout, mem, *copy};
+    bc7_used(e);
     vk_rec_call(bc7_later_run, &l, sizeof l);
     return 1;
 }
 
-u64 vk_bc7_cache_read_ns(u64 bytes) {
-    const u64 ns = atomic_load_explicit(&g_bc7_cache.rd.ns, memory_order_relaxed);
-    const u64 n = atomic_load_explicit(&g_bc7_cache.rd.bytes, memory_order_relaxed);
-    if (!n) return bytes ? ~0ull >> 1 : 0; /* no rate yet: a budget takes its one read and stops */
-    return (u64)((double)bytes * (double)ns / (double)n);
+/* an entry whose blocks may go for a level used `uses` times: used less, and by no present since the one before this
+   (the game is on those) */
+static int bc7_yields(const Bc7Entry* e, u32 uses) {
+    return e->blocks && e->uses < uses && g_vk_present - e->present > 1;
+}
+/* room for size more bytes of a level used `uses` times, taken from the entries that yield to it among the
+   BC7_SWEEP after the hand: 0 when they leave it short, and then none went */
+static int bc7_room(u64 size, u32 uses) {
+    if (g_bc7_cache.bytes + size <= g_bc7_cache.max) return 1;
+    const u64 need = g_bc7_cache.bytes + size - g_bc7_cache.max;
+    const u32 n = g_bc7_cache.cap < BC7_SWEEP ? g_bc7_cache.cap : BC7_SWEEP, from = g_bc7_cache.hand;
+    u64 found = 0;
+    u32 seen = 0;
+    for (; seen < n && found < need; seen++) {
+        const Bc7Entry* e = &g_bc7_cache.map[(from + seen) & (g_bc7_cache.cap - 1)];
+        if (bc7_yields(e, uses)) found += e->size;
+    }
+    g_bc7_cache.hand = (from + seen) & (g_bc7_cache.cap - 1);
+    if (found < need) return 0;
+    for (u32 k = 0; k < seen; k++) {
+        Bc7Entry* e = &g_bc7_cache.map[(from + k) & (g_bc7_cache.cap - 1)];
+        if (!bc7_yields(e, uses)) continue;
+        bc7_drop(e);
+        g_bc7_cache.evicted++;
+    }
+    return 1;
 }
 
 void vk_bc7_cache_put(const u64 key[2], const u8* p, u64 size) {
-    if (!g_bc7_cache.f || !size || size % 16 || size > g_bc7_cache.max - BC7_HEAD - BC7_REC || vk_bc7_cache_find(key))
-        return;
-    if (g_bc7_cache.end + BC7_REC + size > g_bc7_cache.max) {
-        LOG("vulkan: the BC7 cache %s reached %llu MB: it starts over\n", g_bc7_cache.path,
-            (unsigned long long)(g_bc7_cache.max >> 20));
-        g_bc7_cache.restarts++;
-        if (!bc7_start_over()) {
-            bc7_off("it could not be emptied");
-            return;
-        }
-    }
-    const u64 rec[BC7_REC / 8] = {key[0], key[1], size, bc7_check(p, size)};
-    if (snx_seek(g_bc7_cache.f, g_bc7_cache.end) || fwrite(rec, 1, BC7_REC, g_bc7_cache.f) != BC7_REC ||
-        fwrite(p, 1, (size_t)size, g_bc7_cache.f) != size || fflush(g_bc7_cache.f)) {
-        bc7_off("a record could not be written");
+    if (!g_bc7_cache.cap || !size || size % 16 || size > g_bc7_cache.max) return;
+    Bc7Entry* e = bc7_entry(key);
+    if (!e) return;
+    bc7_used(e);
+    if (e->blocks) return;
+    e->size = size;
+    u8* blocks = bc7_room(size, e->uses) ? malloc((size_t)size) : NULL;
+    if (!blocks) { /* not among the most used yet, or no memory: encoded again at its next use, and counted again */
+        g_bc7_cache.refused++;
         return;
     }
-    if (bc7_index(key, g_bc7_cache.end + BC7_REC, size)) g_bc7_cache.stored++;
-    bc7_idx_put(key, g_bc7_cache.end + BC7_REC, size);
-    g_bc7_cache.end += BC7_REC + size;
+    memcpy(blocks, p, (size_t)size);
+    e->blocks = blocks;
+    g_bc7_cache.bytes += size;
+    g_bc7_cache.stored++;
 }
 
-void vk_bc7_cache_stats(u64* hits, u64* stored, u64* restarts, u64* bytes) {
-    *hits = g_bc7_cache.hits + atomic_load_explicit(&g_bc7_cache.rd.hits, memory_order_relaxed);
-    *stored = g_bc7_cache.stored;
-    *restarts = g_bc7_cache.restarts;
-    *bytes = g_bc7_cache.f ? g_bc7_cache.end : 0;
+u64 vk_bc7_cache_release(u32 before) {
+    u64 went = 0;
+    for (u32 i = 0; i < g_bc7_cache.cap; i++) {
+        Bc7Entry* e = &g_bc7_cache.map[i];
+        if (!e->blocks || (int32_t)(e->present - before) >= 0) continue;
+        went += e->size;
+        bc7_drop(e);
+    }
+    g_bc7_cache.released += went;
+    return went;
+}
+
+void vk_bc7_cache_stats(VkBc7CacheStats* s) {
+    *s = (VkBc7CacheStats){g_bc7_cache.hits + atomic_load_explicit(&g_bc7_cache.later, memory_order_relaxed),
+                           g_bc7_cache.stored,
+                           g_bc7_cache.evicted,
+                           g_bc7_cache.refused,
+                           g_bc7_cache.released,
+                           g_bc7_cache.bytes,
+                           g_bc7_cache.used};
 }

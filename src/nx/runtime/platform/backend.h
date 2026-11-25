@@ -7,11 +7,20 @@
 #include "common/cpu/aarch64/cpu.h"
 #include "nx/runtime/ini.h"
 #include "nx/runtime/platform/overlay.h"
+#include "nx/runtime/platform/ctrl_applet.h"
 
 /* the window, titled after the game and, when addons is not "", the updates and DLCs it plays with ("Update 1.2.0,
    DLC 1") */
 void video_init(const char* title, const char* addons);
 void video_poll(void);     /* events and input, once per main loop pass */
+/* in video_poll's place while the player waits on a screen with nothing to do (the save as the game closes): the
+   window's events taken as video_poll takes them, the inputs dropped so that they do nothing; the quits among them,
+   each a close asked (the window's, Alt+F4, SIGTERM, the system's). Another thread's fatal error is shown, as there.
+   Main thread */
+int backend_poll_closes(void);
+/* the presses that came while the main thread was busy and did not poll (a save state's load): dropped, so that they
+   do nothing once it polls again; a key, a button or a finger let go meanwhile still is. Main thread */
+void backend_presses_drop(void);
 void frontend_frame(void); /* screenshots and the unattended limits, after each pass */
 
 /* Offers a .ini or command line setting (the touch screen's mode, whose table is settings.h's g_backend_ini) to the
@@ -57,6 +66,11 @@ u32 backend_window_changes(void);
    its answer to am_keyboard_answered (services.h). Hide takes the box of that ticket away unanswered */
 int backend_keyboard_show(const OverlayKeyboard* k);
 void backend_keyboard_hide(u32 ticket);
+/* The controller applet's dialog over the game (ctrl_applet.h), from any thread, the same way: 0 shown, -1 with no
+   window or in an unattended run, which no one answers. The main thread hands its answer to am_controller_answered
+   (services.h). Hide takes the dialog of that ticket away unanswered */
+int backend_controller_show(const CtrlRequest* r, u32 ticket);
+void backend_controller_hide(u32 ticket);
 
 /* fatal's message box. Called on every platform and from any thread; does nothing where there is no box */
 void win_fatal_box(const char* msg);

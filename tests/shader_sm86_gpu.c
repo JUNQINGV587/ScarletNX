@@ -460,6 +460,96 @@ static void wide_program(Prog* p) {
     epilogue(p);
 }
 
+/* the doubles: F2F.F64 from a float and back in each rounding, DADD, DMUL and DFMA of register pairs and of a constant
+   buffer's 8 bytes, with a negation and an absolute value. The floats come from the integers, so no input is a NaN */
+static Sm86Word dd(u32 op9, u32 form, u32 dst, u32 a) { return alu(op9, form, dst, a); }
+static void double_program(Prog* p) {
+    p->outputs = 18;
+    p->approx_from = p->outputs;
+    prologue(p);
+    Sm86Word w;
+    for (u32 k = 0; k < 2; k++) { /* I2F.F32.S32 R8, R4 and R9, R5 */
+        w = rr(0x106, 8 + k, 255, 4 + k);
+        f(&w, 74, 1, 1);
+        f(&w, 75, 2, 2);
+        f(&w, 84, 2, 2);
+        emit(p, w);
+    }
+    for (u32 k = 0; k < 2; k++) { /* F2F.F64.F32 R12:R13 = R8, R14:R15 = R9 */
+        w = rr(0x110, 12 + 2 * k, 255, 8 + k);
+        f(&w, 75, 2, 3);
+        f(&w, 84, 2, 2);
+        emit(p, w);
+    }
+    w = dd(0x029, 1, 16, 12); /* DADD R16, R12, R14 (c's place) */
+    f(&w, 32, 8, 255);
+    f(&w, 64, 8, 14);
+    emit(p, w);
+    w = dd(0x029, 3, 18, 12); /* DADD R18, R12, c[0][0x40] */
+    f(&w, 64, 8, 255);
+    sm86_cbuf(&w, 0, 0x40);
+    emit(p, w);
+    w = rr(0x028, 20, 12, 14); /* DMUL R20, R12, R14 */
+    emit(p, w);
+    w = dd(0x028, 5, 22, 12); /* DMUL R22, R12, c[0][0x48] */
+    f(&w, 64, 8, 255);
+    sm86_cbuf(&w, 0, 0x48);
+    emit(p, w);
+    w = dd(0x02b, 1, 24, 12); /* DFMA R24, R12, R14, R16 */
+    f(&w, 32, 8, 14);
+    f(&w, 64, 8, 16);
+    emit(p, w);
+    w = dd(0x02b, 5, 26, 14); /* DFMA R26, R14, c[0][0x48], R12 */
+    f(&w, 64, 8, 12);
+    sm86_cbuf(&w, 0, 0x48);
+    emit(p, w);
+    w = dd(0x02b, 1, 28, 12); /* DFMA R28, -R12, |R14|, R16 */
+    f(&w, 32, 8, 14);
+    f(&w, 64, 8, 16);
+    f(&w, 72, 1, 1);
+    f(&w, 62, 1, 1);
+    emit(p, w);
+    for (u32 k = 0; k < 4; k++) { /* F2F.F32.F64.RN, RM, RP, RZ R30 + k, R20 */
+        w = rr(0x110, 30 + k, 255, 20);
+        f(&w, 75, 2, 2);
+        f(&w, 84, 2, 3);
+        f(&w, 78, 2, k);
+        emit(p, w);
+    }
+    static const u8 pairs[7] = {16, 18, 20, 22, 24, 26, 28};
+    for (u32 k = 0; k < 7; k++) {
+        store(p, 2 * k, pairs[k]);
+        store(p, 2 * k + 1, pairs[k] + 1u);
+    }
+    for (u32 k = 0; k < 4; k++) store(p, 14 + k, 30 + k);
+    epilogue(p);
+}
+/* IMAD.WIDE with a constant buffer's 8 bytes as c, unsigned and signed, and the pair of registers beside it */
+static void wide_cbuf_program(Prog* p) {
+    p->outputs = 6;
+    p->approx_from = p->outputs;
+    prologue(p);
+    Sm86Word w;
+    for (u32 k = 0; k < 2; k++) { /* IMAD.WIDE(.U32) R8 + 2k = R4 * R5 + c[0][0x50] */
+        w = dd(0x025, 3, 8 + 2 * k, 4);
+        f(&w, 64, 8, 5);
+        sm86_cbuf(&w, 0, 0x50);
+        if (k) f(&w, 73, 1, 1);
+        f(&w, 81, 3, 7);
+        emit(p, w);
+    }
+    w = dd(0x025, 1, 12, 4); /* IMAD.WIDE.U32 R12 = R4 * R5 + R8 */
+    f(&w, 32, 8, 5);
+    f(&w, 64, 8, 8);
+    f(&w, 81, 3, 7);
+    emit(p, w);
+    for (u32 k = 0; k < 3; k++) {
+        store(p, 2 * k, 8 + 2 * k);
+        store(p, 2 * k + 1, 9 + 2 * k);
+    }
+    epilogue(p);
+}
+
 /* ---- the inputs and the comparison ---- */
 
 static void inputs(u32* in) {
@@ -911,6 +1001,10 @@ static int run_program(Gpu* g, const char* name, void (*build)(Prog*)) {
     cb0[0x24 / 4] = (u32)(VA_IN >> 32);
     cb0[0x28 / 4] = (u32)VA_OUT;
     cb0[0x2c / 4] = (u32)(VA_OUT >> 32);
+    static const double constants[3] = {1.5, -0.1, 0}; /* at 0x40 and 0x48 */
+    memcpy(&cb0[0x40 / 4], constants, 16);
+    cb0[0x50 / 4] = 0xfffffff0u; /* a pair: 0x1234_fffffff0, which a product's low word carries out of */
+    cb0[0x54 / 4] = 0x1234u;
     /* the reference */
     Sm86RefEnv env = {0};
     env.cbuf[0] = cb0;
@@ -1081,6 +1175,116 @@ static int run_fadd(Gpu* g) {
                native ? "OpAtomicFAddEXT" : "compare and exchange", out[0], out[1], bad, INVOCATIONS,
                ran ? "" : ", Vulkan failed");
         ok &= good;
+    }
+    return ok;
+}
+
+/* ---- lone lanes ---- */
+
+/* A combined add as a compiler writes it: VOTEU's ballot, its highest lane by UFLO, its count by POPC; the leader's
+   ATOMG adds the count to word 0 of the output, SHFL hands its old value out, and the lane's rank (POPC of the ballot
+   under LTMASK) beside it is a place, where the invocation stores its number. As lone lanes, with no subgroup in the
+   module, on any device, and as a warp's on one whose subgroups have 32 lanes: word 0 counts every invocation and each
+   has a place of its own */
+#define LONE_WORDS (1u + INVOCATIONS)
+static void lone_program(Prog* p) {
+    Sm86Word w = sm86_fix(0x919); /* S2R R0, TID.X */
+    f(&w, 72, 8, 0x21);
+    emit(p, w);
+    w = sm86_fix(0x919); /* S2R R1, CTAID.X */
+    f(&w, 16, 8, 1);
+    f(&w, 72, 8, 0x25);
+    emit(p, w);
+    emit(p, ri(0x024, 2, 1, LOCAL, 0)); /* IMAD R2, R1, 32, R0 */
+    w = sm86_fix(0xab9);                /* ULDC.64 UR6, c[0x0][0x28] */
+    f(&w, 16, 6, 6);
+    sm86_cbuf(&w, 0, 0x28);
+    f(&w, 73, 3, 5);
+    emit(p, w);
+    w = sm86_fix(0x919); /* S2R R14, LANEID */
+    f(&w, 16, 8, 14);
+    emit(p, w);
+    emit(p, (Sm86Word){{0x0000000000077886ull, 0x000fe400038e0100ull}}); /* VOTEU.ANY UR7 = the running lanes */
+    emit(p, (Sm86Word){{0x00000007000472bdull, 0x000fe200080e0000ull}}); /* UFLO UR4, UR7 */
+    emit(p, (Sm86Word){{0x0000000700047d09ull, 0x000e220008000000ull}}); /* POPC R4, UR7 */
+    emit(p, (Sm86Word){{0x000000040e007c0cull, 0x002fda000bf02070ull}}); /* ISETP.EQ.U32 P0, R14, UR4 */
+    w = sm86_fix(0x9a8);                                                 /* @P0 ATOMG.E.ADD R5, [UR6], R4 */
+    f(&w, 12, 3, 0);
+    f(&w, 16, 8, 5);
+    f(&w, 24, 8, 255);
+    f(&w, 32, 8, 4);
+    f(&w, 64, 6, 6);
+    f(&w, 72, 1, 1);
+    f(&w, 91, 1, 1);
+    emit(p, w);
+    w = sm86_fix(0x919); /* S2R R8, LTMASK */
+    f(&w, 16, 8, 8);
+    f(&w, 72, 8, 0x39);
+    emit(p, w);
+    emit(p, (Sm86Word){{0x0000000708087c12ull, 0x001fe2000f8ec0ffull}}); /* LOP3 R8 = R8 & UR7 */
+    emit(p, (Sm86Word){{0x0000000800097309ull, 0x000e240008000000ull}}); /* POPC R9, R8 */
+    emit(p, (Sm86Word){{0x00000007000a7d00ull, 0x001e7000080e0000ull}}); /* FLO R10, UR7 */
+    emit(p, (Sm86Word){{0x00001f0a050b7589ull, 0x014e2a00000e0000ull}}); /* SHFL.IDX R11, R5, R10, 0x1f */
+    w = rr(0x010, 12, 11, 9);                                            /* IADD3 R12, R11, R9, RZ */
+    f(&w, 77, 4, 7);
+    f(&w, 81, 3, 7);
+    f(&w, 84, 3, 7);
+    f(&w, 87, 4, 7);
+    emit(p, w);
+    emit(p, ri(0x024, 6, 12, 4, 255)); /* IMAD R6, R12, 4, RZ */
+    w = sm86_fix(0x986);               /* STG.E [R6.U32 + UR6 + 4], R2 */
+    f(&w, 24, 8, 6);
+    f(&w, 32, 8, 2);
+    f(&w, 40, 24, 4);
+    f(&w, 64, 6, 6);
+    f(&w, 72, 1, 1);
+    f(&w, 73, 3, 4);
+    f(&w, 91, 1, 1);
+    emit(p, w);
+    epilogue(p);
+}
+static int run_lone(Gpu* g) {
+    static Prog p;
+    memset(&p, 0, sizeof p);
+    lone_program(&p);
+    int ok = 1;
+    /* the module with no subgroup, then the warp's, in the device's own subgroups and in required ones of 32, whole */
+    for (int run = 0; run < 4; run++) {
+        const int lanes = run & 1 ? SM86_LANES_WARP : 0, warp32 = run >> 1;
+        const char *module = lanes ? "a warp's module" : "no subgroup in the module",
+                   *own = warp32 ? "required" : "its own";
+        const u32 size = warp32 ? 32 : g->subgroup;
+        if (warp32 ? !g->warp32 : lanes && g->subgroup < 32) {
+            printf("lone lanes (%s, subgroups of %u, %s): not run, the device cannot\n", module, size, own);
+            continue;
+        }
+        u32 cb0[64] = {0};
+        cb0[0x28 / 4] = (u32)VA_OUT;
+        cb0[0x2c / 4] = (u32)(VA_OUT >> 32);
+        static u32 out[LONE_WORDS], in[2];
+        memset(out, 0, sizeof out);
+        ShaderInfo si = {0};
+        si.cs_local[0] = LOCAL, si.cs_local[1] = si.cs_local[2] = 1;
+        size_t words = 0;
+        u32* spv = sm86_to_spirv_ftz(p.code, p.n * 16, ST_CS, NULL, &si, &words, SH_FTZ_EMULATE, lanes);
+        if (!spv) {
+            fprintf(stderr, "lone lanes: not translated: %s\n", si.first_unsupported);
+            return 0;
+        }
+        g_warp32 = warp32;
+        int ran = si.ngbuf == 1 && gpu_run(g, spv, words, &si, cb0, sizeof cb0, 0x28, in, sizeof in, out, sizeof out);
+        g_warp32 = 0;
+        free(spv);
+        u64 seen = 0;
+        u32 bad = 0;
+        for (u32 i = 0; i < INVOCATIONS; i++)
+            if (out[1 + i] >= INVOCATIONS || (seen >> out[1 + i] & 1))
+                bad++;
+            else
+                seen |= 1ull << out[1 + i];
+        printf("lone lanes (%s, subgroups of %u, %s): %u invocations counted of %u, %u places wrong%s\n", module, size,
+               own, out[0], INVOCATIONS, bad, ran ? "" : ", Vulkan failed");
+        ok &= ran && out[0] == INVOCATIONS && !bad;
     }
     return ok;
 }
@@ -1662,19 +1866,6 @@ static void narrow_program(Prog* p, int subword) {
     emit(p, ri(0x024, 6, 2, 32 * 4, 255)); /* IMAD R6, R2, 128, RZ: the lane's 32 output words */
     for (u32 k = 0; k < 32; k++) store(p, k, 40 + k);
     epilogue(p);
-/* ---- the HMMA bench (SNX_HMMA_BENCH=ROUNDS: only it runs) ----
-   shader.h's HMMA bench program, as hmma_mode's Auto times it (vk/hmma_pick.c), by hand: SNX_HMMA_BENCH_GROUPS
-   workgroups (BENCH_GROUPS where unset), in subgroups of 32 where the device lets a pipeline require them, as
-   vk/compute.c asks for programs that read other lanes, else in the device's own (64 on Adreno, two warps a subgroup,
-   as the renderer runs them there). Each round times each form of hmma in turn, 30 dispatches of which the first 10
-   only bring the GPU's clock up from an idle device's (an RX 6700 XT ran the first ones several times slower), the
-   forms' order alternating, and prints the median of each as an HMMA_BENCH line, then the way Auto picks from them */
-#define BENCH_GROUPS 65536u
-#define BENCH_LOCAL  SH_HMMA_BENCH_LOCAL
-static void bench_program(Prog* p) {
-    p->outputs = 1;
-    p->approx_from = 1;
-    p->n = shader_hmma_bench_program(p->code) / 16;
 }
 static int narrow_value(Gpu* g) {
     static u32 in[32 * 16], got[2][2][32 * 32]; /* subword store, narrow */
@@ -2066,8 +2257,11 @@ int main(void) {
         ok &= run_program(&g, "flow", flow_program);
         ok &= run_program(&g, "wide", wide_program);
         ok &= run_program(&g, "stores", stores_program);
+        ok &= run_program(&g, "doubles", double_program);
+        ok &= run_program(&g, "wide with a constant buffer", wide_cbuf_program);
         ok &= maxwell_log(&g);
         ok &= run_fadd(&g);
+        ok &= run_lone(&g);
     } else /* a phone's GPU: the warp's instructions below still run there */
         printf("no Vulkan 1.3 device with shaderFloat64 and shaderInt64: the scalar programs skipped\n");
     if (g.device) vkDestroyDevice(g.device, NULL);

@@ -88,6 +88,13 @@ CPU reads the pixels with one wait for the GPU, and a target that the CPU never 
 release and nothing more. A watch over memory that is freed or given to other data costs one fault, which finds no
 pending target and only drops the watch.
 
+Over a dma-buf region of unified memory ([below](#linux-guest-memory-moved-into-dma-bufs-of-memfds)) the watch is in
+place (`own_watch_in_place`): its pages stay the region's, which the GPU goes on reading and writing, and only the CPU's
+mapping of them is trapped. A publish over it is a copy in the region on the GPU (`vk_uma_publish`), with no owner and
+no landing. It waits for nothing and leaves the watch, as it can be the GPU thread's, part-way through its recording.
+The CPU's access waits: once the targets pending there are published, for what the GPU writes there in place
+(`own_accessed` in `vk/owned.c`), and the watch goes after it.
+
 The thread that held `vk_lock` before it touched a watched page (the GPU thread, which reads guest memory in a draw's
 setup) cannot wait for a publish. Its `own_acquire`, or its fault on a page with only watches on it, drops the watches
 and reads the CPU's bytes, as it did before there were watches. That is not fatal, as a fault on a real owner is.
@@ -128,7 +135,11 @@ request, so nothing is copied from it). The fault is taken differently on each h
 Guest memory is a private anonymous reservation (`plat_vm_reserve`), and memory mapped at two guest addresses comes
 from a memfd mapped shared (the alias pool, `plat_posix.c`). An owned span is moved into the pool when its trap is
 made (`mem.c`'s `promote_nl`), so it has a mirror (`plat_alias_host`) and its edge pages keep the CPU's bytes in the
-page cache.
+page cache. The move is no write: `plat_alias_map` keeps what write tracking says of each page of the range
+`mem_own_prepare` froze, as `plat_vm_share` does for a dma-buf region (below). The pool's mapping is registered with
+the write watch before the trap takes it out of the scans, and a scan on another thread between the two would report
+every moved page: marked after the result published there took its baseline, they would read as the CPU's writes, and
+the image stored there again would keep memory's bytes on them.
 
 - The span's guest views are registered with the runtime's userfaultfd (the one write tracking uses) in minor mode
   and their page table entries dropped (`MADV_DONTNEED`). A guest access then blocks the faulting thread in the
@@ -137,6 +148,11 @@ page cache.
 - Owned spans are not write-tracked: their consumers use the ownership map. `plat_ww_scan` skips them. A span the
   trap lets go is mapped with `UFFDIO_CONTINUE` and registered for write tracking again while no scan runs: it reads as
   written once, with what the woken thread writes.
+- Unregistering a range wakes none of the minor faults sleeping on it (measured on 6.18: Linux wakes a missing-mode
+  range's only), and arming a page again unregisters it first. A thread whose fault a landing took already, and left
+  to the let_go of the landing that cut the page's entries, sleeps there for good when a new owner arms the page
+  before that let_go, which then keeps it trapped. So `plat_trap_arm` wakes the range it arms, and such a thread
+  faults again into the new owner (`tests/memory_own.c`'s `test_rearm_sleeper`).
 - `UFFD_USER_MODE_ONLY` (needed without privileges) means a system call that reads or writes an owned page from the
   kernel gets EFAULT rather than a fault. Every system call that takes a guest pointer and `pread`/`pwrite` on the
   pool first acquires the range (`own_acquire`): fs.c's IFile Read and Write and IStorage Read (the RomFS, a DLC's,
@@ -508,11 +524,21 @@ Write tracking watches a dma-buf region's pages as the rest of guest memory (`Im
 passes over), where it leaves an import's alone: the driver pinned the pages once, when the udmabuf was made, and
 leaves the CPU's page table alone at each submission. A probe on kernel 7.2.7 found userfaultfd's write-protect with
 `PAGEMAP_SCAN` reporting exactly the pages written on a memfd mapping whose pages a udmabuf holds, and minor faults
-registering there too. `mem_migrate`'s new mapping is registered again (`ww_remapped`), and its first scan reports
-every page written. The GPU's writes in place there reach the caches when their submit is done
-(`gpu_mem_written_cpu`), as for imports. `check_uma_migrate` checks that a region's pages answer `vk_written_since`
-and that a CPU write there is found. In the race above, the caches stopped comparing the regions' bytes: about 12.0 and
-12.5 fps over its last 40 s against 10.7 and 11.2 with the regions untracked.
+registering there too. A region made or gone is no write. `mem_migrate` and `mem_unmigrate` keep what the tracking
+says of each page (`plat_vm_share`, `plat_vm_unshare`): the pages a scan would report are noted before the move, no
+scan runs during it, the new mapping is registered (`ww_remapped`, where every page reads as written) and the others
+are protected again, and the range stays read only from `plat_freeze` to `plat_thaw`, so no write comes between;
+tracking by protection keeps each page's state and protection through the move. A region that goes marks none of its
+pages changed (`imp_destroy`). A page marked written with no write reads as newer than a render target drawn there
+whose pixels are not in memory yet, and a texture over that target loads memory's bytes. A watch in place is none
+either. No scan looks under its trap, so its pages are scanned before they are trapped (`vk_ww_watching`). Let go of,
+they read as written, so they are scanned as they open (own.c's `open` hook, `vk_ww_open`), with their leaves claimed
+over both: of what that scan finds, only the pages whose bytes are not those from before count. The GPU's writes in
+place there reach the caches when their submit is done (`gpu_mem_written_cpu`), as for imports. `check_uma_migrate` checks
+that a region's pages answer `vk_written_since`, that a CPU write there is found, and that a page nobody wrote stays
+unwritten through a region made, moved on into a bigger one and gone; `memory_alias` checks the moves under both
+trackings. In the race above, the caches stopped comparing the regions' bytes: about 12.0 and 12.5 fps over its last
+40 s against 10.7 and 11.2 with the regions untracked.
 
 ### Placed maps
 

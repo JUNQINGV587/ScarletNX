@@ -7,6 +7,7 @@
   * [GameChat's images and the camera](#gamechats-images-and-the-camera)
 * [Built-in fonts](#built-in-fonts)
 * [Shaders](#shaders)
+  * [Subgroups narrower than a warp](#subgroups-narrower-than-a-warp)
 * [Surfaces](#surfaces)
 * [Driver offsets](#driver-offsets)
 * [Shading rate images](#shading-rate-images)
@@ -15,6 +16,7 @@
   * [Stages](#stages)
   * [The programs' I/O](#the-programs-io)
   * [Draws](#draws)
+  * [The compute-task path](#the-compute-task-path)
   * [Design](#design)
   * [Open questions](#open-questions)
 
@@ -32,6 +34,17 @@ The game draws through NVN2, API version 231.16 (GPU code 201.5 to 201.11). The 
 buffers, device messages, variable rate shading and HDR window metadata. ScarletNX always takes these calls; the
 `nvn_direct` setting older versions read for that is deprecated ([Deprecations](../../user/deprecations.md)).
 
+A memory pool with storage has the storage's own address as its GPU address (`nvn_MemoryPoolInitialize`,
+`gmmu_space_alloc_at`), as the console's driver maps such a pool where the device has its second address space (read
+from one driver's code; which device flag asks for it is not known, and one game's device that relies on it has flags
+0x500 where others have 0), so `nvnMemoryPoolGetBufferAddress` answers the storage's CPU address. The runtime does it
+for every Ounce device: a game that doesn't rely on it gets one GPU address as good as another. An engine frees the storage of a pool the CPU can't access by that address, as it can't map
+it: with a GPU address of the allocator's it freed that address, and its allocator stopped on it about 16 s into the
+boot. The GPU address allocator of an Ounce program keeps the addresses below the end of the guest's address space
+for these, and gives out its own past it. A virtual pool, and a pool whose range another pool's holds (a warning),
+take the allocator's. An ended pool's range goes back at once, before its unmap: only a pool over the same storage
+takes it again, and that pool's map is queued after the unmap.
+
 The game must be compiled ahead of time (`build/scarletnx -r ...`). With the JIT alone, the dispatch slot of
 `nvnBootstrapLoader` is still empty when `nvn_loader_init` runs, because that runs before `jit_init`.
 
@@ -45,7 +58,8 @@ runtime read the same NPDM, and `g_ounce` is the one flag. It gives the game the
   recompiler and the runtime JIT alike: LSE, RDM, FP16, the dot product, RCpc with LRCPC2, PAuth with authentication
   off, FlagM and ESB. It has no JSCVT, FCMA, DIT or MSR SSBS (PFR1's SSBS is 1). Before, an Ounce game took
   `cpu_extensions=1`'s LSE, RCpc and PAuth only, and one game's bootstrap level stopped on a UDOT
-- the 10 GiB application pool and the 12 GiB heap region of `memory_gb=12`
+- a 9152 MiB application pool, the 12 GiB heap region of `memory_gb=12` and a 128 GiB alias region, the sizes
+  GetInfo answers a native program on the console
 - SM86 shaders and the T239's GOB
 - a 31.25 MHz system tick. The SDK's `nn::os::GetSystemTickFrequency` returns 31,250,000 as a constant, and the SDK
   never reads `CNTFRQ_EL0`. With the Switch's 19.2 MHz, the game's time ran at 0.61 of real time. The GPU's
@@ -87,8 +101,15 @@ shared fonts' calls. The runtime answers it in the game's own SDK function (`src
 the shared fonts': it fills the caller's `BuiltInFontDataOunce` as the SDK fills it from the service's answer, two
 bytes of flags, the font's address at +8 and its size at +0x10, and answers whether the type has a font.
 
+Its set takes a count, an array of the same structure, an array of one-byte types and their number, a language code
+and a bool. The SDK reads no more than six types, and fills one structure for each entry of the service's answer, as
+the single function does, and the count with the answer's. Which fonts the service picks is not in the SDK: the runtime
+gives, for each type asked in its order, the font the single function gives it (a type with no font gives none),
+whatever the language, and the count of those. It always answers true, since every font is loaded from the start.
+
 The fonts are the shared fonts: each is a plain TrueType font after its header, so the same memory, mapped read only
-in the game at the first ask, answers both. `tests/pl_fonts.c` checks the structure for each type.
+in the game at the first ask, answers both. `tests/pl_fonts.c` checks the structure for each type, and the set's
+entries and count.
 
 ## Shaders
 
@@ -167,7 +188,8 @@ the CPU touched in the last presents with traps. A logged byte that guest memory
 keeps the CPU's: the shadow holds every CPU write from before the submit, so the CPU wrote it later. Landed over it,
 the write was lost to guest memory and the mirror both (one game's characters showed squares of wrong lighting).
 Landing every written page at each submit took most of the GPU thread in one game's menus. A read of guest memory
-under pending writes lands them first, and a draw reading them takes the mirror instead (`buffer.c`'s `buf_get`), as
+under pending writes lands them first, waiting for the submission that wrote them, or finishing the GPU's work where
+they are still being recorded, and a draw reading them takes the mirror instead (`buffer.c`'s `buf_get`), as
 does a draw reading a range part of which the mirror owns (`vk_mirror_holds`): read elsewhere, the CPU's bytes between
 the owned pages were staged again for each draw.
 Before, every writing dispatch copied the 16 MiB of each range twice (its original bytes, and its input), compared
@@ -247,6 +269,23 @@ Metal backend prints itself into the module as `t192 = ALU u2f64` and the Metal 
 KosmicKrisp has no conversion to a double at all. The game shows its title menu on either driver, after the stall on
 KosmicKrisp, and `vulkan_driver=moltenvk` skips the stall.
 
+### Subgroups narrower than a warp
+
+A warp has 32 lanes, and VOTE, VOTEU, MATCH, SHFL, REDUX, LANEID, the lane masks and the tensor core's instructions read
+them. A device serves them with subgroups of 32 or more, or in compute with subgroups of 32 that a pipeline asks for
+(`subgroupSizeControl`). Where its subgroups have fewer (16 on a Mali, 8 on lavapipe), a program that reads other lanes
+runs each invocation as a warp of its own, lane 0, where that gives what the console does:
+
+* A vertex, geometry or fragment program: its ballot is its own bit, MATCH finds itself, REDUX and SHFL keep its value.
+  A fragment's SHFL and FSWZADD inside its quad keep the quad's lanes where the subgroups hold whole quads.
+* A compute program: only the ways a compiler combines a warp's atomics, shown by the proof that the Maxwell programs
+  take (`gpu/shader/warp_idioms.c`), which `gpu/shader/sm86_lone.c` hands the SM86 ones to: a combined add and the rank
+  beside its old value, its leader the highest or the lowest running lane, by a predicate or by a branch over the
+  leader's run, and an address that MATCH.ALL compared, whose other way is each lane's own add of 1.
+
+Any other program is refused, with the instruction and the lanes the device has in the log: `subgroup ballot/shuffle
+unavailable: REDUX at 1040: no combined add's, no reduction's (8 lanes of 32)`. The tensor core's instructions always are.
+
 ## Surfaces
 
 An Ounce game's block linear surfaces use another GOB: bits 5 and 6 of a byte's offset in it are swapped, so x
@@ -265,6 +304,17 @@ renderer binds an empty storage image there (`vk_null_storage`). Before, it skip
 its kart's contact shadow as a box that samples a 128x128 texture array with trilinear filtering. Layer 0 is the kart's
 footprint, drawn into level 0 from a 256x256 texture, and this program writes levels 1 to 3. Without them the box read
 zeros at the title camera's distance and drew a dark square under the kart.
+
+A memory pool that ends while results of the GPU over it are not in guest memory yet (render targets not written
+back, pending results: `Renderer.gpu_holds`) waits in `nvnMemoryPoolFinalize` until the GPU thread has made the pool's
+unmap, which lands them first (`gmmu_later_wait`, bounded at 5 s). The console's GPU wrote them into the storage as it
+ran, and a game may hand a pool's storage to other uses as soon as the pool has ended. Without the wait the unmap,
+made later on the GPU thread, landed a render target's old pixels over memory that one engine's allocator had given to
+its object hash tables in the meantime (a watchpoint on the tables' array caught the GPU thread's landing writing zeros
+there): the game looped for good in a hash chain. The same boot also stopped at a property its struct didn't have, at a
+different point from run to run, most runs at `-O2`; that is taken for the same overwrite, as it no longer happened in
+about 20 runs with the wait, but no write was caught for it. A pool with nothing of the GPU's over it ends at once, as a
+Switch device's always does: 60 of one boot's 72 pool ends waited, about 4 ms each.
 
 ## Driver offsets
 
@@ -477,6 +527,34 @@ then `DRAW_VERTEX_ARRAY_BEGIN_END_A` (0x9c) with 0 and the task count x * y * z.
 (0x453), `SET_MESH_SHADER_A` (0x454: topology, most vertices, most primitives), `SET_MESH_SHADER_B` (0x455: shared
 lines, invocations) and `SET_MESH_INIT_SHADER` (0x456: invocations, local lines, payload lines) (`clc597.h`). The
 runtime takes the API calls and needs none of the macros.
+
+### The compute-task path
+
+A draw whose task program launches the mesh program takes `VK_EXT_mesh_shader`'s two stages in one submission, and that
+gang is the shape that faulted NVIDIA's driver and hangs RADV on RDNA4 ([Driver quirks](../../layers/gpu/driver-quirks.md#mesh-shaders)).
+`vk_mesh_path`'s Auto, the default, takes them apart instead (`sm86.h` has the buffer's layout, `vk/render.c` the
+dispatch and the draw):
+
+- the task program is translated as a compute program (`ST_TS` with `ShMesh.payload_buf`): its ISBE payload writes go
+  to a storage buffer at its workgroup's slot, and after the body it stores the groups it launched in a count of its
+  own, an atomic maximum of them in the draw's record, and the dispatch's size in the record's y. It calls no
+  `OpEmitMeshTasksEXT`;
+- the mesh program has no task stage. It reads its task workgroup's payload from the buffer (`WorkgroupId.y`), and
+  calls `OpSetMeshOutputsEXT` with 0 and 0 before it returns where its `WorkgroupId.x` is past that workgroup's count
+  (RADV hangs on a mesh workgroup that returns without it). The draw is `vkCmdDrawMeshTasksIndirectEXT` of the record:
+  x the most groups any task workgroup launched, y the task workgroups, z 1;
+- the renderer keeps one buffer for each frame in flight, shared by its draws, zeroes the record, dispatches the task
+  program as compute (the draw's count, or `vkCmdDispatchIndirect` of its record's) with the task stage's set and the
+  same push constants (the first workgroup in `SNX_VKB_RS`'s x, the buffer's slots above the flag in the push
+  constant's z), and barriers its writes to the mesh stage and the draw's record. The dispatch is recorded outside the
+  render pass, which the previous draw's pass ends; a barrier before its fill orders the buffer's last reads.
+
+The programs, their outputs, the payload's bytes and the fragment program's `PerPrimitiveEXT` inputs are the ones the
+native path draws. A direct draw and an indirect one both take the path. A device whose graphics descriptors are heaps
+keeps the native path, because a heap bind is the graphics pipeline's. On an RX 9060 XT (RADV Mesa 26.2.6) the native
+path hangs the GPU as soon as an indirect task+mesh gang is submitted, and the compute path draws a game's first 3D
+scene for 120 seconds with 23,204 mesh draws through it and none skipped ([Driver
+quirks](../../layers/gpu/driver-quirks.md#mesh-shaders)).
 
 ### Design
 

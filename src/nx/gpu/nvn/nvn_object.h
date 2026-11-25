@@ -17,12 +17,16 @@ static inline void nvn_record_relocate(u64 dst, u64 src, u32 op, u32 size) {
     static const struct {
         u32 op, off, n;
     } snaps[] = {
-        {OP_SET_RT, offsetof(NvnPSetRT, color), 8},         {OP_SET_RT, offsetof(NvnPSetRT, depth), 1},
-        {OP_COPY_B2T, offsetof(NvnPCopyB2T, texture), 1},   {OP_COPY_T2B, offsetof(NvnPCopyB2T, texture), 1},
-        {OP_COPY_T2T, offsetof(NvnPCopyT2T, src), 1},       {OP_COPY_T2T, offsetof(NvnPCopyT2T, dst), 1},
+        {OP_SET_RT, offsetof(NvnPSetRT, color), 8},
+        {OP_SET_RT, offsetof(NvnPSetRT, depth), 1},
+        {OP_COPY_B2T, offsetof(NvnPCopyB2T, texture), 1},
+        {OP_COPY_T2B, offsetof(NvnPCopyB2T, texture), 1},
+        {OP_COPY_T2T, offsetof(NvnPCopyT2T, src), 1},
+        {OP_COPY_T2T, offsetof(NvnPCopyT2T, dst), 1},
         {OP_CLEAR_TEX, offsetof(NvnPClearTex, texture), 1},
         {OP_DLSS, offsetof(NvnPDlss, tex), NVN_DLSS_TEXTURES},
         {OP_RATE_IMAGE, offsetof(NvnPRateImage, tex), 1},
+        {OP_UPSCALE, offsetof(NvnPUpscale, tex), NVN_UPSCALE_TEXTURES},
     };
     size_t i;
     u32 k;
@@ -130,10 +134,6 @@ int nvn_subroutine_apply(u32 linkage, i32 first, i32 count, const i32* values);
 /* whether a linkage map's fields are what its bytes say, every offset and target inside them, as SetSubroutineLinkage
    checks a map before it keeps it: a save state's are checked again (gpu/nvn/nvn_save.c) */
 int nvn_sub_linkage_valid(const NvnSubLinkage* l);
-/* the c[0] record of the Ounce compute program SetShaders gave serial (NVN_C0_RECORD), all 0 for another program */
-void nvn_program_c0(u64 serial, u8 c0[NVN_C0_RECORD]);
-/* the task and mesh programs' fields of the Ounce program SetShaders gave serial, all 0 for another program */
-DsMeshKey nvn_program_mesh(u64 serial);
 /* the game's driver resolved nvnDeviceGetInteger to func: its answers are read from its code (gpu/nvn/nvn_driver.c)
    before the game can ask */
 void nvn_device_driver(u64 func);

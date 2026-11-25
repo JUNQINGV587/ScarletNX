@@ -5,15 +5,19 @@
    waits for; the waiting channel's later jobs, and the calls that name it, stay behind it while a call naming another
    channel doesn't; a release the CPU writes and a syncpoint incremented off the GPU thread end waits; a stream
    resumes in the middle of a method batch, of a job's entries, and of a macro; and a wait nothing ends times out. A
-   new channel's render enable override starts at USE_RENDER_ENABLE, as Eden's does.
+   new channel's render enable override starts at USE_RENDER_ENABLE, as Eden's does. With the argument split,
+   gpu_queue.c's renderer thread runs the queue's records, the front end's constant buffer upload waits in the queue
+   behind the work before it, and the front end reads its own writes still queued.
    Each mark is a ClearBuffers value the stand-in renderer records; the platform's locks are pthreads */
 #include "nx/gpu/gpu.h"
+#include "nx/gpu/gpu_queue.h"
 #include "nx/gpu/maxwell/engines_int.h"
 #include "nx/gpu/renderer.h"
 #include "support/dma_ref.h"
 #include "nx/hle/services/nvdrv.h"
 #include "nx/memory/mem.h"
 #include "nx/runtime/clock.h"
+#include "nx/runtime/options.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include <pthread.h>
@@ -64,7 +68,8 @@ void mem_query(u64 addr, MemBlock* out) {
     out->size = sizeof guest;
     (void)addr;
 }
-u64 guest_ns(void) { return 0; }
+static _Atomic u64 clock_ns; /* the guest's clock, as a test sets it */
+u64 guest_ns(void) { return atomic_load_explicit(&clock_ns, memory_order_relaxed); }
 /* save states' function names, which nothing here takes */
 const char* state_fn_name(StateFnPtr fn) {
     (void)fn;
@@ -100,10 +105,18 @@ static void see(u32 v) {
     pthread_cond_broadcast(&seen_cv);
     pthread_mutex_unlock(&seen_lk);
 }
+/* set: the next clear notes what ended the GPU thread's last sleep (GpuPollStats.last) in sleep_end */
+static _Atomic int note_sleep_end;
+static _Atomic u32 sleep_end;
 static void record_clear(const DsState* ds, const DrawClear* c, const DrawOwner* o) {
     /* CLEAR_SURFACE's word again, from the clear the 3D engine made of it */
     u32 v = c->aspects | c->color_mask << 2 | c->slot << 6 | c->layer << 10;
     (void)ds, (void)o;
+    if (atomic_exchange_explicit(&note_sleep_end, 0, memory_order_acq_rel)) {
+        GpuPollStats s;
+        gpu_poll_stats(&s);
+        atomic_store_explicit(&sleep_end, s.last, memory_order_release);
+    }
     if (rewrite_on_clear) {
         *rewrite_on_clear = snx_le32(rewrite_value);
         rewrite_on_clear = NULL;
@@ -197,6 +210,18 @@ u64 plat_ns(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
 }
+#ifdef _WIN32 /* the platform's types hold Windows' own locks there (thread.h) */
+void pm_init(PMutex* m) { InitializeSRWLock(&m->l); }
+void pm_lock(PMutex* m) { AcquireSRWLockExclusive(&m->l); }
+void pm_unlock(PMutex* m) { ReleaseSRWLockExclusive(&m->l); }
+void pm_lock_announce(PMutex* m, const char* name) { (void)m, (void)name; }
+void pc_init(PCond* c) { InitializeConditionVariable(&c->c); }
+void pc_broadcast(PCond* c) { WakeAllConditionVariable(&c->c); }
+int pc_wait(PCond* c, PMutex* m, i64 ns) {
+    DWORD ms = ns < 0 ? INFINITE : (DWORD)((ns + 999999) / 1000000);
+    return !SleepConditionVariableSRW(&c->c, &m->l, ms, 0);
+}
+#else
 void pm_init(PMutex* m) { pthread_mutex_init(&m->l, NULL); }
 void pm_lock(PMutex* m) { pthread_mutex_lock(&m->l); }
 void pm_unlock(PMutex* m) { pthread_mutex_unlock(&m->l); }
@@ -220,17 +245,39 @@ int pc_wait(PCond* c, PMutex* m, i64 ns) {
     struct timespec ts = {(time_t)(t / 1000000000ull), (long)(t % 1000000000ull)};
     return pthread_cond_timedwait(&c->c, &m->l, &ts) != 0;
 }
-static PThreadFn thread_fn;
-static void* thread_main(void* arg) {
-    thread_fn(arg);
+#endif
+/* each thread's function and argument of its own: gpu.c's GPU thread and gpu_queue.c's renderer thread start one
+   after the other */
+typedef struct {
+    PThreadFn fn;
+    void* arg;
+} ThreadStart;
+static void* thread_main(void* p) {
+    ThreadStart start = *(ThreadStart*)p;
+    free(p);
+    start.fn(start.arg);
     return NULL;
 }
 int plat_thread(PThreadFn fn, void* arg, size_t stack) {
     pthread_t t;
+    ThreadStart* start = malloc(sizeof *start);
     (void)stack;
-    thread_fn = fn;
-    return pthread_create(&t, NULL, thread_main, arg) != 0;
+    if (!start) return 1;
+    *start = (ThreadStart){fn, arg};
+    if (pthread_create(&t, NULL, thread_main, start)) {
+        free(start);
+        return 1;
+    }
+    return 0;
 }
+/* gpu_queue.c's sleeps on a word: a wait that may end early for no reason, as thread.h allows, here a short sleep
+   while the word holds v; the wake has nothing to do then */
+void plat_wait_word(_Atomic uint32_t* w, uint32_t v, int64_t timeout_ns) {
+    if (atomic_load_explicit(w, memory_order_seq_cst) != v || !timeout_ns) return;
+    struct timespec ts = {0, timeout_ns > 0 && timeout_ns < 50000 ? (long)timeout_ns : 50000};
+    nanosleep(&ts, NULL);
+}
+void plat_wake_word(_Atomic uint32_t* w) { (void)w; }
 
 /* ------------------------------------------------ pushbuffers */
 #define SEM  0x8000 /* the semaphores */
@@ -335,7 +382,137 @@ static void expect(int ok, const char* what) {
 }
 #define FAST 500000000ull /* a wait an event ends, well short of the 1 and 2 s timeouts */
 
-int main(void) {
+/* ------------------------------------------------ gpu_split=1: gpu_queue.c's renderer thread runs the records */
+#define CBUF  (SEM + 0x300) /* a word of a constant buffer */
+#define EVENT (SEM + 0x200) /* an NVN event's word */
+/* a record that holds the renderer thread until the front end opens the gate: what the front end queues after it
+   stays queued while the front end goes on */
+static void renderer_held(const void* arg, u64 bytes) {
+    (void)arg, (void)bytes;
+    held_call(NULL);
+}
+static void open_gate(void) {
+    pthread_mutex_lock(&gate_lock);
+    gate_open = 1;
+    pthread_cond_broadcast(&gate_cv);
+    pthread_mutex_unlock(&gate_lock);
+}
+/* on the GPU thread, the front end: a constant buffer upload (LOAD_CONSTANT_BUFFER's gmem_write_cb) with the renderer
+   thread behind it. A draw queued before it must read the word from before it, so memory keeps it until the record
+   runs */
+static u32 cb_before_run;
+static void cb_upload(void* arg) {
+    (void)arg;
+    gq_call(renderer_held, NULL, 0);
+    u8 v[4];
+    snx_st_le32(v, 9);
+    gmem_write_cb(CBUF, v, sizeof v);
+    cb_before_run = snx_le32(*((u32*)guest + CBUF / 4));
+    open_gate();
+}
+/* on the GPU thread, the front end: two adds of 1 to the event's word as nvn_replay.c's effects() makes them (the word
+   as the stream sees it, plus 1, written through the release path), the renderer thread behind both */
+static void two_event_adds(void* arg) {
+    (void)arg;
+    pthread_mutex_lock(&gate_lock);
+    gate_open = 0;
+    pthread_mutex_unlock(&gate_lock);
+    gq_call(renderer_held, NULL, 0);
+    for (int i = 0; i < 2; i++) {
+        u8 v[4];
+        snx_st_le32(v, gmem_r32(EVENT) + 1);
+        gpu_release_write(EVENT, v, sizeof v);
+    }
+    open_gate();
+}
+/* on the GPU thread, the front end: a release with the GPU's timestamp (the puller's 16-byte semaphore release, DMA's
+   four-word one, NVN's timestamp report), queued at 1 ms of the clock with the renderer thread behind it, which gets
+   to it at 5 ms: the timestamp says when the draws before it were done, so it is the renderer thread's */
+#define STAMP (SEM + 0x400)
+static void stamped_release(void* arg) {
+    (void)arg;
+    pthread_mutex_lock(&gate_lock);
+    gate_open = 0;
+    pthread_mutex_unlock(&gate_lock);
+    gq_call(renderer_held, NULL, 0);
+    atomic_store_explicit(&clock_ns, 1000000, memory_order_relaxed);
+    u8 v[16];
+    snx_st_le32(v, 0x51);
+    snx_st_le32(v + 4, 0);
+    gpu_release_write_stamped(STAMP, v);
+    /* and NVN's timestamp report, which comes with the front end's ticks */
+    snx_st_le32(v, 0x52);
+    snx_st_le64(v + 8, gpu_ticks());
+    gpu_release_stamp(STAMP + 16, v, 0);
+    /* and NVN's samples-passed report with no count of the renderer's: the replay's value, then its ticks */
+    gpu_report_samples(0, STAMP + 32, 0, 1000);
+    atomic_store_explicit(&clock_ns, 5000000, memory_order_relaxed);
+    open_gate();
+}
+static int split_main(void) {
+    g_settings.gpu_split = 1;
+    cpu_store(CBUF, 3);
+    gpu_call(cb_upload, NULL, NULL, 0);
+    gpu_call(called, (void*)(uintptr_t)0x991, NULL, 0); /* a call runs once every record queued before it ran */
+    wait_marks(1);
+    u32 word = snx_le32(*((u32*)guest + CBUF / 4));
+    expect(cb_before_run == 3, "a constant buffer upload reached memory before the renderer thread ran its record");
+    expect(marks_are((u32[]){0x991}, 1) && word == 9, "the constant buffer upload's record did not run");
+    cpu_store(EVENT, 5);
+    gpu_call(two_event_adds, NULL, NULL, 0);
+    gpu_call(called, (void*)(uintptr_t)0x990, NULL, 0);
+    wait_marks(2);
+    word = snx_le32(*((u32*)guest + EVENT / 4));
+    if (word != 7) fprintf(stderr, "the event's word is %u after two adds of 1 to 5 (7 expected)\n", word);
+    expect(marks_are((u32[]){0x991, 0x990}, 2) && word == 7,
+           "two adds on the front end, the renderer thread behind: the second reads the first's queued write");
+    cpu_store(STAMP, 0);
+    gpu_call(stamped_release, NULL, NULL, 0);
+    gpu_call(called, (void*)(uintptr_t)0x992, NULL, 0);
+    wait_marks(3);
+    u64 stamp;
+    memcpy(&stamp, (const u8*)guest + STAMP + 8, sizeof stamp);
+    stamp = snx_le64(stamp);
+    const u64 queued = snx_gpu_ticks_of_ns(1000000), run = snx_gpu_ticks_of_ns(5000000);
+    if (stamp < run || stamp >= run + queued / 10)
+        fprintf(stderr,
+                "a release's timestamp is %llu ticks: %llu when the front end queued it, %llu when the "
+                "renderer thread ran it\n",
+                (unsigned long long)stamp, (unsigned long long)queued, (unsigned long long)run);
+    expect(snx_le32(*((u32*)guest + STAMP / 4)) == 0x51 && stamp >= run && stamp < run + queued / 10,
+           "a release's timestamp is the clock's when the renderer thread performs it");
+    memcpy(&stamp, (const u8*)guest + STAMP + 24, sizeof stamp);
+    stamp = snx_le64(stamp);
+    if (stamp < run || stamp >= run + queued / 10)
+        fprintf(stderr,
+                "a timestamp report's ticks are %llu: %llu when the front end queued it, %llu when the renderer "
+                "thread ran it\n",
+                (unsigned long long)stamp, (unsigned long long)queued, (unsigned long long)run);
+    expect(snx_le32(*((u32*)guest + STAMP / 4 + 4)) == 0x52 && stamp >= run && stamp < run + queued / 10,
+           "a timestamp report's ticks are the clock's when the renderer thread performs it");
+    memcpy(&stamp, (const u8*)guest + STAMP + 40, sizeof stamp);
+    stamp = snx_le64(stamp);
+    if (stamp < run || stamp >= run + queued / 10)
+        fprintf(stderr,
+                "a samples-passed report's ticks are %llu: %llu when the front end queued it, %llu when the "
+                "renderer thread ran it\n",
+                (unsigned long long)stamp, (unsigned long long)queued, (unsigned long long)run);
+    expect(snx_le32(*((u32*)guest + STAMP / 4 + 8)) == 1000 && stamp >= run && stamp < run + queued / 10,
+           "a samples-passed report's ticks are the clock's when the renderer thread performs it");
+    if (!failures) printf("gpu_park split: ok\n");
+    return failures != 0;
+}
+
+/* tests/support/gpu_front_stub.c: the renderer side's decision on draws and clears, which engines.c's render enable
+   makes */
+extern int (*g_stub_render_state)(u32 owner, u32* pred);
+int main(int argc, char** argv) {
+    if (argc > 1 && !strcmp(argv[1], "split")) return split_main();
+    g_stub_render_state = gpu_render_state;
+    /* the front stub runs draws and clears on the GPU thread as they come, so gpu_queue.c's records (DMA copies,
+       writes) run there too, in their order with them: on a renderer thread of their own they ran after the clears
+       that mark a job done */
+    g_settings.gpu_split = 0;
     /* A yielding call retains its lane's order without trapping the GPU thread. Another lane can signal it. */
     gpu_call_poll(poll_wait, (void*)(uintptr_t)0x970, 0);
     gpu_call_poll(poll_mark, (void*)(uintptr_t)0x971, 0);
@@ -383,6 +560,27 @@ int main(void) {
         expect(gpu_mem_dirty_since(g, 0x3000, 0x1000) && !gpu_mem_dirty_since(g, 0xA000, 0x1000) &&
                    !gpu_mem_dirty_since(g, 0x4000, 0x1000),
                "a mapping change dirties its own GPU pages alone");
+    }
+
+    /* the watched granules' newest write over a range that starts and ends inside blocks of 64 granules and covers two
+       whole (maxwell3d.c's g_wgran, WGRAN_BLOCK): a write to any granule of it is its newest, the first and the last
+       ones and each of the two blocks' too, and a write to a granule beside it is not */
+    {
+        const u64 granule = 2ull << 20, block = 64 * granule, base = 256ull << 30;
+        const u64 from = base + 62 * granule, to = base + 3 * block + 2 * granule;
+        u32 missed = 0, beside = 0;
+        expect(gpu_mem_watch(base, 4 * block), "four blocks of granules are watched");
+        for (u64 at = from - 2 * granule; at < to + 2 * granule; at += granule) {
+            const u64 before = gpu_mem_granules_generation(from, to - from);
+            gpu_mem_written(at + 0x1000, 4);
+            const u64 now = gpu_mem_granules_generation(from, to - from);
+            if (at >= from && at < to)
+                missed += now != gpu_mem_generation();
+            else
+                beside += now != before;
+        }
+        expect(!missed, "a write to any granule of a range of blocks is the range's newest");
+        expect(!beside, "and a write to a granule beside it is not");
     }
 
     /* Constant buffer uploads (gpu_mem_written_cb, gmem_write_cb) stamp their pages as any write does. A question whose
@@ -549,6 +747,26 @@ int main(void) {
     expect(took < FAST, "the CPU's release was seen soon after");
     expect(atomic_load_explicit(&epochs, memory_order_seq_cst) > epochs_before,
            "the end of a wait tells the renderer memory may have changed");
+
+    /* an acquire a release's write ends (vk/release.c writes the payload, then gpu_kick_polls): the GPU thread's sleep
+       while the stream waits is ended by that kick, not by its next look WAIT_POLL_NS on. Nine trials, as a look can
+       come between the write and the kick; before, every one ended at the look */
+    {
+        int kicked = 0;
+        for (u32 t = 0; t < 9; t++) {
+            forget_marks();
+            cpu_store(SEM + 112, 0);
+            submit1(sem_then(SEM + 112, 100 + t, 1, 0xF1), 21);
+            nanosleep(&ms20, NULL); /* parked, asleep between its looks */
+            atomic_store_explicit(&note_sleep_end, 1, memory_order_release);
+            cpu_store(SEM + 112, 100 + t);
+            gpu_kick_polls();
+            wait_marks(1);
+            kicked += marks_are((u32[]){0xF1}, 1) && atomic_load_explicit(&sleep_end, memory_order_acquire) == 0;
+        }
+        if (kicked < 7) fprintf(stderr, "a release's kick ended %d of 9 parked acquires' sleeps\n", kicked);
+        expect(kicked >= 7, "a release's kick ends the sleep of a stream that waits for memory");
+    }
 
     /* an acquire already met: the stream goes on, and the renderer is told memory may have changed (what the CPU
        wrote before releasing it is for the stream to see), on top of the submission's own */

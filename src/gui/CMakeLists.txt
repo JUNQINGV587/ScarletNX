@@ -21,22 +21,21 @@ function(snx_gui_languages target folder out)
     add_custom_command(OUTPUT "${out}"
         COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/build-languages.py" --out "${out}" ${pos}
         DEPENDS "${PROJECT_SOURCE_DIR}/scripts/build-languages.py" "${PROJECT_SOURCE_DIR}/po/scarletnx.pot" ${pos}
-                "${PROJECT_SOURCE_DIR}/scripts/build-glyphs.py" "${CMAKE_CURRENT_SOURCE_DIR}/unifont-latin.hex"
-                "${CMAKE_CURRENT_SOURCE_DIR}/unifont-wide.hex" "${CMAKE_CURRENT_SOURCE_DIR}/unifont-titles.hex"
-                "${PROJECT_SOURCE_DIR}/src/common/utilities/font.c"
+                "${PROJECT_SOURCE_DIR}/scripts/build-glyphs.py" "${PROJECT_SOURCE_DIR}/src/common/utilities/font.c"
         COMMENT "The menu's languages from ${folder}" VERBATIM)
     add_library(${target} STATIC "${out}")
 endfunction()
 snx_gui_languages(snx_gui_languages "${PROJECT_SOURCE_DIR}/po" "${PROJECT_BINARY_DIR}/generated/gui_languages.c")
-# The letters past the VGA font's CP437: GNU Unifont's, the Latin ones (latin.h) kept in unifont-latin.hex, the CJK and
-# Hangul blocks of game titles (titles.h) in unifont-titles.hex and the other wide ones the languages show (wide.h) in
-# unifont-wide.hex
+# The letters past the VGA font's CP437, from the Unifont the build downloads (cmake/dependencies.cmake): the Latin ones
+# (latin.h), the wide ones the languages of po/ and tests/po/ show (wide.h) and the CJK and Hangul blocks of game titles
+# (titles.h)
+file(GLOB snx_gui_glyph_pos CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/po/*.po" "${PROJECT_SOURCE_DIR}/tests/po/*.po")
 add_custom_command(OUTPUT "${PROJECT_BINARY_DIR}/generated/gui_glyphs.c" "${PROJECT_BINARY_DIR}/generated/gui_titles.c"
-    COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/build-glyphs.py"
+    COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/build-glyphs.py" --from "${snx_unifont_hex}"
             --out "${PROJECT_BINARY_DIR}/generated/gui_glyphs.c"
             --titles-out "${PROJECT_BINARY_DIR}/generated/gui_titles.c"
-    DEPENDS "${PROJECT_SOURCE_DIR}/scripts/build-glyphs.py" "${CMAKE_CURRENT_SOURCE_DIR}/unifont-latin.hex"
-            "${CMAKE_CURRENT_SOURCE_DIR}/unifont-wide.hex" "${CMAKE_CURRENT_SOURCE_DIR}/unifont-titles.hex"
+    DEPENDS "${PROJECT_SOURCE_DIR}/scripts/build-glyphs.py" "${PROJECT_SOURCE_DIR}/scripts/build-languages.py"
+            "${PROJECT_SOURCE_DIR}/src/common/utilities/font.c" "${snx_unifont_hex}" ${snx_gui_glyph_pos}
     COMMENT "The menu's Latin, wide and titles' glyphs" VERBATIM)
 # the launcher's scenes, generated from ui.txt by tools/uigen: gui/ui.h and gui/ui.c, whose drawing and callbacks
 # main.c defines, so they go into what compiles main.c
@@ -52,11 +51,13 @@ target_link_libraries(snx_gui_ui PRIVATE SDL3::SDL3) # its platform macros and k
 set_target_properties(snx_gui_ui PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON)
 target_compile_options(snx_gui_ui PRIVATE -Wall -Wextra -Werror=missing-prototypes)
 add_library(snx_gui_support STATIC aot.c model.c browser.c steps.c theme.c recent.c editor.c settings.c place.c clean.c
-            queue.c latin.c wide.c log.c logzip.c saves.c gpu_driver.c gpu_driver_fetch.c covers.c probe.c last_run.c
-            title.c ${gui_process}
+            queue.c latin.c wide.c log.c logzip.c saves.c gpu_driver.c jdk.c gpu_driver_fetch.c covers.c probe.c last_run.c
+            title.c bluetooth.c ${gui_process}
             "${PROJECT_BINARY_DIR}/generated/gui_themes.c" "${PROJECT_BINARY_DIR}/generated/gui_glyphs.c"
             "${PROJECT_BINARY_DIR}/generated/gui_titles.c")
 target_link_libraries(snx_gui_support PUBLIC scarletnx-common snx_setup snx_i18n snx_settings snx_miniz PRIVATE snx_libdeflate)
+# Controllers > Bluetooth's controllers (bluetooth.c): the adverts a scan hears (common/platform/ble_scan.h)
+target_link_libraries(snx_gui_support PUBLIC snx_ble)
 # Install Keys' check of the DS's ARM7 BIOS, its CRC-32 (snx_crc32, main.c)
 target_link_libraries(snx_gui_support PUBLIC snx_zip)
 # Download Driver's GitHub lists (gpu_driver_fetch.c), Amberlith's report (probe.c)
@@ -146,6 +147,9 @@ target_compile_options(scarletnx-gui PRIVATE -Wframe-larger-than=262144 -Werror=
 target_compile_definitions(scarletnx-gui PRIVATE SNX_SOURCE_DIR="${PROJECT_SOURCE_DIR}" SNX_BUILD_DIR="${PROJECT_BINARY_DIR}")
 target_link_libraries(scarletnx-gui PUBLIC snx_gui_support PRIVATE snx_gui_ui scarletnx-common SDL3::SDL3
                       snx_window_icon snx_build_info snx_pad_sdl snx_gui_pad snx_splash snx_gui_languages snx_demangle)
+# Controllers > Bluetooth's search: the system's scan (BlueZ on Linux), which the tests that compile main.c replace
+# by a fake (tests/support/ble_fake_system.c)
+target_link_libraries(scarletnx-gui PRIVATE snx_ble_system)
 # GPU Drivers' Download Driver, where the build has OpenSSL (common/network/https.h)
 if(TARGET snx_https)
     target_link_libraries(scarletnx-gui PRIVATE snx_https)

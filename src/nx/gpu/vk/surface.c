@@ -7,6 +7,7 @@
    come back. Textures and render targets are each in a list from the least recently used to the most, which the
    caches' eviction takes from (vk_surf_reclaim): idle ones, and more when device memory nears its budget
    (vk_mem_trim, with the budget from gpu/vk/memory.c). */
+#include "nx/gpu/vk/addr_gens.h"
 #include "nx/gpu/vk/descriptor_objects.h"
 #include "nx/gpu/vk/rt_bands.h"
 #include "nx/gpu/vk/rt_cover.h"
@@ -26,6 +27,7 @@
 #include "nx/gpu/vk/resource_stats.h"
 #include "nx/gpu/vk/tex_report.h"
 #include "nx/gpu/vk/pending_pages.h"
+#include "nx/gpu/vk/pool_map.h"
 #include "nx/gpu/texture/astc_bc.h"
 #include "nx/gpu/texture/blocklinear.h"
 #include "nx/memory/own.h"
@@ -252,6 +254,8 @@ u32 vk_surf_epoch_at(u64 gva) { return g_surf_bucket_epoch[hkey(gva)]; }
 static void surf_changed(u64 gva) {
     atomic_fetch_add_explicit(&g_vk_surf_epoch, 1, memory_order_relaxed);
     g_surf_bucket_epoch[hkey(gva)]++;
+    /* item 7b's events: a surface made or freed changes no texel, its draws do (vk_rt_drawn), so its first byte alone */
+    if (g_settings.texture_events_shadow && !(gva >> 63)) addr_gens_bump(ADDR_GENS_WRITE, gva, 1);
 }
 
 /* bytes of a block-linear surface of w_bytes x h, block height 2^bh GOBs (shrunk for small surfaces, as the
@@ -325,6 +329,109 @@ static void surf_barrier(VkCommandBuffer cb, const Surf* s, VkPipelineStageFlags
                                     .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &image};
     rec_CmdPipelineBarrier2(cb, &dependency);
 }
+/* the accesses that write an image */
+#define SURF_WRITES                                                                                                    \
+    (VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |                                         \
+     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)
+/* The written list of the barriers at the writer (vk_surf_written_flush): each surface with the command buffer its
+   write was recorded in. Under vk_lock, as the surfaces' recorded state is */
+#define WRITTEN_MAX 4096
+static struct {
+    Surf* s[WRITTEN_MAX];
+    VkCommandBuffer cb[WRITTEN_MAX];
+    u32 n;
+    VkWriterCounts c;
+} g_written;
+/* on with writer_barriers, and with the pool map, whose draws drop the reader barriers a batch covers */
+static int written_on(void) {
+    return (g_settings.writer_barriers || g_spirv_translate.pool_map) && g_vk.has_unified_layouts;
+}
+/* whether s is on the list: its place there holds it. A surface made as a copy of another (a crop, a snapshot) starts
+   with the other's place, which holds the other */
+static int written_listed(const Surf* s) {
+    return s->written_at && s->written_at <= g_written.n && g_written.s[s->written_at - 1] == s;
+}
+/* entry i leaves the list: the last one takes its place */
+static void written_drop_at(u32 i) {
+    g_written.s[i]->written_at = 0;
+    g_written.n--;
+    if (i < g_written.n) {
+        g_written.s[i] = g_written.s[g_written.n];
+        g_written.cb[i] = g_written.cb[g_written.n];
+        g_written.s[i]->written_at = i + 1;
+    }
+}
+static void written_drop(Surf* s) {
+    if (written_listed(s)) written_drop_at(s->written_at - 1);
+}
+/* s written in cb: no batch covers this write yet, and s goes on the list once */
+static void written_note(VkCommandBuffer cb, Surf* s) {
+    s->written_batched = 0;
+    if (!written_on() || written_listed(s)) return;
+    if (g_written.n == WRITTEN_MAX) {
+        g_written.c.full++;
+        return;
+    }
+    g_written.s[g_written.n] = s;
+    g_written.cb[g_written.n] = cb;
+    s->written_at = ++g_written.n;
+}
+void vk_surf_written_flush(VkCommandBuffer cb, Surf* const* rt, u32 n, const Surf* zt) {
+    if (!written_on() || !g_written.n) return;
+    surf_batch_flush(); /* the barriers before go first */
+    VkImageMemoryBarrier2 b[64];
+    u32 nb = 0;
+    for (u32 i = 0; i < g_written.n;) {
+        Surf* s = g_written.s[i];
+        int own = s == zt;
+        for (u32 k = 0; k < n && !own; k++) own = rt[k] == s;
+        if (own) { /* the pass writes it again: on the list for the next pass's batch */
+            i++;
+            continue;
+        }
+        /* a write no reader barrier has followed yet, in GENERAL and in this command buffer: GENERAL to GENERAL is
+           no layout transition, so no sample locations either */
+        if ((s->access & SURF_WRITES) && s->layout == VK_IMAGE_LAYOUT_GENERAL && g_written.cb[i] == cb) {
+            b[nb++] = (VkImageMemoryBarrier2){.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+                                              .srcStageMask = s->stage,
+                                              .srcAccessMask = s->access,
+                                              .dstStageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                              .dstAccessMask = VK_ACCESS_2_MEMORY_READ_BIT,
+                                              .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                              .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+                                              .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                              .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                              .image = s->img,
+                                              .subresourceRange = {vk_aspect(&s->f), 0, VK_REMAINING_MIP_LEVELS, 0,
+                                                                   VK_REMAINING_ARRAY_LAYERS}};
+            s->written_batched = 1;
+            g_written.c.batched++;
+        }
+        written_drop_at(i); /* the last one moves into place i */
+        if (nb == sizeof b / sizeof *b || (nb && i >= g_written.n)) {
+            VkDependencyInfo d = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = nb,
+                                  .pImageMemoryBarriers = b};
+            rec_CmdPipelineBarrier2(cb, &d);
+            g_written.c.batches++;
+            nb = 0;
+        }
+    }
+    if (nb) {
+        VkDependencyInfo d = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO, .imageMemoryBarrierCount = nb,
+                              .pImageMemoryBarriers = b};
+        rec_CmdPipelineBarrier2(cb, &d);
+        g_written.c.batches++;
+    }
+}
+void vk_surf_writer_counts(VkWriterCounts* c) { *c = g_written.c; }
+int vk_surf_read_covered(Surf* s) {
+    if (!written_on() || s->layout != VK_IMAGE_LAYOUT_GENERAL || !(s->access & SURF_WRITES)) return 0;
+    /* batched already, or on the list in this command buffer for the batch of the pass the draw begins */
+    if (!s->written_batched && !(written_listed(s) && g_written.cb[s->written_at - 1] == vk_cmd())) return 0;
+    s->stage |= VK_SAMPLED_STAGES; /* a later write's barrier waits for these reads too */
+    g_written.c.dropped++;
+    return 1;
+}
 void vk_surf_batch_begin(void) { g_surf_batch.on = 1; }
 void vk_surf_batch_end(void) {
     surf_batch_flush();
@@ -335,6 +442,7 @@ void vk_surf_use(VkCommandBuffer cb, Surf* s, VkImageLayout layout, VkPipelineSt
     int writes = (access & (VK_ACCESS_2_TRANSFER_WRITE_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
                             VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_SHADER_WRITE_BIT |
                             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT)) != 0;
+    const int compute_only = stage == VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
     /* With unified image layouts each use of the image is in GENERAL. A read then makes the last write visible to
        every later read, in each stage. Later reads of another kind (a sample after a copy read, a copy after a
        sample) then take no barrier, and they do not end the open rendering pass */
@@ -359,14 +467,44 @@ void vk_surf_use(VkCommandBuffer cb, Surf* s, VkImageLayout layout, VkPipelineSt
         return;
     }
     vk_render_end(); /* no barriers on images inside a rendering pass */
+    /* a reader barrier after a write: one a written-list barrier covers, or the next pass's batch would (step 6 of
+       docs/dev/draw-cost.md, item 7, takes these away) */
+    if (written_on() && !writes && s->layout == layout && layout == VK_IMAGE_LAYOUT_GENERAL) {
+        g_written.c.readers++;
+        if (compute_only)
+            g_written.c.compute++;
+        else if (s->written_batched || written_listed(s))
+            g_written.c.covered++;
+    }
     surf_barrier(cb, s, s->stage ? s->stage : VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, s->access,
                s->layout, stage, access, layout);
     s->layout = layout;
     s->stage = stage;
     s->access = access;
+    if (writes) written_note(cb, s);
 }
 
 float g_vk_scale = 1.0f;
+/* the multiplier's window: 0 open, 1 closed by the first render target, 2 a request writing g_vk_scale. A render
+   target made while a request writes waits for it, so every target has the same multiplier */
+static _Atomic int g_scale_window;
+float vk_scale_request(float scale) {
+    int open = 0;
+    if (!atomic_compare_exchange_strong_explicit(&g_scale_window, &open, 2, memory_order_acq_rel, memory_order_acquire))
+        return g_vk_scale;
+    g_vk_scale = scale;
+    atomic_store_explicit(&g_scale_window, 0, memory_order_release);
+    return scale;
+}
+static void scale_close(void) {
+    for (;;) {
+        int open = 0;
+        if (atomic_load_explicit(&g_scale_window, memory_order_acquire) == 1 ||
+            atomic_compare_exchange_strong_explicit(&g_scale_window, &open, 1, memory_order_acq_rel,
+                                                    memory_order_acquire))
+            return;
+    }
+}
 u32 vk_sc(u32 v) {
     u32 r = (u32)((float)v * g_vk_scale + 0.5f);
     return r ? r : 1;
@@ -387,7 +525,6 @@ int vk_rt_same_layout(const Surf* s, u32 w, u32 h, int bl, u32 bh, u32 pitch) {
     if (!bl) return pitch == s->pitch;
     return (w * s->f.bpp + 63) / 64 == (s->w * s->f.bpp + 63) / 64 && bl_height(h, bh) == bl_height(s->h, s->bh);
 }
-/* a surface of w by h pixels with the samples of the sample layout msaa (render targets only: textures have one) */
 /* s's image (a render target, or a surface of the caches): its create info (vf has to live until it is made), the
    usage, and the format its storage view takes. It sets what s keeps of them (storage_capable, ms_raw, type, the
    sample locations). 0 when the GPU makes no such image. surf_create_ makes it, and vk_rt_move makes it again */
@@ -483,9 +620,12 @@ static Surf* surf_create_(u64 gva, u32 w, u32 h, VkFmt f, u32 fkey, u32 bl, u32 
                          u32 msaa) {
     Surf* s = calloc(1, sizeof *s);
     if (!s) return NULL;
+    const char* kind = is_rt ? "render targets" : "texture objects"; /* surf_free frees with the same choice */
+    SNX_MEM_ALLOC_D(s, sizeof *s, kind);
     s->gva = gva;
     s->w = w;
     s->h = h;
+    if (is_rt) scale_close();
     s->sw = is_rt ? vk_sc(w) : w;
     s->sh = is_rt ? vk_sc(h) : h;
     s->layers = layers;
@@ -506,12 +646,14 @@ static Surf* surf_create_(u64 gva, u32 w, u32 h, VkFmt f, u32 fkey, u32 bl, u32 
     VkImageUsageFlags usage;
     VkFormat storage_format;
     if (!surf_image_info(s, &ii, &vf, &usage, &storage_format)) {
+        SNX_MEM_FREE_D(s, kind);
         free(s);
         return NULL;
     }
     /* a scaled target can pass the allocation cap (4x of 4K is 506 MiB in RGBA8). Room is made for it under the
        budget: the caller holds only surfaces it used this present, which stay */
     if (!vk_cache_image_create(&ii, &s->img, &s->mem, VK_OWN_TARGET | (is_rt ? VK_OWN_MOVES : 0), &s->bytes)) {
+        SNX_MEM_FREE_D(s, kind);
         free(s);
         return NULL;
     }
@@ -583,6 +725,7 @@ static int rt_move(VkCommandBuffer cb, Surf* s, const DevMemWant* want, u64* byt
     s->att = s->att_linear = VK_NULL_HANDLE;
     s->img = img;
     s->mem = mem;
+    vk_pool_map_swapped(s);
     vk_surf_bytes(s, info.size);
     s->layout = copied ? VK_LAYOUT(TRANSFER_DST_OPTIMAL) : VK_IMAGE_LAYOUT_UNDEFINED;
     s->stage = copied ? VK_PIPELINE_STAGE_2_COPY_BIT : 0;
@@ -888,6 +1031,7 @@ static u64 g_wseq;
    guest memory still at it, so its next write looked written back already and never landed */
 static u32 g_surf_gen;
 u32 vk_surf_gen(void) { return ++g_surf_gen; }
+u32 vk_surf_gen_now(void) { return g_surf_gen; }
 /* What a texture takes from the drawn targets over it (texture.c tex_take_drawn) changes only with the targets in its
    range and their pixels, so a texture that had nothing left to take is passed over while this count hasn't moved. It
    moves when a target enters the list of drawn targets or leaves it, is parked or taken out of parking, and when one
@@ -901,6 +1045,8 @@ static void take_changed(Surf* s) {
     g_take_gen++;
 }
 void vk_surf_wrote(Surf* s) {
+    /* item 7b's events: its pixels changed, by a draw or a copy, blit or pack into it */
+    if (g_settings.texture_events_shadow && !(s->gva >> 63)) addr_gens_bump(ADDR_GENS_WRITE, s->gva, rt_bytes(s));
     take_changed(s);
     s->wgen = vk_surf_gen();
     s->wseq = ++g_wseq;
@@ -1142,7 +1288,11 @@ static void rt_reload(u64 gva) {
 }
 void vk_rt_reload(u64 gva) {
     VkResourceScope scope = vk_resource_begin();
+    /* the console's GPU reads the target's memory as it is: the load is the runtime's work, which a game that times
+       its frames must not count (stamp.c) */
+    vk_stamp_runtime_begin();
     rt_reload(gva);
+    vk_stamp_runtime_end();
     vk_resource_end(VK_RESOURCE_RT_RELOAD, scope);
 }
 
@@ -1464,6 +1614,14 @@ static u32 rt_newer_over(const Surf* s, u64 size, Surf** local, u32 nlocal, Surf
 /* s's pixels, read back to p as of its write generation wgen, into guest memory in its layout (or over original, a
    storage image's merge), but for the pages the CPU wrote since s's draws (cpu_newer) */
 static void flush_land(Surf* s, const u8* p, const u8* original, u64 wgen, u8** keep, u64* keep_size) {
+    /* a parked target (another size or format took its address, rt_create_) owns none of memory's bytes now: its pixels,
+       a storage image's result among them, land nowhere and are settled as if they had. Its address with the parked
+       bit is no GPU address: a write stamped there reads as one over every page (write_pages_stamp), which loaded
+       every target again from memory and left the depth targets undefined */
+    if (s->gva >> 63) {
+        s->mem_wgen = wgen;
+        return;
+    }
     u32 gh = guest_h(s);
     u64 gva = s->gva, row = (u64)guest_w(s) * s->f.bpp, slice = row * gh;
     u64 sz = rt_bytes(s), gw0 = gpu_mem_generation();
@@ -1877,14 +2035,14 @@ static int publish_bands(Surf* s, u64 size, u32 mem_wgen, u64 gw0) {
         rt_overlay(s->gva + at, hi - at, r->buf, 0, s, 0);
         s->mem_wgen = mem_wgen;
         VkCommandBuffer cb = vk_cmd();
-        vk_all_barrier(cb);
+        vk_all_barrier_by(VK_BAR_SURFACE, cb);
         if (!flush_record(cb, s, r->buf, 0, &part)) {
             vk_own_res_unref(r);
             return 0;
         }
-        vk_all_barrier(cb);
+        vk_all_barrier_by(VK_BAR_SURFACE, cb);
         s->mem_wgen = s->wgen; /* the newer ones wholly in the band, over them */
-        if (rt_overlay(s->gva + at, hi - at, r->buf, 0, s, 1)) vk_all_barrier(vk_cmd());
+        if (rt_overlay(s->gva + at, hi - at, r->buf, 0, s, 1)) vk_all_barrier_by(VK_BAR_SURFACE, vk_cmd());
         const Surf* publishing = g_rt_publishing;
         g_rt_publishing = s;
         rt_retire_over(s->gva + at, hi - at, s, r, at); /* r holds the band: its byte 0 is the span's byte at */
@@ -1966,17 +2124,26 @@ static u32 publish_gaps(const Surf* s, u64 size, const CpuRuns* newer, u64 (*r)[
     return n ? n : (u32)-1; /* -1: nothing to read, the flush writes it all */
 }
 u64 g_vk_publish_reads_cut, g_vk_publish_bytes_skipped; /* publishes that read only their gaps, and the bytes left */
-int vk_surf_publish(Surf* s) {
-    SNX_ZONE(z_publish, "surface publish");
+static int surf_publish(Surf* s) {
+    SNX_ZONE(z_publish, "vk: surface publish");
     u64 size = flush_bytes(s);
     u32 mem_wgen = s ? s->mem_wgen : 0;
     VkOwnRes* r;
     VkCommandBuffer cb;
-    if (!size || (s->gva >> 63)) return 0;
+    if (!size || (s->gva >> 63)) {
+        SNX_ZONE_VALUE(z_publish, 0);
+        return 0;
+    }
     if (!s->bl) {
-        if (!surf_publishable(s)) return 0;
+        if (!surf_publishable(s)) {
+            SNX_ZONE_VALUE(z_publish, 0);
+            return 0;
+        }
         size = rt_bytes(s);
     }
+    /* what is published, in bytes, beside the zone's own duration */
+    SNX_ZONE_VALUE(z_publish, size);
+    const int bands = size > g_vk.alloc_cap;
     vk_render_end();
     CpuRuns newer;
     u32 kept = cpu_newer(s, size, &newer);
@@ -1984,9 +2151,11 @@ int vk_surf_publish(Surf* s) {
     VkBuffer kbuf = VK_NULL_HANDLE;
     /* over one owner: in bands when nothing the CPU wrote since the draws has to stay over the pixels (cpu_newer), a
        single 2D layer that packs no depth; else the caller writes it back */
-    if (size > g_vk.alloc_cap)
+    if (bands) {
+        SNX_ZONE_TEXT(z_publish, "%s", "larger than one allocation, published in bands");
         return s->bl && !kept && s->layers == 1 && !surf_volume(s) && !depth_packs(s) &&
                publish_bands(s, size, mem_wgen, gw0);
+    }
     r = vk_own_res_new(size, VK_OWN_BY_TARGET);
     if (!r) return 0;
     /* straight into the buffer that becomes the span's owner, as the copy engine's destinations go (dma.c): the bytes
@@ -2041,7 +2210,7 @@ int vk_surf_publish(Surf* s) {
             rec_CmdCopyBuffer(cb, r->buf, kbuf, 1, &kc);
             k += kc.size;
         }
-        vk_all_barrier(cb);
+        vk_all_barrier_by(VK_BAR_SURFACE, cb);
     }
     /* the older targets over the span: s's own pixels go over them below, in the guest's layout, so a target leaves
        itself out (its tight rows would be a pitch-linear one's padding) */
@@ -2049,15 +2218,15 @@ int vk_surf_publish(Surf* s) {
     rt_overlay(s->gva, size, r->buf, 0, s, 0);
     s->mem_wgen = mem_wgen;
     cb = vk_cmd();
-    vk_all_barrier(cb);
+    vk_all_barrier_by(VK_BAR_SURFACE, cb);
     FlushPart whole = flush_whole(s);
     if (!(s->bl ? flush_record(cb, s, r->buf, 0, &whole) : flush_copy(cb, s, r->buf, 0, s->pitch, &whole))) {
         vk_own_res_unref(r);
         return 0;
     }
-    vk_all_barrier(cb);
+    vk_all_barrier_by(VK_BAR_SURFACE, cb);
     s->mem_wgen = s->wgen; /* the newer targets wholly in the span, over s's pixels */
-    if (rt_overlay(s->gva, size, r->buf, 0, s, 1)) vk_all_barrier(vk_cmd());
+    if (rt_overlay(s->gva, size, r->buf, 0, s, 1)) vk_all_barrier_by(VK_BAR_SURFACE, vk_cmd());
     s->mem_wgen = mem_wgen;
     cb = vk_cmd();
     for (u64 i = 0, k = 0; i < kept; i++) { /* the CPU's runs over the image (cpu_newer) */
@@ -2065,7 +2234,7 @@ int vk_surf_publish(Surf* s) {
         rec_CmdCopyBuffer(cb, kbuf, r->buf, 1, &kc);
         k += kc.size;
     }
-    if (kept) vk_all_barrier(cb);
+    if (kept) vk_all_barrier_by(VK_BAR_SURFACE, cb);
     /* The buffer now holds this image, and the targets under it: publishing it must not flush them again */
     s->mem_wgen = s->wgen;
     const Surf* publishing = g_rt_publishing;
@@ -2083,8 +2252,29 @@ int vk_surf_publish(Surf* s) {
     vk_surf_relist(s);
     if (!s->is_rt) vk_tex_note_writeback(s);
     rt_publish_newer(s, size, retired != 0);
+    SNX_ZONE_TEXT(z_publish, "%s",
+                  ngaps == (u32)-1 ? "flush writes the whole span, no gaps read"
+                  : ngaps          ? "gaps read from memory"
+                  : kept           ? "CPU wrote runs, kept over pixels"
+                  : covers_all     ? "whole span copied"
+                                   : "span read from memory");
     return 1;
 }
+/* surf_publish counted by why (VkRtWatchStats, vk_lock held): its bytes, and the CPU's time in the outermost one, as
+   a publish publishes the older targets under it first (vk_rt_before_publish_cpu) */
+static int publish_why(Surf* s, int why) {
+    static int depth;
+    const u64 size = s ? flush_bytes(s) : 0, a = depth ? 0 : plat_ns();
+    depth++;
+    const int r = surf_publish(s);
+    depth--;
+    if (!r) return 0;
+    g_vk_rt_watch.by[why]++;
+    g_vk_rt_watch.bytes[why] += size;
+    if (!depth) g_vk_rt_watch.ns[why] += plat_ns() - a;
+    return 1;
+}
+int vk_surf_publish(Surf* s) { return publish_why(s, VK_PUB_OTHER); }
 /* A draw's storage image kept on the GPU until the CPU touches its bytes, where the write-back read all of them on the
    CPU before the draw, and copied the image back after it, to merge the two with what the CPU wrote between. Here
    the span is GPU-owned from the bind on: by the owner a release published there before, or by one made now from
@@ -2131,7 +2321,7 @@ int vk_surf_keep_begin(Surf* s, VkImageKeep* k) {
             return 0;
         }
         s->mem_wgen = s->wgen; /* a target goes over nothing of its own */
-        if (vk_rt_overlay(s->gva, size, r->buf, 0)) vk_all_barrier(vk_cmd());
+        if (vk_rt_overlay(s->gva, size, r->buf, 0)) vk_all_barrier_by(VK_BAR_SURFACE, vk_cmd());
         s->mem_wgen = mem_wgen;
         rt_retire_over(s->gva, size, NULL, NULL, 0);
         vk_own_publish(cpu, size, r, 0);
@@ -2161,7 +2351,7 @@ static u8* keep_original(VkOwnRes* held, u64 off, u64 size) {
     }
     vk_render_end();
     VkCommandBuffer cb = vk_cmd();
-    vk_all_barrier(cb);
+    vk_all_barrier_by(VK_BAR_SURFACE, cb);
     VkBufferCopy c = {off, 0, size};
     rec_CmdCopyBuffer(cb, held->buf, buf, 1, &c);
     flush_wait(cb);
@@ -2188,6 +2378,7 @@ int vk_surf_keep_end(Surf* s, const VkImageKeep* k, u8** original) {
 
 u64 g_vk_rt_readbacks; /* render targets written back to guest memory because the GPU's copy couldn't take them */
 u64 g_vk_rt_dropped;   /* render targets dropped instead of written back: the guest wrote over all of their bytes */
+u64 g_vk_rt_remapped;  /* render targets that went as the GPU mapping under them changed (vk_rt_remap_end) */
 /* a publish made for another one's sake (rt_overlay, rt_publish_newer) is under way: one met inside it is written back */
 static int g_rt_nested;
 /* vk_rt_overlay's work for every pending target over the range (of NULL), or for a publish of the target of: the
@@ -2360,15 +2551,18 @@ static void zt_restore(Surf* s);
 /* Another format over the same bytes: one game draws its scene to an sRGB target and the overlay over it to a UNORM
    one at the same address, and presents that. The target taking the address starts from the pixels of the one it
    parks (fresh: newer than memory) when they are newer than its own and both images hold the guest's bytes as they
-   are, in the same shape. Memory, which neither target's draws wrote, doesn't have them. 1 when it took them */
+   are, in the same shape (rt_takes). 1 when it took them: those pixels are in it then, not in memory, and need no
+   publish (rt_park_publish) */
+static int rt_takes(const Surf* to, const Surf* from, int fresh) {
+    return from && from != to && fresh && from->layout != VK_IMAGE_LAYOUT_UNDEFINED && from->wseq > to->wseq &&
+           !from->f.depth && !to->f.depth && from->f.raw && to->f.raw && from->f.bpp == to->f.bpp && from->w == to->w &&
+           from->h == to->h && from->sw == to->sw && from->sh == to->sh && from->bl == to->bl && from->bh == to->bh &&
+           from->bd == to->bd && from->pitch == to->pitch && from->layers == to->layers &&
+           (from->layers == 1 || from->layer_size == to->layer_size) && !from->volume && !to->volume &&
+           from->msaa == to->msaa;
+}
 static int rt_take_pixels(Surf* to, Surf* from, int fresh) {
-    if (!from || from == to || !fresh || from->layout == VK_IMAGE_LAYOUT_UNDEFINED || from->wseq <= to->wseq ||
-        from->f.depth || to->f.depth || !from->f.raw || !to->f.raw || from->f.bpp != to->f.bpp || from->w != to->w ||
-        from->h != to->h || from->sw != to->sw || from->sh != to->sh || from->bl != to->bl || from->bh != to->bh ||
-        from->bd != to->bd || from->pitch != to->pitch || from->layers != to->layers ||
-        (from->layers != 1 && from->layer_size != to->layer_size) || from->volume || to->volume ||
-        from->msaa != to->msaa)
-        return 0;
+    if (!rt_takes(to, from, fresh)) return 0;
     const int open = vk_render_begun();
     vk_render_end();
     VkCommandBuffer cb = vk_cmd();
@@ -2395,12 +2589,60 @@ static int rt_take_pixels(Surf* to, Surf* from, int fresh) {
     to->draw_hash = from->draw_hash;
     return 1;
 }
+/* The target named again by a path that may know less of its layer's stride than the one that drew it (a 2D copy knows
+   none): the greater stays, which is the game's */
+static void rt_stride_keep(Surf* s, u64 layer_size) {
+    if (s->layer_size < layer_size) s->layer_size = layer_size;
+}
+/* Newer guest memory at this address takes precedence, as it does where a texture takes a target's draw
+   (vk_rt_drawn_fresh, tex_take_drawn): where the CPU wrote the target's memory since it was drawn, the target is loaded
+   again from it. What the draw left is in that memory before the write lands: a live target is watched and published at
+   the CPU's first access (vk_rt_watch_hit), and a parked one was published as it was parked (rt_park_publish). A depth
+   target holds nothing a load takes, and one never drawn has no baseline to tell by */
+static void rt_stride_written(Surf* s) {
+    if (!s->f.depth && s->draw_wseen && s->layout != VK_IMAGE_LAYOUT_UNDEFINED && !vk_rt_drawn_fresh(s))
+        vk_rt_reload(s->gva);
+}
+/* A target parked at gva of the shape of want, or NULL: first the one of want's layer size, else, for a single layer, the
+   same target whose layer only its padding differs in (*padding is 1 then). The copy that names a target knows its
+   pixels but not the stride the game laid its layer out in, so it asks for the least one: without the second it makes a
+   second target at the address, where its pixels arrive that no draw and no texture looks at, and the draw's target stays
+   parked with the pixels it had (a minimap's terrain, every frame). Of those parked, the one with the greatest stride, so
+   that naming it with a smaller one never lowers what the game laid out */
+static Surf* rt_find_parked(u64 gva, const Surf* want, u32 fkey, int* padding) {
+    Surf* found = NULL;
+    *padding = 0;
+    for (int by_padding = 0; by_padding < 2 && !found; by_padding++) {
+        if (by_padding && (want->layers != 1 || want->volume)) break;
+        for (Surf* s = vk_surf_first(gva); s; s = vk_surf_next(s)) {
+            if (s->gva != (gva | 1ull << 63) || !s->is_rt || s->w != want->w || s->h != want->h || s->fkey != fkey ||
+                s->bl != want->bl || s->bh != want->bh || s->pitch != want->pitch || s->layers != want->layers ||
+                s->bd != want->bd || s->volume != want->volume || s->msaa != want->msaa)
+                continue;
+            if (by_padding ? found && s->layer_size <= found->layer_size : s->layer_size != want->layer_size || found)
+                continue;
+            found = s;
+            *padding = by_padding;
+        }
+    }
+    return found;
+}
+static void rt_publish_now(Surf* s, int why);
+/* A target that takes its address from another parks it, which drops its pages from the watch (rt_pages): a CPU write
+   there is no access vk_rt_watch_hit sees, and lands over bytes the draw never wrote back, so the target is published
+   first, whatever of its pixels memory lacks */
+static void rt_park_publish(u64 gva) {
+    Surf* live = vk_rt_find(gva);
+    if (live && flush_bytes(live) && !rt_superseded(live)) rt_publish_now(live, VK_PUB_OTHER);
+}
 static Surf* rt_create_(u64 gva, u32 w, u32 h, u32 fmt, u32 tile, int depth, u32 pitch, u32 layers, u64 layer_size,
                         int volume, u32 msaa);
 /* a render target's lookup or creation as a profiler zone (SNX_TRACY builds) */
 static Surf* rt_create(u64 gva, u32 w, u32 h, u32 fmt, u32 tile, int depth, u32 pitch, u32 layers, u64 layer_size,
                        int volume, u32 msaa) {
-    SNX_ZONE(z, "render target");
+    SNX_ZONE_TV(z, "vk: render target", (u64)layer_size * layers,
+                 "@%llx %ux%u fmt %#x tile %u depth %u pitch %u layers %u msaa %u", (unsigned long long)gva, w, h,
+                 fmt, tile, depth, pitch, layers, msaa);
     Surf* s = rt_create_(gva, w, h, fmt, tile, depth, pitch, layers, layer_size, volume, msaa);
     SNX_ZONE_END(z);
     return s;
@@ -2437,32 +2679,39 @@ static Surf* rt_create_(u64 gva, u32 w, u32 h, u32 fmt, u32 tile, int depth, u32
         for (Surf* s = vk_surf_first(gva); s; s = vk_surf_next(s))
             if (s->gva == gva && s->is_rt && s->w == w && s->h == h && s->fkey == fkey && s->bl == bl && s->bh == bh &&
                 s->pitch == pitch && s->layers == 1 && s->bd == bd && !s->volume && s->msaa == msaa) {
-                if (s->layer_size < layer_size) s->layer_size = layer_size;
+                rt_stride_keep(s, layer_size);
                 vk_rt_note_read(s);
+                rt_stride_written(s);
                 return s;
             }
-    /* another size, format or layout at this address: park the current one, reuse a parked one that fits */
-    Surf* parked = NULL;
-    /* the one parked here, whose freshness is asked while it holds the address (not when only the size changes, as
-       dynamic resolution does every frame in some games) */
+    /* another size, format or layout at this address: park the current one, reuse a parked one that fits. Its freshness
+       is asked while it holds the address (not when only the size changes, as dynamic resolution does every frame in
+       some games) */
     Surf* cur = depth ? NULL : vk_rt_find(gva);
     int cur_fresh = cur && cur->w == w && cur->h == h && cur->layers == layers && !volume && vk_rt_drawn_fresh(cur);
-    for (Surf* s = vk_surf_first(gva); s; s = vk_surf_next(s))
-        if (s->gva == (gva | 1ull << 63) && s->is_rt && s->w == w && s->h == h && s->fkey == fkey && s->bl == bl &&
-            s->bh == bh && s->pitch == pitch && s->layers == layers && s->layer_size == layer_size && s->bd == bd &&
-            s->volume == volume && s->msaa == msaa && !parked)
-            parked = s;
-    /* The same target parked here, whose single layer only its padding differed in. The copy that names a target
-       knows its pixels but not the stride the game laid its layer out in, so it asks for the least one: without this
-       it makes a second target at the address, where its pixels arrive that no draw and no texture looks at, and the
-       draw's target stays parked with the pixels it had (a minimap's terrain, every frame). Of those parked, the one
-       with the greatest stride, so that naming it with a smaller one never lowers what the game laid out */
-    if (!parked && layers == 1 && !volume)
-        for (Surf* s = vk_surf_first(gva); s; s = vk_surf_next(s))
-            if (s->gva == (gva | 1ull << 63) && s->is_rt && s->w == w && s->h == h && s->fkey == fkey && s->bl == bl &&
-                s->bh == bh && s->pitch == pitch && s->layers == 1 && s->bd == bd && !s->volume && s->msaa == msaa &&
-                (!parked || s->layer_size > parked->layer_size))
-                parked = s;
+    const Surf want = {.f = layout_fmt,
+                       .w = w,
+                       .h = h,
+                       .sw = vk_sc(w),
+                       .sh = vk_sc(h),
+                       .bl = bl,
+                       .bh = bh,
+                       .bd = bd,
+                       .pitch = pitch,
+                       .layers = layers,
+                       .layer_size = layer_size,
+                       .volume = volume,
+                       .msaa = msaa};
+    int padding; /* the parked one was found by its padding alone */
+    Surf* parked = rt_find_parked(gva, &want, fkey, &padding);
+    if (!rt_takes(parked ? parked : &want, cur, cur_fresh)) {
+        /* cur's own pixels, which no target takes, go to memory as it is parked. After its freshness is asked, as the
+           publish's write to memory is newer than its draw to vk_rt_drawn_fresh, and before the parked targets are
+           looked up for good, as it can let some go */
+        rt_park_publish(gva);
+        if (cur && vk_rt_find(gva) != cur) cur = NULL, cur_fresh = 0;
+        parked = rt_find_parked(gva, &want, fkey, &padding);
+    }
     for (Surf* s = vk_surf_first(gva); s; s = vk_surf_next(s))
         if (s->gva == gva && s->is_rt) {
             rt_pages(s, -1);
@@ -2481,8 +2730,8 @@ static Surf* rt_create_(u64 gva, u32 w, u32 h, u32 fmt, u32 tile, int depth, u32
         rt_pages(parked, 1);
         vk_rt_note_read(parked);
         /* named with more padding than it was parked with: it keeps the greater, as the one holding the address does */
-        if (parked->layer_size < layer_size) parked->layer_size = layer_size;
-        rt_take_pixels(parked, cur, cur_fresh);
+        rt_stride_keep(parked, layer_size);
+        if (!rt_take_pixels(parked, cur, cur_fresh) && padding) rt_stride_written(parked);
         return parked;
     }
     VkFmt f = depth ? vk_zt_format(fmt) : vk_rt_format(fmt);
@@ -2639,10 +2888,11 @@ static u64 mem_hash(u64 gva, u64 size) {
 static u64 rt_mem_hash(const Surf* s) { return mem_hash(s->gva, rt_bytes(s)); }
 /* Pitch-linear color targets drawn since the last release. A target's pixels reach guest memory only when something
    asks for them, and the CPU can't ask. Reading back on the CPU what the GPU drew is what pitch-linear targets are
-   mostly for, and they are few: one game draws its ambient light's spherical harmonics into seven 8x8 RGBA32F targets
-   and reads them after a fence, and lit its scenes with the old bytes there, values up to 1e31. A release publishes
-   them, GPU-owned (vk_surf_publish): the GPU copies them over their guest bytes, and they land only if the CPU
-   touches those.
+   mostly for: one game draws its ambient light's spherical harmonics into seven 8x8 RGBA32F targets and reads them
+   after a fence, and lit its scenes with the old bytes there, values up to 1e31. A release watches them as it watches
+   block linear ones (below): the CPU's first read publishes them, and one the CPU read lately is published at the
+   release, GPU-owned (vk_surf_publish), so that its reads after find the pixels with no fault; one it never reads is
+   copied back never. Without traps a release publishes them, as no watch can be had.
 
    Block linear color targets drawn since the last release are the second list. Most are never read on the CPU, and
    to publish each one at each release would copy tens of megabytes a frame. But a game also reads one now and then:
@@ -2689,8 +2939,8 @@ static void linear_drop(Surf* s) {
     drawn_pull(&g_linear, s, &s->in_linear);
     drawn_pull(&g_bl, s, &s->in_bl);
 }
-static void rt_publish_now(Surf* s) {
-    if (!vk_surf_publish(s)) vk_surf_flush(s, NULL);
+static void rt_publish_now(Surf* s, int why) {
+    if (!publish_why(s, why)) vk_surf_flush(s, NULL);
 }
 /* a block linear target s drawn since the last release, its pixels newer than memory: watched, or published */
 static void rt_watch(Surf* s) {
@@ -2710,7 +2960,7 @@ static void rt_watch(Surf* s) {
         if (g_vk_rt_watch.publishes++ < 4)
             LOG("vulkan: the %ux%u render target at %llx (%llu bytes) published at a release: the CPU read it lately\n",
                 s->w, s->h, (unsigned long long)s->gva, (unsigned long long)size);
-        rt_publish_now(s);
+        rt_publish_now(s, VK_PUB_CPU_LATELY);
         return;
     }
     for (u64 off = 0; off < size;) {
@@ -2723,9 +2973,16 @@ static void rt_watch(Surf* s) {
                one own_watch arms nothing. Asked of watches alone, a run under an owner was armed again at each
                release: one game's 864x480 depth target, drawn between its occlusion reports, 1,700 times a present, about
                10 ms of each (31 fps with this, 25 without) */
-            /* memory an import holds (unified memory): the publish copies in place, with no trap */
-            if (vk_own_watch(cpu, n) && vk_uma_held(cpu, n)) {
-                rt_publish_now(s);
+            /* memory an import of guest memory where it is holds (unified memory): the publish copies in place, with
+               no trap. Over dma-buf regions the watch traps the CPU's mapping alone (vk_own_watch), and the CPU's
+               access publishes it in place (own_publish); one that can't be had is published now there too */
+            if (vk_own_watch(cpu, n) && (vk_uma_held(cpu, n) || vk_uma_region_held(cpu, n))) {
+                static u32 said;
+                if (said++ < 8)
+                    LOG("vulkan: the %ux%u render target at %llx (%u layers, format %d, %llu bytes) published at a "
+                        "release: an import holds its memory\n",
+                        s->w, s->h, (unsigned long long)s->gva, s->layers, (int)s->f.vk, (unsigned long long)size);
+                rt_publish_now(s, VK_PUB_IMPORT);
                 return;
             }
             armed = 1;
@@ -2739,7 +2996,12 @@ void vk_rt_publish_drawn(void) {
     while (g_linear.n) {
         Surf* s = g_linear.s[--g_linear.n];
         s->in_linear = 0;
-        if (!(s->gva >> 63) && flush_bytes(s)) rt_publish_now(s);
+        if (!(s->gva >> 63) && flush_bytes(s)) {
+            if (own_traps())
+                rt_watch(s);
+            else
+                rt_publish_now(s, VK_PUB_NO_TRAPS);
+        }
     }
     while (g_bl.n) {
         Surf* s = g_bl.s[--g_bl.n];
@@ -2747,7 +3009,9 @@ void vk_rt_publish_drawn(void) {
         if (!(s->gva >> 63) && flush_bytes(s)) rt_watch(s); /* pending: drawn since memory last had it */
     }
 }
-void vk_rt_watch_hit(u64 cpu, u64 size) {
+/* the targets pending over guest memory [cpu, cpu + size) published: for a CPU access (vk_rt_watch_hit) when asked,
+   else for a move of the pages under them (vk_rt_publish_over) */
+static void rt_publish_pending(u64 cpu, u64 size, int asked) {
     Surf* local[16];
     RtPendingList pending = {local, 0, 16};
     vk_lock();
@@ -2756,16 +3020,22 @@ void vk_rt_watch_hit(u64 cpu, u64 size) {
        written back, and its watch goes as the write-back's own_acquire finds it */
     for (u32 i = 0; i < pending.count; i++) {
         Surf* s = pending.surfaces[i];
+        if (!asked) {
+            rt_publish_now(s, VK_PUB_OTHER);
+            continue;
+        }
         if (g_vk_rt_watch.hits++ < 4)
             LOG("vulkan: the CPU touched guest memory %llx, a page of the %ux%u render target at %llx (%llu bytes), "
                 "watched: published\n",
                 (unsigned long long)cpu, s->w, s->h, (unsigned long long)s->gva, (unsigned long long)rt_bytes(s));
         s->cpu_asked = g_vk_present + 1;
-        rt_publish_now(s);
+        rt_publish_now(s, VK_PUB_CPU_ACCESS);
     }
     if (pending.surfaces != local) free(pending.surfaces);
     vk_unlock();
 }
+void vk_rt_watch_hit(u64 cpu, u64 size) { rt_publish_pending(cpu, size, 1); }
+void vk_rt_publish_over(u64 cpu, u64 size) { rt_publish_pending(cpu, size, 0); }
 void vk_rt_watch_owed(void) {
     u64 cpu, size;
     /* watched again, as a release watches them: no copy and no GPU work, and the CPU's next access publishes them.
@@ -2782,23 +3052,55 @@ void vk_rt_watch_owed(void) {
     }
 }
 static u64 g_drawn_max; /* the biggest span a listed target has: how far before an address one over it can start */
+/* Whether every byte from lo to lo + span was drawn over by targets other than self, each over its own span, drawn
+   after the write count since (wseq). The drawn list is in order of address, so the targets over the span are a sweep
+   from its start */
+static int span_drawn_over(const Surf* self, u64 lo, u64 span, u64 since) {
+    u64 hi = lo + span, reach = lo;
+    for (int i = drawn_lower(lo > g_drawn_max ? lo - g_drawn_max : 0); i < g_ndrawn && g_drawn[i]->drawn_from <= reach;
+         i++) {
+        const Surf* o = g_drawn[i];
+        if (o == self || o->draw_wseq <= since || o->drawn_from + o->rt_size <= reach) continue;
+        reach = o->drawn_from + o->rt_size;
+        if (reach >= hi) return 1;
+    }
+    return 0;
+}
 /* Whether every byte of s's span was drawn over after s last changed, by targets drawn later, each over its own span:
    memory holds their pixels now (or would on the console), so s's are no one's to read and it goes without loss. A
    game rendering at a dynamic resolution makes its scene's targets again at another size each frame over the same
    memory, and each old one held a draw memory never got: kept as precious, a few thousand took the budget from the
    targets that are (one game's ink maps, drawn once at a level's start, went under that pressure with the budget
-   lowered, and its walls took no ink). The drawn list is in order of address, so the targets over s are a sweep from its start */
+   lowered, and its walls took no ink) */
 static int rt_superseded(const Surf* s) {
-    u64 lo = s->gva & ~(1ull << 63), hi = lo + s->rt_size, reach = lo;
     if (!s->is_rt || !s->rt_size) return 0;
-    for (int i = drawn_lower(lo > g_drawn_max ? lo - g_drawn_max : 0); i < g_ndrawn && g_drawn[i]->drawn_from <= reach;
-         i++) {
-        const Surf* o = g_drawn[i];
-        if (o == s || o->draw_wseq <= s->wseq || o->drawn_from + o->rt_size <= reach) continue;
-        reach = o->drawn_from + o->rt_size;
-        if (reach >= hi) return 1;
-    }
-    return 0;
+    return span_drawn_over(s, s->gva & ~(1ull << 63), s->rt_size, s->wseq);
+}
+/* The same for a texture that holds pixels it took from targets (tex_take_drawn), which memory may lack: every byte
+   of its guest memory drawn over by targets drawn after its last take (vk_tex_took). It holds no one's pixels then,
+   and one made there again takes the newer targets' (rt_superseded's reasoning). A game whose frame places its
+   transient targets in one pool, each frame at offsets that move with its dynamic resolution, samples its two-layer
+   2048x2048 shadow map through a texture header at the new offset each frame: each was a copy of 32 MB that only the
+   budget's lossy steps freed, as nothing else could tell its pixels were no one's. The textures over that pool held
+   7.2 GB of images over 602 MB of guest memory, 2.2 GB of them such copies, and a 14.6 GB budget ran out in seconds */
+static int tex_superseded(const Surf* s) {
+    return !s->is_rt && s->took_drawn && s->size && span_drawn_over(s, s->gva, s->size, s->took_wseq);
+}
+void vk_tex_took(Surf* t) { t->took_wseq = g_wseq; }
+void vk_rt_kinds(VkRtKinds* k) {
+    *k = (VkRtKinds){0};
+    for (int lru = VK_LRU_RT; lru <= VK_LRU_RT + LRU_AGED; lru += LRU_AGED)
+        for (u32 r = g_rows.lists[lru].head; r; r = g_rows.lru[r].next) {
+            const Surf* s = g_rows.surf[r];
+            const int kind = s->layout != VK_IMAGE_LAYOUT_UNDEFINED && rt_superseded(s) ? 0 : lossless(s) ? 1 : 2;
+            k->n[kind]++;
+            k->bytes[kind] += s->bytes;
+            k->parked[kind] += (s->gva >> 63) != 0;
+            for (const Surf* c = s->crop; c; c = c->next) {
+                k->copies++;
+                k->copy_bytes += c->bytes;
+            }
+        }
 }
 /* The runs of s's span's size bytes that no target drawn after s last changed is over, as [from, to) offsets into the
    span in address order: the bytes whose newest pixels are s's. The rest are a later target's, as all of a target
@@ -2826,6 +3128,8 @@ static u32 rt_own_runs(const Surf* s, u64 size, u64 run[][2], u32 max) {
     return n;
 }
 void vk_rt_drawn(Surf* s) {
+    /* item 7b's events: what a texture over the target's memory should show changed */
+    if (g_settings.texture_events_shadow && !(s->gva >> 63)) addr_gens_bump(ADDR_GENS_WRITE, s->gva, rt_bytes(s));
     take_changed(s);
     linear_note(s);
     s->draw_wseq = s->wseq;
@@ -2911,6 +3215,7 @@ int vk_rt_drawn_in(u64 lo, u64 hi, Surf** out, int max) {
    image being made for it too */
 static void surf_free(Surf* s) {
     const u32 r = s->row;
+    written_drop(s);
     vk_tex_later_forget(s);
     surf_changed(s->gva);
     vk_astc_forget(s, ~0u); /* the background encodes of its levels stop writing into it */
@@ -2940,6 +3245,7 @@ static void surf_free(Surf* s) {
     for (int i = 0; i < s->nsv; i++) vk_defer_image(VK_NULL_HANDLE, 0, s->sv[i].v, VK_NULL_HANDLE);
     if (s->present) vk_defer_image(VK_NULL_HANDLE, 0, s->present, VK_NULL_HANDLE);
     vk_defer_image(s->img, s->mem, s->att, s->att_linear);
+    SNX_MEM_FREE_D(s, s->is_rt ? "render targets" : "texture objects");
     free(s);
 }
 /* a target holding a draw that memory doesn't have: it stays while its address is its own and memory wasn't written
@@ -2950,12 +3256,13 @@ static int keeps_drawn(Surf* s) {
     return s->f.depth ? s->layout != VK_IMAGE_LAYOUT_UNDEFINED : vk_rt_drawn_fresh(s);
 }
 /* a surface whose pixels can be had again once it goes. A texture: loaded from memory, unless it took pixels from
-   render targets since. A render target: without defined contents, or with memory holding what it holds (written back
+   render targets since, or all of whose memory later targets drew over (tex_superseded). A render target: without
+   defined contents, or with memory holding what it holds (written back
    or loaded since its last draw, in a format that moves between the two; rt_create loads it again), or with every
    byte drawn over by later targets (rt_superseded). A parked one too only then: taken out of parking it gives back
    its own pixels, which memory, written by neither target's draws, doesn't have */
 static int lossless(const Surf* s) {
-    if (!s->is_rt) return !s->took_drawn;
+    if (!s->is_rt) return !s->took_drawn || tex_superseded(s);
     if (s->layout == VK_IMAGE_LAYOUT_UNDEFINED) return 1;
     return (!s->f.depth && s->f.raw && s->mem_wgen == s->wgen && moves_scaled(s)) || rt_superseded(s);
 }
@@ -2965,9 +3272,26 @@ static int lossless(const Surf* s) {
    reclaim, and an idle one goes as any texture does when nothing is asked for (want ~0, vk_tex_frame) */
 static u64 surf_evict(Surf* s);
 static u64 tex_give_way(Surf* s, u64 want) {
-    if (s->demoted) return want == ~0ull ? surf_evict(s) : 0;
+    if (s->demoted) {
+        if (want == ~0ull) {
+            SNX_ZONE_T(z, "vk mem texture reclaim", "%lluKB, epoch %u: idle in system memory, evict",
+                       (unsigned long long)(s->bytes >> 10), vk_ww_epoch());
+            SNX_ZONE_COLOR(z, 0xF39C12); /* evicted, but no loss: it was already in system memory */
+            return surf_evict(s);
+        }
+        return 0; /* frees no device memory */
+    }
     const u64 moved = want != ~0ull ? vk_tex_demote(s) : 0;
-    return moved ? moved : surf_evict(s);
+    if (moved) {
+        SNX_ZONE_T(z, "vk mem texture reclaim", "%lluKB, epoch %u: moved to system memory",
+                   (unsigned long long)(moved >> 10), vk_ww_epoch());
+        SNX_ZONE_COLOR(z, 0x27AE60); /* no eviction: device memory came back, the pixels stay */
+        return moved;
+    }
+    SNX_ZONE_T(z, "vk mem texture reclaim", "%lluKB, epoch %u: no system memory, evict pixels",
+               (unsigned long long)(s->bytes >> 10), vk_ww_epoch());
+    SNX_ZONE_COLOR(z, 0xE74C3C); /* lossy eviction: the pixels have to be loaded again */
+    return surf_evict(s);
 }
 /* the CPU's writes to runs of guest memory since a write-tracking clock: written 1 at the first (or where the run's
    writes can't be told) */
@@ -3008,6 +3332,9 @@ static void rt_aside_check(Surf* s) {
         written = rt_mem_hash(s) != s->aside_hash;
     if (!written) return;
     g_rt_sys.reloads++;
+    SNX_ZONE_T(z, "vk mem target reload", "%ux%u %lluKB, epoch %u: %s", s->w, s->h,
+               (unsigned long long)(rt_bytes(s) >> 10), vk_ww_epoch(),
+               s->aside_wseen ? "guest writes tracked, pixels are stale" : "guest hash changed, pixels are stale");
     vk_rt_reload(s->gva);
 }
 /* a render target where an eviction would take it: under the budget's pressure (lossy VK_RECLAIM_ANY), or unused for
@@ -3015,12 +3342,19 @@ static void rt_aside_check(Surf* s) {
    memory (rt_demote) and stays there, where it frees none of the GPU's memory. One that can't move stays for its age,
    and goes under the pressure with its pixels, said */
 static u64 rt_give_way(Surf* s, int lossy) {
-    if (lossless(s)) return surf_evict(s);
+    if (lossless(s)) {
+        SNX_ZONE_T(z, "vk mem target reclaim", "%ux%u %lluKB, epoch %u: memory has its pixels, evict", s->w, s->h,
+                   (unsigned long long)(s->bytes >> 10), vk_ww_epoch());
+        return surf_evict(s);
+    }
     if (s->demoted) return 0;
     const char* no = "";
     const u64 moved = rt_demote(s, &no);
     if (moved || lossy != VK_RECLAIM_ANY) {
         rt_aside(s);
+        SNX_ZONE_T(z, "vk mem target reclaim", "%ux%u %lluKB, epoch %u: %s", s->w, s->h,
+                   (unsigned long long)(s->bytes >> 10), vk_ww_epoch(),
+                   moved ? "moved to system memory, set aside" : "idle, set aside");
         return moved;
     }
     g_rt_sys.lost++;
@@ -3030,6 +3364,8 @@ static u64 rt_give_way(Surf* s, int lossy) {
         "vulkan: the %ux%u render target at %llx (format %x, %llu KB) goes under the budget's pressure with pixels "
         "memory lacks, as it can't move into system memory: %s\n",
         s->w, s->h, (unsigned long long)(s->gva & ~(1ull << 63)), s->fkey, (unsigned long long)(s->bytes >> 10), no);
+    SNX_ZONE_T(z, "vk mem target reclaim", "%ux%u %lluKB, epoch %u: under budget pressure, pixels only here", s->w,
+               s->h, (unsigned long long)(s->bytes >> 10), vk_ww_epoch());
     return surf_evict(s);
 }
 static u64 surf_evict(Surf* s) {
@@ -3133,6 +3469,22 @@ u64 vk_rt_reclaim_superseded(u32 before, u64 want) {
     vk_resource_end(VK_RESOURCE_SURFACE_RECLAIM, scope);
     return freed;
 }
+/* the textures last used before `before` whose memory later targets drew all over since they took pixels from
+   targets (tex_superseded), from either list: the aged one holds those that took pixels, which draws since may have
+   made lossless */
+u64 vk_tex_reclaim_superseded(u32 before, u64 want) {
+    VkResourceScope scope = vk_resource_begin();
+    u64 freed = 0;
+    for (int lru = VK_LRU_TEX + LRU_AGED; lru >= VK_LRU_TEX && freed < want; lru -= LRU_AGED)
+        for (u32 r = g_rows.lists[lru].head, n; r && freed < want; r = n) {
+            n = g_rows.lru[r].next;
+            Surf* s = g_rows.surf[r];
+            if ((i32)((u32)s->last_used - before) >= 0) break;
+            if (tex_superseded(s) && !vk_gfx_image_holds(s)) freed += surf_evict(s);
+        }
+    vk_resource_end(VK_RESOURCE_SURFACE_RECLAIM, scope);
+    return freed;
+}
 
 /* ------------------------------------------------------------ the budget */
 /* A trim that found the images short of memory, where ASTC textures are held as RGBA8 by astc_mode=1 (Exact; Auto makes
@@ -3183,6 +3535,71 @@ static struct {
     u32 n;
     int all;
 } g_remapped;
+/* The live render targets a GMMU change covers, each with the guest addresses the first and the last page of what it
+   covers showed before the change (vk_rt_remap_begin), so the change's end (vk_rt_remap_end) knows which show other
+   memory now. A target is keyed by its GPU address, and one whose pages show other memory after the change describes
+   memory that is gone: one game unmapped its 1280x720 scene targets (R11G11B10F, R16G16) after a menu, its movie
+   player took their memory for its VIC output surfaces and the game mapped those at the old targets' GPU addresses.
+   The targets stayed, so each movie frame VIC wrote there reached the scene through them as floats: purple and blue
+   frames with colour bands, flashing on the title screen */
+typedef struct {
+    Surf* s;
+    u64 lo, hi;     /* the first and last byte of the change the target covers, GPU addresses */
+    u64 was_lo, was_hi; /* their guest addresses before it, 0 unmapped */
+} RtRemap;
+static struct {
+    RtRemap* at;
+    u32 n, cap;
+} g_rt_remap;
+static void rt_remap_note(Surf* s, u64 gva, u64 size) {
+    const u64 end = gva + size, s_end = s->gva + rt_bytes(s);
+    if ((s->gva >> 63) || s->gva >= end || s_end <= gva) return;
+    if (g_rt_remap.n == g_rt_remap.cap) {
+        u32 cap = g_rt_remap.cap ? g_rt_remap.cap * 2 : 16;
+        RtRemap* n = (RtRemap*)realloc(g_rt_remap.at, (size_t)cap * sizeof *n);
+        if (!n) fatal("Out of memory listing the render targets a GPU mapping change covers");
+        g_rt_remap.at = n;
+        g_rt_remap.cap = cap;
+    }
+    RtRemap* r = &g_rt_remap.at[g_rt_remap.n++];
+    r->s = s;
+    r->lo = s->gva > gva ? s->gva : gva;
+    r->hi = (s_end < end ? s_end : end) - 1;
+    r->was_lo = gmmu_translate(r->lo);
+    r->was_hi = gmmu_translate(r->hi);
+}
+void vk_rt_remap_begin(u64 gva, u64 size) {
+    g_rt_remap.n = 0;
+    if (!size) return;
+    if (!g_rts_failed) {
+        for (u32 i = rts_lower(gva > g_rts_span ? gva - g_rts_span : 0); i < g_nrts && g_rts[i]->gva < gva + size; i++)
+            rt_remap_note(g_rts[i], gva, size);
+        return;
+    }
+    for (int lru = VK_LRU_RT; lru <= VK_LRU_RT + LRU_AGED; lru += LRU_AGED)
+        for (u32 r = g_rows.lists[lru].head; r; r = g_rows.lru[r].next) rt_remap_note(g_rows.surf[r], gva, size);
+}
+/* The targets whose pages show other memory now go, as memory has all of their pixels: the change's beginning sent
+   each one pending to its old memory (vk_rt_before_write), and the others held nothing memory lacked. A target held
+   by a storage image's result still to land stays. A change that showed the same memory again leaves its targets */
+void vk_rt_remap_end(void) {
+    u32 went = 0;
+    for (u32 i = 0; i < g_rt_remap.n; i++) {
+        const RtRemap* r = &g_rt_remap.at[i];
+        if (gmmu_translate(r->lo) == r->was_lo && gmmu_translate(r->hi) == r->was_hi) continue;
+        if (vk_gfx_image_holds(r->s)) continue;
+        if (!went) vk_render_end(); /* the open pass may draw to one of them */
+        LOG_LIMIT(8,
+                  "vulkan: the %ux%u render target at %llx (format %x) went: the GPU mapping under it changed, from "
+                  "guest memory %llx to %llx\n",
+                  r->s->w, r->s->h, (unsigned long long)r->s->gva, r->s->fkey, (unsigned long long)r->was_lo,
+                  (unsigned long long)gmmu_translate(r->lo));
+        surf_evict(r->s);
+        went++;
+    }
+    g_rt_remap.n = 0;
+    g_vk_rt_remapped += went;
+}
 void vk_surf_mapping_changed(u64 gva, u64 size) {
     if (gpu_textures_added()) return; /* the front end tells of each texture's end */
     if (g_remapped.n == sizeof g_remapped.gva / sizeof *g_remapped.gva)
@@ -3272,6 +3689,7 @@ static u64 trim_head(u64 budget) {
     return head > budget / 4 ? budget / 4 : head;
 }
 static u32 g_forced;    /* the present a failed allocation last forced a trim (+1) */
+static u32 g_heap_swept; /* the present the heap's own use last freed the superseded targets (+1) */
 static u32 g_oom;       /* the present an image allocation last found no memory (+1) */
 static u64 g_oom_bytes; /* the smallest size that found none in that present */
 static u32 g_oom_target; /* the same of render targets */
@@ -3460,8 +3878,23 @@ void vk_mem_trim(u64 extra, int force) {
                     release, which goes back to a block no request takes while it is emptied */
         u64 gone = vk_deferred_bytes() - vk_deferred_moved();
         need = extra > gone ? extra - gone : 0;
-    } else if (usage <= vk_mem_trim_start(budget))
+    } else if (usage <= vk_mem_trim_start(budget)) {
+        /* The caches count the free space inside the blocks as room, but a request takes only a run of its own kind
+           and size, and the driver's heap can be at its budget while that space is in pieces no request takes. Then
+           the render targets later ones drew all over go after two presents, once a present, though the hold below
+           would keep them for a second: they are lossless. A game at a dynamic resolution that places its frame's
+           targets in one pool, at offsets that move each frame, made about 30 targets a frame at 30 frames a
+           second. A second of them held 5 to 8 GB of a 14.6 GB budget while the caches counted 3 GB of room in the
+           blocks, so no trim ran until an image found no memory, every second and a half: the forced trim then freed
+           5 to 8 GB of targets, too late for that image, and its draws went without it. The textures that took
+           targets' pixels where later targets drew all over go with them (tex_superseded) */
+        if (g_heap_swept != g_vk_present + 1 && vk_mem_heap_use() + extra > vk_mem_trim_start(budget)) {
+            g_heap_swept = g_vk_present + 1;
+            g_trimmed += vk_rt_reclaim_superseded(vk_present_before(0, 2), ~0ull);
+            g_trimmed += vk_tex_reclaim_superseded(vk_present_before(0, 2), ~0ull);
+        }
         return;
+    }
     SNX_ZONE_V(z, "vk mem trim", force);
     /* What goes first is what can be had again without loss: textures (loaded again from memory), own buffers (copied
        again), then render targets memory holds. Those unused for a second go down to two heads under the budget
@@ -3475,7 +3908,8 @@ void vk_mem_trim(u64 extra, int force) {
        the budget: those unused for five seconds, then, within half a head, those unused for a second and eight
        presents, the youngest a lossy entry can be. Every step frees the least recently used first. Before them all
        go the render targets later ones drew all over, unused for two presents (for a second and eight where the
-       driver moves memory, below): what they hold is no one's (rt_superseded), and the textures whose texture object
+       driver moves memory, below), and the textures that took their pixels from targets and whose memory later ones
+       drew all over: what they hold is no one's (rt_superseded, tex_superseded), and the textures whose texture object
        the game ended (ended_reclaim) */
     /* Where the driver moves memory by priority (g_vk.has_pageable), a trim for headroom leaves those targets as long
        as the sweep every 30 presents does, a second and eight presents: they have the highest priority, so where the
@@ -3488,12 +3922,14 @@ void vk_mem_trim(u64 extra, int force) {
     const u32 superseded_before = g_vk.has_pageable && !force ? vk_present_before(1000000000ull, 8)
                                                                : vk_present_before(0, 2);
     u64 superseded = vk_rt_reclaim_superseded(superseded_before, ~0ull);
+    const u64 tex_superseded_bytes = vk_tex_reclaim_superseded(superseded_before, ~0ull);
     static const struct {
         u32 ms, presents;
         int lossy;
         u32 mark; /* the halves of trim_head below the budget that the step frees down to */
     } steps[] = {{1000, 8, 0, 4}, {0, 8, 0, 1}, {5000, 30, 1, 2}, {1000, 8, 1, 1}};
-    u64 freed = superseded, by[3] = {0, 0, superseded}, working = 0, step_big = 0, step_back = 0;
+    u64 freed = superseded + tex_superseded_bytes, by[3] = {tex_superseded_bytes, 0, superseded}, working = 0,
+        step_big = 0, step_back = 0;
     int short_of = 0;
     /* first the textures the game has ended, down to the lowest mark: no later frame asks for them */
     ended_collect();
@@ -3595,6 +4031,7 @@ static struct {
     PMutex lock; /* why, between the thread that asks and the renderer's */
     char why[160], said[160];
     u64 by[3], blocks; /* what went (textures, buffers, render targets), and the blocks before */
+    u64 bc7;           /* the BC7 cache's blocks that went, the system's memory */
     u32 present;       /* when it ran (+1), 0 none to tell */
     u32 runs;
 } g_release = {.lock = PMUTEX_INIT};
@@ -3612,10 +4049,12 @@ void vk_mem_release_run(void) {
     if (g_release.present && g_vk_present - (g_release.present - 1) >= 4) {
         LOG_LIMIT(20,
                   "vulkan: %s: %llu MB of textures, %llu of buffers and %llu of render targets that the two presents "
-                  "before didn't use went, and the renderer's memory blocks went from %llu to %llu MB\n",
+                  "before didn't use went, and the renderer's memory blocks went from %llu to %llu MB; the BC7 cache "
+                  "let %llu MB of the system's memory go\n",
                   g_release.said, (unsigned long long)(g_release.by[0] >> 20),
                   (unsigned long long)(g_release.by[1] >> 20), (unsigned long long)(g_release.by[2] >> 20),
-                  (unsigned long long)(g_release.blocks >> 20), (unsigned long long)(vk_memory_blocks() >> 20));
+                  (unsigned long long)(g_release.blocks >> 20), (unsigned long long)(vk_memory_blocks() >> 20),
+                  (unsigned long long)(g_release.bc7 >> 20));
         g_release.present = 0;
     }
     if (!atomic_exchange_explicit(&g_release.asked, 0, memory_order_acq_rel)) return;
@@ -3623,13 +4062,16 @@ void vk_mem_release_run(void) {
     snprintf(g_release.said, sizeof g_release.said, "%s", g_release.why);
     pm_unlock(&g_release.lock);
     /* what can be had again without loss, as vk_mem_trim's lossless steps take it, whatever the budget: render
-       targets later ones drew over, then textures, own buffers and render targets unused for two presents */
+       targets and textures later targets drew over, then textures, own buffers and render targets unused for two
+       presents */
     u32 before = vk_present_before(0, 2);
     g_release.blocks = vk_memory_blocks();
     g_release.by[2] = vk_rt_reclaim_superseded(before, ~0ull);
-    g_release.by[0] = vk_surf_reclaim(VK_LRU_TEX, before, ~0ull, VK_RECLAIM_LOSSLESS);
+    g_release.by[0] = vk_tex_reclaim_superseded(before, ~0ull);
+    g_release.by[0] += vk_surf_reclaim(VK_LRU_TEX, before, ~0ull, VK_RECLAIM_LOSSLESS);
     g_release.by[1] = vk_buf_reclaim(before, ~0ull);
     g_release.by[2] += vk_surf_reclaim(VK_LRU_RT, before, ~0ull, VK_RECLAIM_LOSSLESS);
+    g_release.bc7 = vk_bc7_cache_release(before); /* the system's memory, not the renderer's: not in g_trimmed */
     g_trimmed += g_release.by[0] + g_release.by[1] + g_release.by[2];
     g_release.present = g_vk_present + 1;
     g_release.runs++;
@@ -3733,18 +4175,18 @@ static int blit_depth_gather(Surf* source, Surf* destination, i32 x0, i32 y0, i3
         rec_CmdCopyImageToBuffer(cb, source->img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), scratch, 1, &read);
         VkBufferCopy copy = {table_offset, table_at, table_size};
         rec_CmdCopyBuffer(cb, table_buffer, scratch, 1, &copy);
-        vk_all_barrier(cb);
+        vk_all_barrier_by(VK_BAR_SURFACE, cb);
         if (!vk_tc_blit(cb, bytes, 0, width * bytes, height, scratch, used, 0, input_pitch, table_at,
                         table_at + 4ull * width, scratch, output_at, output_pitch))
             return 0;
-        vk_all_barrier(cb);
+        vk_all_barrier_by(VK_BAR_SURFACE, cb);
         VkBufferImageCopy write = {.bufferOffset = output_at,
                                    .bufferRowLength = output_pitch / bytes,
                                    .imageSubresource = {bit, 0, 0, 1},
                                    .imageOffset = {dx, dy, 0},
                                    .imageExtent = {width, height, 1}};
         rec_CmdCopyBufferToImage(cb, scratch, destination->img, VK_LAYOUT(TRANSFER_DST_OPTIMAL), 1, &write);
-        vk_all_barrier(cb);
+        vk_all_barrier_by(VK_BAR_SURFACE, cb);
     }
     return 1;
 }

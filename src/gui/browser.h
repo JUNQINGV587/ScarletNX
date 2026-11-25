@@ -90,8 +90,9 @@ void gui_games_free(GuiGames* games);
 /* The bytes of the files under path, in its folders too, links not followed: 0 for no such folder, or "". It stops,
    with what it counted, once *stop is set by another thread */
 uint64_t gui_tree_size(const char* path, const _Atomic int* stop);
-/* An NRO, XCI or NSP (or a decrypted one) by its name: a dump the driver prepares, not a game ready to run. So is an
-   extracted game's folder (snx_extracted_game), which a library lists by its folder's name and a / after it */
+/* An NRO, XCI or NSP (decrypted or compressed by nsz too) by its name: a dump the driver prepares, not a game ready to
+   run. So is an extracted game's folder (snx_extracted_game), which a library lists by its folder's name and a / after
+   it */
 bool gui_is_dump(const char* name);
 /* A game's program in a folder of its own beside its data (<name>/<name>, .exe on Windows, and <name>/<name>_data/),
    or an update's or a DLC's beside it (<name>/<name>_<its title ID>), as the recompile lays games out: the driver
@@ -119,7 +120,8 @@ bool gui_game_source_missing(const char* path, const char* work, char* out, size
 char* gui_game_shown(const char* path);
 /* The icon the extraction kept for the game whose program is at path, a game of a folder of its own: its
    <name>_data/icon.jpg, or a Vita game's sce_sys/icon0.png (patch/ before app/), a PNG, or beside the program a 3DS
-   game's icon.rgba or a GBA game's box, icon.png; owned, else NULL (none there, or no such game) */
+   game's icon.rgba or a GBA game's box, icon.png; for an extracted game's folder (snx_extracted_game), the icon.jpg
+   beside its exefs/. Owned, else NULL (none there, or no such game) */
 char* gui_game_icon(const char* path);
 /* The updates and DLCs of the game at path, made beside it in its folder (<name>/<name>_<add-on's title ID>_data/, an
    update's program beside it), into addons (emptied first): names <name>_<its title ID>, shown what the player reads

@@ -385,6 +385,10 @@ static int check_vertex_input_layouts(void) {
     g_viw.ncap = 0;
     g_viw.capture = 1;
     u64 sets = g_viw.sets, redundant = g_viw.redundant, unset = g_viw.unset;
+    /* the pipelines counted by the handles bound: a link stays one (gpl_hold), where its optimized pipeline would take
+       its place among the draws of its layout whenever a worker made it */
+    const int hold = g_vk.gpl_hold;
+    g_vk.gpl_hold = 1;
     for (u32 i = 0; i < drawn; i++) {
         u64 target = targets + 0x1000 * i;
         r[0x487] = 1;
@@ -466,7 +470,7 @@ static int check_vertex_input_layouts(void) {
         if (p == npipes) pipes[npipes++] = g_viw.cap[c].pipe;
     }
     /* A layout is set before a draw exactly when its command buffer has another or none: a new command buffer (the
-       renderer submits one a millisecond of recording at most, and the last draw follows a finish), or another layout
+       renderer submits one each vk_submit_every draws at most, and the last draw follows a finish), or another layout
        before it, the clear's empty one among them. Draws 0 and 1 share theirs where no submit fell between them */
     for (u32 c = 1; g_vk.vertex_input_dynamic && c <= captured; c++) {
         int need = g_viw.cap[c].cb != g_viw.cap[c - 1].cb || want[c] != want[c - 1];
@@ -477,7 +481,11 @@ static int check_vertex_input_layouts(void) {
         CHECK(set == (u64)need);
         kept += !need;
     }
+    g_vk.gpl_hold = hold;
     CHECK(g_viw.cap[captured].cb != g_viw.cap[captured - 1].cb);
+    if (npipes != (g_vk.vertex_input_dynamic ? 1u : 3u))
+        fprintf(stderr, "vertex input layouts: %u pipelines bound for 3 layouts, expected %u\n", npipes,
+                g_vk.vertex_input_dynamic ? 1u : 3u);
     CHECK(npipes == (g_vk.vertex_input_dynamic ? 1u : 3u));
     CHECK(g_viw.redundant == redundant && g_viw.unset == unset);
     CHECK(g_vk.vertex_input_dynamic ? g_viw.sets > sets : g_viw.sets == sets);

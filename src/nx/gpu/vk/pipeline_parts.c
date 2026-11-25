@@ -2,6 +2,7 @@
    Copyright 2026 the ScarletNX contributors */
 /* Graphics pipeline libraries: the choice and the dynamic pre-rasterization state (pipeline_parts.h) */
 #include "nx/gpu/vk/pipeline_parts.h"
+#include "nx/runtime/platform/tracy.h"
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -74,6 +75,7 @@ int vk_gpl_choose(const VkGplDevice* d, u32* dyn_pr, char* line, size_t n) {
                                                       : NULL;
     *dyn_pr = 0;
     if (off) {
+        SNX_ZONE_T(z, "vk pipe libraries choice", "off: %s", off);
         snprintf(line, n, "vulkan: graphics pipeline libraries off (%s): each pipeline compiles its shaders whole", off);
         return 0;
     }
@@ -89,14 +91,19 @@ int vk_gpl_choose(const VkGplDevice* d, u32* dyn_pr, char* line, size_t n) {
         "patch control points", "depth range", "depth clip"};
     char dyn[192];
     size_t at = 0;
+    [[maybe_unused]] int nstates = 0;
     dyn[0] = 0;
     for (int i = 0; i < 7; i++)
-        if ((*dyn_pr >> i & 1) && at < sizeof dyn)
-            at += (size_t)snprintf(dyn + at, sizeof dyn - at, "%s%s", at ? ", " : "", names[i]);
+        if (*dyn_pr >> i & 1) {
+            ++nstates;
+            if (at < sizeof dyn)
+                at += (size_t)snprintf(dyn + at, sizeof dyn - at, "%s%s", at ? ", " : "", names[i]);
+        }
     snprintf(line, n,
              "vulkan: graphics pipeline libraries on: a new pipeline links the parts of its shaders, each compiled "
              "once, and is optimized in the background; dynamic pre-rasterization state: %s",
              at ? dyn : "none");
+    SNX_ZONE_T(z, "vk pipe libraries choice", "on, with %d dynamic states", nstates);
     return 1;
 }
 
@@ -171,7 +178,17 @@ void vk_pipe_part_src(u32 part, const void* key, PipeKey* out) {
 /* every dynamic state a draw pipeline can have, in the order pipe_create always listed them (a pipeline cache entry
    depends on it), with the part that holds it (the specification's "Graphics Pipeline Library" says which state each
    part holds) and when it is there */
-enum { DYN_ALWAYS, DYN_FEEDBACK, DYN_STRIDE, DYN_VERTEX_INPUT, DYN_PR, DYN_PR_TESS, DYN_CLAMP_RANGE, DYN_RATE_PALETTE };
+enum {
+    DYN_ALWAYS,
+    DYN_FEEDBACK,
+    DYN_STRIDE,
+    DYN_VERTEX_INPUT,
+    DYN_PR,
+    DYN_PR_TESS,
+    DYN_CLAMP_RANGE,
+    DYN_RATE_PALETTE,
+    DYN_BLEND
+};
 static const struct {
     VkDynamicState state;
     u32 part; /* VK_PART_* */
@@ -211,9 +228,31 @@ static const struct {
     {VK_DYNAMIC_STATE_DEPTH_CLIP_NEGATIVE_ONE_TO_ONE_EXT, VK_PART_PR, DYN_PR | VK_DYN_PR_DEPTH_RANGE << 8},
     {VK_DYNAMIC_STATE_DEPTH_CLAMP_RANGE_EXT, VK_PART_PR, DYN_CLAMP_RANGE},
     {VK_DYNAMIC_STATE_VIEWPORT_SHADING_RATE_PALETTE_NV, VK_PART_PR, DYN_RATE_PALETTE},
+    {VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_PART_FO, DYN_BLEND},
+    {VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT, VK_PART_FO, DYN_BLEND},
+    {VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT, VK_PART_FO, DYN_BLEND},
 };
 typedef char dyn_states_fit[sizeof g_dyn_states / sizeof *g_dyn_states <= VK_PIPE_DYN_MAX ? 1 : -1];
 
+void vk_pipe_unwritten_targets(PipeKey* k) {
+    for (u32 i = 0; i < k->ncolor && i < 8; i++) {
+        if (k->blend[i].mask || (!i && k->alpha_to_coverage) || k->coverage_to_color == i + 1) continue;
+        k->color[i] = 0;
+        k->blend[i].en = k->blend[i].sc = k->blend[i].dc = k->blend[i].cop = 0;
+        k->blend[i].sa = k->blend[i].da = k->blend[i].aop = 0;
+    }
+}
+int vk_pipe_blend_key(const PipeKey* k, PipeKey* out) {
+    if (!k->ncolor || k->advanced.operation) return 0;
+    *out = *k;
+    for (u32 i = 0; i < 8; i++) {
+        out->blend[i].en = out->blend[i].sc = out->blend[i].dc = out->blend[i].cop = 0;
+        out->blend[i].sa = out->blend[i].da = out->blend[i].aop = 0;
+        out->blend[i].mask = i < k->ncolor ? PIPE_BLEND_DYNAMIC : 0;
+    }
+    return 1;
+}
+int vk_pipe_blend_dynamic(const PipeKey* k) { return k->ncolor && (k->blend[0].mask & PIPE_BLEND_DYNAMIC); }
 u32 vk_pipe_dynamic(u32 parts, const PipeDynIn* in, VkDynamicState* out) {
     u32 n = 0;
     for (u32 i = 0; i < sizeof g_dyn_states / sizeof *g_dyn_states; i++) {
@@ -224,6 +263,7 @@ u32 vk_pipe_dynamic(u32 parts, const PipeDynIn* in, VkDynamicState* out) {
                  : when == DYN_VERTEX_INPUT ? in->vertex_input
                  : when == DYN_CLAMP_RANGE  ? in->clamp_range
                  : when == DYN_RATE_PALETTE ? in->rate_palette
+                 : when == DYN_BLEND        ? in->blend
                  : when == DYN_PR           ? (in->dyn_pr & bit) != 0
                                             : (in->dyn_pr & bit) && in->tess;
         if (in->mesh && g_dyn_states[i].part == VK_PART_VI) on = 0; /* a mesh pipeline has no vertex input state */
@@ -298,7 +338,8 @@ void vk_pipe_split(const PipeKey* k, VkShaderModule fs, const PipeSplitDevice* d
         fo->blend[i].sa = k->blend[i].sa;
         fo->blend[i].da = k->blend[i].da;
         fo->blend[i].aop = k->blend[i].aop;
-        fo->blend[i].mask = k->fs ? k->blend[i].mask : 0;
+        /* the dynamic blend's mark stays: the draw sets the masks then, 0 without a fragment program */
+        fo->blend[i].mask = k->fs ? k->blend[i].mask : k->blend[i].mask & PIPE_BLEND_DYNAMIC;
     }
     fo->logic_op = k->logic_op;
     fo->samples = k->samples;

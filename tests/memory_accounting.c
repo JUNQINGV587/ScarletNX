@@ -3,6 +3,7 @@
 /* Exercise the production memory SVCs and block list without game files. The POSIX backing is sparse, with
    injectable commit failures. Thread/handle/GPU services are stubs, not the code under test. */
 #include "nx/memory/own.h"
+#include "common/utilities/common.h"
 #include "nx/hle/kernel/kernel_int.h"
 #include "nx/hle/hle.h"
 #include "nx/runtime/clock.h"
@@ -169,6 +170,23 @@ void plat_vm_decommit(u8* p, u64 size) {
     /* as plat_posix.c: only Linux's MADV_DONTNEED drops the contents (Darwin's and FreeBSD's keep them) */
     if (mmap(p, size, PROT_NONE, MAP_FIXED | MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) == MAP_FAILED) abort();
 #endif
+}
+/* no guest files here (platform_posix tests them) */
+int plat_vm_files(u8* base, u64 size, const char* dir) {
+    (void)base, (void)size, (void)dir;
+    return -1;
+}
+/* the disk the guest files would take (mem_files_room): its free bytes, or the error that reading them gives */
+static SnxU64 disk_free;
+static int disk_error;
+int snx_disk_room(const char* path, SnxU64* free_bytes, SnxU64* total) {
+    (void)path;
+    if (disk_error) {
+        errno = disk_error;
+        return -1;
+    }
+    *free_bytes = *total = disk_free;
+    return 0;
 }
 /* no alias pool here: views are copies (memory_alias tests the pool) */
 int plat_alias_init(u64 size) {
@@ -365,10 +383,10 @@ static void test_large_heap(void) {
     CHECK(g_heap_size == 8500 * MIB && state(HEAP_BASE + 8499 * MIB) == MS_NORMAL);
     CHECK(svc_set_heap_size(0) == 0);
     CHECK(svc_set_heap_size(12ull << 30) == SNX_RC_SVC_INVALID_SIZE);
-    /* an Ounce game gets the same budget with memory_gb at its default */
+    /* an Ounce game gets the same heap region with memory_gb at its default, and the console's 9152 MiB pool */
     g_settings.memory_gb = 0;
     g_ounce = 1;
-    CHECK(mem_total() == 10ull << 30 && info(5) == 12ull << 30);
+    CHECK(mem_total() == 9152 * MIB && info(5) == 12ull << 30);
     CHECK(svc_set_heap_size(8500 * MIB) == 0);
     CHECK(svc_set_heap_size(0) == 0);
     g_ounce = 0;
@@ -488,8 +506,8 @@ static void test_short_hint(void) {
     mem_layout_large_heap();
     g_ounce = 1;
     CHECK(hint_is(""));
-    mem_fit(1, 8006 * MIB, 106 * MIB); /* the measure leaves 7412: an Ounce game's 10240 is the least Auto tells */
-    CHECK(mem_total() == 10240 * MIB && hint_is(""));
+    mem_fit(1, 8006 * MIB, 106 * MIB); /* the measure leaves 7412: an Ounce game's 9152 is the least Auto tells */
+    CHECK(mem_total() == 9152 * MIB && hint_is(""));
     g_settings.memory_gb = 0;
     mem_fit(0, 0, 0);
     CHECK(hint_is(""));
@@ -515,12 +533,12 @@ static void test_gb_said(void) {
     mem_layout_large_heap();
     g_ounce = 1;
     mem_gb_said();
-    CHECK(!strcmp(said, "memory: memory_gb=8 does not change an Ounce game's memory: it is told 10240 MiB\n"));
-    mem_fit(1, 8006 * MIB, 106 * MIB); /* the measure leaves 7412: Auto tells no less than its own 10240 */
+    CHECK(!strcmp(said, "memory: memory_gb=8 does not change an Ounce game's memory: it is told 9152 MiB\n"));
+    mem_fit(1, 8006 * MIB, 106 * MIB); /* the measure leaves 7412: Auto tells no less than its own 9152 */
     said[0] = 0;
     g_settings.memory_gb = 6;
     mem_gb_said();
-    CHECK(!strcmp(said, "memory: memory_gb=6 does not change an Ounce game's memory: it is told 10240 MiB\n"));
+    CHECK(!strcmp(said, "memory: memory_gb=6 does not change an Ounce game's memory: it is told 9152 MiB\n"));
     said[0] = 0;
     g_settings.memory_gb = 0; /* the key's default: nothing was asked */
     mem_gb_said();
@@ -971,6 +989,20 @@ static void test_ladder(void) {
    MapPhysicalMemory), so the region is 16 GiB. GetInfo names each region as the layout lays it out, a physical mapping
    goes up to the alias region's last page and not past it, and the stack region keeps a free GiB before the kernel's
    pages */
+/* the disk check before the guest files (mem_files_room): the free space against the need, or the error of reading it,
+   never a free space nobody read */
+static void test_files_room(void) {
+    char out[256], want[256];
+    disk_error = ENOENT;
+    snprintf(want, sizeof want, "the free space on the disk of /gone could not be read: %s", strerror(ENOENT));
+    CHECK(mem_files_room("/gone", 1, out, sizeof out) == -1 && !strcmp(out, want));
+    disk_error = 0;
+    disk_free = 3ull << 30;
+    CHECK(mem_files_room("/tmp", 4ull << 30, out, sizeof out) == -1 &&
+          !strcmp(out, "3072 MiB free on the disk of /tmp, 4096 needed"));
+    CHECK(mem_files_room("/tmp", 2ull << 30, out, sizeof out) == 0 &&
+          !strcmp(out, "3072 MiB free on the disk of /tmp, 2048 needed"));
+}
 static void test_alias_layouts(void) {
     static const u64 sizes[] = {32, 48}; /* GiB */
     for (unsigned i = 0; i < sizeof sizes / sizeof *sizes; i++) {
@@ -1073,14 +1105,14 @@ static void test_moved(void) {
          guest memory moved into a GPU's buffer is the runtime's own, one beside it another owner's */
         char out[64], want[64];
         share_ok = 1;
-        CHECK(mem_migrate(HEAP_BASE, 0x1000, 7) == 0);
+        CHECK(mem_migrate(HEAP_BASE, 0x1000, 7, NULL) == 0);
         foreign.named[0][0] = HEAP_BASE, foreign.named[0][1] = HEAP_BASE + 0x1000;
         foreign.named[1][0] = HEAP_BASE + 0x1000, foreign.named[1][1] = HEAP_BASE + 0x2000;
         foreign.n = 2;
         CHECK(mem_foreign(out, sizeof out) == 1 && foreign.lo == by + 0x8000000ull && foreign.hi == by + size);
         snprintf(want, sizeof want, "%#llx", (unsigned long long)(HEAP_BASE + 0x1000));
         CHECK(!strcmp(out, want));
-        CHECK(mem_unmigrate(HEAP_BASE, 0x1000) == 0);
+        CHECK(mem_unmigrate(HEAP_BASE, 0x1000, NULL) == 0);
         CHECK(mem_foreign(out, sizeof out) == 2); /* moved back, it is no buffer's */
         foreign.n = 0;
         share_ok = 0;
@@ -1185,6 +1217,7 @@ int main(void) {
     }
     test_ladder();
     test_alias_layouts();
+    test_files_room();
     /* a system that gives less than 128 GiB: the largest tier it gives, in a smaller layout of that size */
     host_page = (u64)sysconf(_SC_PAGESIZE);
     refuse_above = 24ull << 30;

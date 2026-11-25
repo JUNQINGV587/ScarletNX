@@ -82,7 +82,7 @@ under explicit assumptions, not a promised gain. Keep Rosetta observations disti
 ```sh
 git clone https://github.com/scarletnx/ScarletNX.git
 cd ScarletNX
-cmake --preset default -B build && cmake --build build
+cmake --preset default -B build -DBUILD_TESTING=ON && cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
@@ -136,7 +136,7 @@ and at the plan.
 | --- | --- |
 | Finding functions | `src/common/cpu/recompiler/codegen.c`, `src/nx/loader/loader.c`, `src/nx/loader/codegen_view.c` |
 | The instruction emitters, ported from QEMU's `translate-a64.c` | `ir_int.c`, `ir_ldst.c`, `ir_vec.c`, `ir_vec_fp.c`, `ir_vec_crypto.c` in `src/common/cpu/recompiler/llvm/` |
-| The integer data-processing, hint, barrier, general-purpose load and store, scalar floating-point and SIMD integer (one element per lane) emitters and the branch operands, generated from the Arm architecture's Sail | `ir_sail.c` (`tools/sailgen`'s output; `ir_fpu.c` sends it the scalar floating point, `ir_vec.c` the SIMD ops whose element loop is one vector operation), the Sail and the NX's fixups in `src/common/cpu/aarch64/sail/`; the floating-point arithmetic's lowering, fast paths and helper calls, in `tools/sailgen/llvm.h` |
+| The integer data-processing, hint, barrier, general-purpose load and store, scalar floating-point and SIMD integer (one element per lane, pairwise and across lanes) emitters and the branch operands, generated from the Arm architecture's Sail | `ir_sail.c` (`tools/sailgen`'s output; `ir_fpu.c` sends it the scalar floating point, `ir_vec.c` the SIMD ops whose element loop is one vector operation, a shuffle or a reduction), the Sail and the NX's fixups in `src/common/cpu/aarch64/sail/`; the floating-point arithmetic's lowering, fast paths and helper calls, in `tools/sailgen/llvm.h` |
 | A guest function's IR: calls, returns, polls, stale checks | `ir_codegen.c` |
 | Guest registers' and flags' per-block cache, for every emitter | `tools/sailgen/llvm.h` (the back end), whose functions are `ir.h`'s accessors in `ir_sail.c` |
 | The flags' helpers, the vectors' cache and memory accesses | `ir_state.c` |
@@ -144,7 +144,7 @@ and at the plan.
 | Helpers, `snx_lookup`, calls into the runtime | `ir_helpers.c`, `ir_emit.c` |
 | The pass pipeline and the target CPU | `ir.c` |
 | The branch profile | `ir_profile.c` |
-| Units, the unit cache, the module descriptor | `src/nx/loader/module_llvm.c`, `src/nx/loader/unit_cache.c`, `src/nx/loader/module_abi.h` |
+| Units, the units held in memory, the module descriptor | `src/nx/loader/module_llvm.c`, `src/common/cpu/recompiler/x64/x64_cache.c`, `src/nx/loader/module_abi.h` |
 | Linkers and the code loader | `link_elf.c`, `link_coff.c`, `link_macho.c`, `code_loader.c`, `elf_object.c` |
 | The runtime JIT and its cache | `jit_service.c`, `jit_cache.c`, `src/nx/runtime/guest_jit.c`, `src/nx/runtime/rtapi.c` |
 | The contract with generated code | `src/common/cpu/aarch64/cpu.h` (`SNX_ABI`, `CPU`, `snx_lookup`), `cpu_helpers.c`, `helpers/`, `rtlib.c` |

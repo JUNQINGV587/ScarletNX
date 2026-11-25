@@ -273,7 +273,7 @@ typedef struct {
 NVN_FITS(NvnDlssParameters, 0xc8);
 /* A network (0x258 bytes, which the driver's Initialize clears): the fields the runtime keeps, at the offsets the
    driver's Initialize and Resize write them. render: the render sizes its GetOptimalSettings answers (optimal, then the
-   two other pairs, taken to be the largest and the smallest as NGX orders them). output: the size Resize sets,
+   two other pairs, the smallest and then the largest). output: the size Resize sets,
    output_max the builder's, which Resize may not exceed */
 typedef struct {
     u8 pad0[8];
@@ -285,8 +285,8 @@ typedef struct {
     i32 render[2];       /* +0x21c, the optimal render size */
     i32 size[2];         /* +0x224, the output size as the driver keeps it a second time */
     i32 flag22c;         /* +0x22c, a flag bit of the builder's */
-    i32 render_max[2];   /* +0x230 */
-    i32 render_min[2];   /* +0x238 */
+    i32 render_min[2];   /* +0x230 */
+    i32 render_max[2];   /* +0x238 */
     i32 output[2];       /* +0x240 */
     i32 output_max[2];   /* +0x248 */
     i32 builder_flags;   /* +0x250 */
@@ -411,7 +411,8 @@ typedef struct {
     u64 origin;
     u64 game_end; /* the end of the memory the game last added (the getters' size and room) */
     u32 ctl;      /* its control memory's slot in nvn_cmd.c's g_nvn.cmd.ctl, plus 1 (0 none) */
-    u32 piece;    /* the piece the open recording starts in (nvn_cmd.c's PIECE_MORE once past it), 0 none */
+    u32 piece;    /* the piece the open recording starts in, or (nvn_cmd.c's PIECE_TAIL) the one its records in the
+                     game's memory go on in; PIECE_MORE once past it, 0 none */
     i64 row_stride, image_stride; /* SetCopyRowStride's and SetCopyImageStride's, for their getters */
     u64 game_cur, last, seen;
 } NvnCmdBuf;
@@ -568,6 +569,7 @@ enum {
     OP_RATE_IMAGE,
     OP_RATE_PALETTE,
     OP_RATE_MODE,
+    OP_UPSCALE,
     OP_COUNT_
 };
 typedef char NvnOpcodeMaskFits[(OP_COUNT_ <= 128) ? 1 : -1]; /* nvn_replay.h's unknown[2] */
@@ -863,6 +865,29 @@ static inline u64 nvn_rate_palette(const u32* rates, i32 n) {
     }
     return p;
 }
+/* An upscale a hook module's CPU hook recorded (nvn_cmd_record_upscale, hle/hook/snx_hook_module.h), its textures'
+   snapshots after it, tex and view in the order of NVN_UPSCALE_*: given to the renderer's upscaler, and where none
+   takes it, a filtered copy of the color's render rectangle onto the output's rectangle */
+enum {
+    NVN_UPSCALE_COLOR,
+    NVN_UPSCALE_OUTPUT,
+    NVN_UPSCALE_DEPTH,
+    NVN_UPSCALE_MOTION,
+    NVN_UPSCALE_EXPOSURE,
+    NVN_UPSCALE_REACTIVE,
+    NVN_UPSCALE_TEXTURES
+};
+typedef struct {
+    u64 tex[NVN_UPSCALE_TEXTURES];
+    NvnView view[NVN_UPSCALE_TEXTURES];
+    u8 has_view[NVN_UPSCALE_TEXTURES];
+    u8 reset, pad;
+    u32 flags; /* gpu.h's GPU_UPSCALE_ */
+    u32 render[2], out[2], render_max[2];
+    i32 out_base[2];
+    f32 jitter[2], motion_scale[2], pre_exposure;
+    f32 reprojection[16]; /* with GPU_UPSCALE_REPROJECTED_MOTION */
+} NvnPUpscale;
 typedef struct {
     u64 texture;
     NvnView view;

@@ -21,6 +21,7 @@
 #define SNX_SM86_H
 #include "common/utilities/bits.h"
 #include "nx/gpu/shader/shader.h"
+#include "nx/gpu/shader/warp_notes.h"
 #include <stddef.h>
 
 /* the kind of an opcode: an ALU instruction (its sources placed by its form), the same on the uniform datapath, or
@@ -360,6 +361,33 @@ u32* sm86_to_spirv(const u8* code, u32 bytes, int stage, const u32* sph, ShaderI
    A fragment program takes the generics that the draw's mesh program writes per primitive in si->prim_mask (its key):
    the mesh program's translated si->prim_mask, which sm86_mesh_primitive_mask gives from its key alone. Its module
    declares those inputs PerPrimitiveEXT */
+/* The compute-task path (vk_mesh_path=compute, vk/device.c): a task program runs as a compute dispatch, and the mesh
+   program it launches has no task stage. The task's payload, which the hardware copies to each mesh workgroup it
+   launches, is a storage buffer instead (SNX_VKB_MESHBUF, shader.h), a flat array of u32:
+   - the indirect mesh draw's record at words 0 to 3: the most groups one task workgroup launched (an atomic maximum,
+     the draw's x), the task workgroups (y), 1 (z) and 0;
+   - the count of each task workgroup from word 4 on: the mesh groups it launched (the payload's word 1);
+   - the payloads from word 4 + the buffer's groups: task workgroup g's at 4 + groups + g * payload_stride words, where
+     payload_stride is the larger of the task's and the mesh program's payload (ShMesh.payload_stride).
+   The buffer holds sm86_mesh_task_cap(payload_stride) task workgroups, which the push constant's z gives above its
+   flag (SH_PUSH_GPU_MESH_FIRST): the task program cuts its dispatch to them and stores that count at the record's word
+   1, and the mesh program reads it from there. A mesh workgroup (x, y) runs when x is below the count of task
+   workgroup y, and reads y's payload; one that did not run calls OpSetMeshOutputsEXT with 0 and 0 before it returns,
+   as RADV hangs a mesh workgroup that returns without it. The renderer keeps one buffer for each frame in flight,
+   zeroes its record, dispatches the task (of the draw's count, or of its indirect record's) and draws with
+   vkCmdDrawMeshTasksIndirectEXT (vk/render.c) */
+#define SNX_MESH_PAYLOAD_BYTES (1u << 20) /* the buffer's bytes: 1 MiB holds SNX_MESH_TASK_GROUPS slots */
+#define SNX_MESH_TASK_GROUPS   1024u      /* the most task workgroups a buffer holds */
+/* the buffer's bytes for groups task workgroups of a slot of stride_words words: the record, the counts, the payloads */
+static inline u64 sm86_mesh_payload_bytes(u32 stride_words, u32 groups) {
+    return 4ull * (4 + (u64)groups * (stride_words + 1));
+}
+/* the task workgroups a buffer of a slot of stride_words words holds: its words less the record, one to a slot and one
+   to its count */
+static inline u32 sm86_mesh_task_cap(u32 stride_words) {
+    const u32 cap = (SNX_MESH_PAYLOAD_BYTES / 4 - 4) / (stride_words + 1);
+    return cap < SNX_MESH_TASK_GROUPS ? cap : SNX_MESH_TASK_GROUPS;
+}
 /* the generics with a component in the output map of a vertex, tessellation or geometry SPH (its words 0 to 19):
    generic i's four components at bits 432 + 4 i on */
 static inline u32 sm86_omap_generics(const u32* sph) {
@@ -386,8 +414,16 @@ static inline u64 sm86_mesh_output_bytes(const u32* sph, const ShMesh* mesh, u32
 /* sm86_to_spirv, with the device's FP32 flush to zero (can_flush, SH_FTZ_* of shader.h) as shader_to_spirv takes it:
    the DenormFlushToZero execution mode where every FADD, FMUL and FFMA flushes and the device has the mode, nothing on
    a device that flushes by itself, else a flush of each such operand and result. sm86_to_spirv is SH_FTZ_EMULATE */
+/* what the device's subgroups give a stage's programs (bits): the 32 lanes of a warp, in subgroups of 32 or more, which
+   VOTE, SHFL, MATCH, REDUX and the tensor core's instructions read, and quads, whole in one subgroup of any size. A
+   program that needs more than a stage has runs each invocation as a warp of its own where that gives the same, or is
+   refused ("subgroup ballot/shuffle unavailable") */
+enum { SM86_LANES_WARP = 1, SM86_LANES_QUAD = 2 };
+/* sm86_lone.c: whether a compute program gives with each invocation a warp of its own what it gives on the console, 0
+   with the reason in why. notes are the translator's of what each of the n instructions at in reads and writes */
+int sm86_lone_gives(const Sm86Insn* in, u32 n, const ShNotes* notes, const ShaderInfo* si, char* why, size_t size);
 u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, ShaderInfo* si, size_t* word_count,
-                       int can_flush);
+                       int can_flush, int lanes);
 /* The texture handles an Ounce program loads from memory (SNX_TEX_MEMORY in shader.h): the CPU runs the instructions
    the translation kept (ShaderInfo.memh) on what a draw binds, the constant buffer words that io->cbuf reads (bank,
    byte offset) and the guest memory words io->mem reads (address, its words, their count: 0 when no memory is
@@ -395,6 +431,14 @@ u32* sm86_to_spirv_ftz(const u8* code, u32 bytes, int stage, const u32* sph, Sha
    when an instruction is not one sm86_eval_takes, or a load finds no memory (out then holds 0 for the probes after
    it) */
 int sm86_eval(const u64 (*insn)[2], u32 n, const Sm86EvalIo* io, const u32* probes, u32 nprobes, u32* out);
+/* the state sm86_eval runs on: the registers, the uniform registers and the predicates (0 or 1; PT is none of them) */
+typedef struct {
+    u32 r[256], ur[64];
+    u8 p[8], up[8];
+} Sm86EvalState;
+/* one instruction run on s, as sm86_eval runs each (the tests hold sail/sm86.sail to it): 0 when it is not one
+   sm86_eval_takes, or a load finds no memory */
+int sm86_eval_step(Sm86EvalState* s, const Sm86Insn* in, const Sm86EvalIo* io);
 /* whether sm86_eval runs the instruction: MOV, UMOV, R2UR, IADD3, IMAD (.WIDE), LEA, LOP3, SHF, SEL, IMNMX, ISETP,
    PLOP3 and PRMT (their uniform forms too), CS2R of zero, LDC, ULDC (.IDX) and LDG, in the forms the translation
    takes */

@@ -105,6 +105,19 @@ static int changed(u64 a, u64 size) {
     return r;
 }
 
+/* the runtime's JIT tells what it must compile again (mem.c's code_invalidate): the range it names */
+static u64 inval_lo = ~0ull, inval_hi;
+static void on_invalidate(u64 a, u64 size) {
+    if (a < inval_lo) inval_lo = a;
+    if (a + size > inval_hi) inval_hi = a + size;
+}
+static int invalidated(u64 a, u64 size) {
+    int r = inval_lo <= a && a + size <= inval_hi;
+    inval_lo = ~0ull;
+    inval_hi = 0;
+    return r;
+}
+
 /* handle 0x1234 names test_handle; references are counted */
 static KObj* test_handle;
 /* the native SDK's mapping of a shared memory (kshmem_map_free) takes a handle, which no test here makes */
@@ -170,6 +183,21 @@ static int scan_reports(u64 a, u64 size, u64 at) {
     if (plat_ww_scan(GP(a), size, on_written)) return -1;
     return g_written_lo <= at && at < g_written_hi;
 }
+#if defined(__linux__) /* test_migrate's, a Linux test */
+/* 1 when a scan of [a, a + size) works and reports the host page at `at` and no other, 0 when it reports none, -1 when
+   it fails or reports another */
+static int scan_only(u64 a, u64 size, u64 at) {
+    const u64 page = (u64)sysconf(_SC_PAGESIZE);
+    g_written_lo = ~0ull;
+    g_written_hi = 0;
+    if (plat_ww_scan(GP(a), size, on_written)) return -1;
+    if (!g_written_hi) return 0;
+    if (g_written_lo != (at & ~(page - 1)) || g_written_hi != g_written_lo + page)
+        fprintf(stderr, "a scan reported [%llx, %llx), not the page at %llx alone\n", (unsigned long long)g_written_lo,
+                (unsigned long long)g_written_hi, (unsigned long long)at);
+    return g_written_lo == (at & ~(page - 1)) && g_written_hi == g_written_lo + page ? 1 : -1;
+}
+#endif
 /* every range scans, and a write through it is reported (a scan first takes what remapping marked) */
 static void check_tracking(u64 a, u64 size) {
     if (!g_ww) return;
@@ -287,10 +315,226 @@ static void test_code_view(void) {
     check_tracking(m.source, 0x3000);
 }
 
+/* the view entry of a destination, as the runtime keeps it (svc_mem.c's KMapView table): NULL when there is none */
+static const KMapView* view_at(u64 dst) {
+    for (u32 i = 0; i < KMAPVIEW_MAX; i++)
+        if (g_hle.svcmem.maps[i].size && g_hle.svcmem.maps[i].dst == dst) return &g_hle.svcmem.maps[i];
+    return NULL;
+}
+
+/* The code-memory SVCs a JIT uses: MapProcessCodeMemory makes an AliasCode view of the game's own normal memory and
+   locks the source, SetProcessMemoryPermission gives the view read-execute, and UnmapProcessCodeMemory unmaps it and
+   puts the source back to read-write, so the game maps again after writing. The console maps exactly the range it is
+   given: the view needs no guard page. Here it shares its source's pages, so what the game writes through a
+   read-write view is in the source (without the pool it is a copy, written back at the unmap) */
+static void test_process_code(void) {
+    KObj process = {0};
+    const u64 src = HEAP_BASE + 0x60000, dst = STACK_BASE + 0x90000, size = 0x2000;
+    MemBlock b;
+    u32 perm;
+    process.type = KO_PROCESS;
+    process.refs = 1;
+    test_handle = &process;
+    gw32(src, 0xD503201F); /* nop */
+    /* the arguments every call checks first: an invalid handle, alignment, size and wrap */
+    CHECK(svc_map_process_code_memory(0x9999, dst, src, size) == SNX_RC_SVC_INVALID_HANDLE);
+    CHECK(svc_map_process_code_memory(0x1234, dst | 1, src, size) == SNX_RC_SVC_INVALID_ADDRESS);
+    CHECK(svc_map_process_code_memory(0x1234, dst, src | 1, size) == SNX_RC_SVC_INVALID_ADDRESS);
+    CHECK(svc_map_process_code_memory(0x1234, dst, src, 0) == SNX_RC_SVC_INVALID_SIZE);
+    CHECK(svc_map_process_code_memory(0x1234, dst, src, 0x1001) == SNX_RC_SVC_INVALID_SIZE);
+    CHECK(svc_map_process_code_memory(0x1234, ~0ull & ~0xFFFull, src, size) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    CHECK(svc_map_process_code_memory(0x1234, dst, ~0ull & ~0xFFFull, size) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    CHECK(svc_unmap_process_code_memory(0x1234, dst, src, size) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    /* the source must be normal, read-write memory without an attribute: free pages, a locked source and code are
+       not (the console's CheckMemoryState for MapCodeMemory) */
+    CHECK(svc_map_process_code_memory(0x1234, dst, HEAP_BASE + 0x300000, size) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    CHECK(mem_map(dst + 0x500000, size, MS_CODE, PERM_RX) == 0);
+    CHECK(svc_map_process_code_memory(0x1234, dst, dst + 0x500000, size) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    CHECK(mem_unmap(dst + 0x500000, size) == 0);
+    /* the view's dst is free memory of the address space outside the heap, the alias region and the kernel's pages */
+    CHECK(svc_map_process_code_memory(0x1234, HEAP_BASE + 0x80000, src, size) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    if (ALIAS_SIZE)
+        CHECK(svc_map_process_code_memory(0x1234, ALIAS_BASE + 0x200000, src, size) ==
+              SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    CHECK(svc_map_process_code_memory(0x1234, KERN_BASE + 0x10000, src, size) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    /* the destination's region is the SVC's own check, InvalidCurrentMemory as the console's svcMapProcessCodeMemory and
+       svcUnmapProcessCodeMemory answer it (Contains, then CanContain): the page table's InvalidMemoryRegion for it is
+       never reached from the SVC */
+    CHECK(svc_map_process_code_memory(0x1234, HEAP_BASE + 0x80000, HEAP_BASE + 0x300000, size) ==
+          SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    CHECK(svc_unmap_process_code_memory(0x1234, HEAP_BASE + 0x80000, HEAP_BASE + 0x300000, size) ==
+          SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    CHECK(mem_map(dst + 0x100000, size, MS_NORMAL, PERM_RW) == 0);
+    CHECK(svc_map_process_code_memory(0x1234, dst + 0x100000, src, size) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    CHECK(mem_unmap(dst + 0x100000, size) == 0);
+    /* a page on each side of the view: the console needs no guard page around it, and ldr:ro's mem_map_code does */
+    CHECK(mem_map(dst - 0x1000, 0x1000, MS_STACK, PERM_RW) == 0);
+    CHECK(mem_map(dst + size, 0x1000, MS_STACK, PERM_RW) == 0);
+    inval_lo = ~0ull, inval_hi = 0;
+    CHECK(svc_map_process_code_memory(0x1234, dst, src, size) == 0);
+    CHECK(mem_pool_used() == size); /* the source's pages, which the view shares */
+    CHECK(gr32(dst) == 0xD503201F && gr32(dst + 0x1000) == 0);
+    mem_query(dst, &b);
+    CHECK(b.state == MS_ALIASCODE && b.perm == PERM_NONE && b.attr == 0);
+    mem_query(src, &b);
+    CHECK(b.state == MS_NORMAL && b.perm == PERM_NONE && b.attr == MA_LOCKED); /* kernel-read and not mapped */
+    CHECK(info_attr_perm(STACK_BASE, src, &perm) == MA_LOCKED && perm == PERM_NONE); /* what the game reads */
+    CHECK(state(dst - 0x1000) == MS_STACK && state(dst + size) == MS_STACK);
+    /* the view and the source are one: what the game writes through the view is in the source, and the source's
+       locked pages are no longer read-write (get a second view of them, grow the heap, set an attribute) */
+    CHECK(svc_map_process_code_memory(0x1234, dst + 0x200000, src, size) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    CHECK(svc_set_heap_size(0) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    CHECK(svc_map_memory(dst + 0x200000, src, size) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    /* read-execute, as the JIT sets it before the code runs: the runtime is told to compile it again */
+    CHECK(svc_set_process_mem_perm(0x1234, dst, size, PERM_RX) == 0);
+    CHECK(invalidated(dst, size));
+    mem_query(dst, &b);
+    CHECK(b.state == MS_ALIASCODE && b.perm == PERM_RX);
+    CHECK(svc_set_mem_perm(dst, size, PERM_RW) == SNX_RC_SVC_INVALID_CURRENT_MEMORY); /* not reprotectable */
+    /* a read-write view is code data, and the console's FlagCode is gone with it: no permission change goes back */
+    CHECK(svc_set_process_mem_perm(0x1234, dst, size, PERM_RW) == 0);
+    mem_query(dst, &b);
+    CHECK(b.state == MS_ALIASCODEDATA && b.perm == PERM_RW);
+    CHECK(svc_set_process_mem_perm(0x1234, dst, size, PERM_RX) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    gw32(dst, 0xD65F03C0); /* ret */
+    CHECK(gr32(src) == 0xD65F03C0); /* the same pages */
+    check_tracking(dst, size);
+    /* the permissions it takes: none, read, read-write and read-execute; execute alone and write alone no more than
+       an invalid one, and the code states only */
+    CHECK(svc_set_process_mem_perm(0x1234, dst, size, PERM_X) == SNX_RC_SVC_INVALID_NEW_MEMORY_PERMISSION);
+    CHECK(svc_set_process_mem_perm(0x1234, dst, size, PERM_W) == SNX_RC_SVC_INVALID_NEW_MEMORY_PERMISSION);
+    CHECK(svc_set_process_mem_perm(0x1234, dst, size, PERM_DONTCARE) == SNX_RC_SVC_INVALID_NEW_MEMORY_PERMISSION);
+    CHECK(svc_set_process_mem_perm(0x9999, dst, size, PERM_RX) == SNX_RC_SVC_INVALID_HANDLE);
+    CHECK(svc_set_process_mem_perm(0x1234, dst | 1, size, PERM_RX) == SNX_RC_SVC_INVALID_ADDRESS);
+    CHECK(svc_set_process_mem_perm(0x1234, dst, 0, PERM_RX) == SNX_RC_SVC_INVALID_SIZE);
+    CHECK(svc_set_process_mem_perm(0x1234, src, size, PERM_RX) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    CHECK(svc_set_process_mem_perm(0x1234, dst - 0x1000, 0x1000, PERM_RX) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    /* the unmap: the destination must be a code view, the source normal, locked and without permission, and the view
+       must be the source's. A wrong source leaves both as they were */
+    CHECK(svc_unmap_process_code_memory(0x9999, dst, src, size) == SNX_RC_SVC_INVALID_HANDLE);
+    CHECK(svc_unmap_process_code_memory(0x1234, dst | 1, src, size) == SNX_RC_SVC_INVALID_ADDRESS);
+    CHECK(svc_unmap_process_code_memory(0x1234, dst, src, 0) == SNX_RC_SVC_INVALID_SIZE);
+    gw32(src + 0x10000, 1);
+    CHECK(svc_map_process_code_memory(0x1234, dst + 0x300000, src + 0x10000, 0x1000) == 0);
+    CHECK(svc_unmap_process_code_memory(0x1234, dst, src + 0x10000, size) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    /* the view's pages must be the source's: [dst, dst + 0x1000) is src's first page, not its second */
+    CHECK(svc_unmap_process_code_memory(0x1234, dst, src + 0x1000, 0x1000) == SNX_RC_SVC_INVALID_MEMORY_REGION);
+    CHECK(svc_unmap_process_code_memory(0x1234, dst, src + 0x1000, size) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    CHECK(svc_unmap_process_code_memory(0x1234, dst + 0x300000, src, 0x1000) == SNX_RC_SVC_INVALID_MEMORY_REGION);
+    CHECK(state(dst) == MS_ALIASCODEDATA && gr32(src) == 0xD65F03C0);
+    CHECK(svc_unmap_process_code_memory(0x1234, dst + 0x300000, src + 0x10000, 0x1000) == 0);
+    inval_lo = ~0ull, inval_hi = 0;
+    CHECK(svc_unmap_process_code_memory(0x1234, dst, src, size) == 0);
+    CHECK(invalidated(dst, size));
+    CHECK(mem_pool_used() == 0 && state(dst) == MS_FREE);
+    mem_query(src, &b);
+    CHECK(b.state == MS_NORMAL && b.perm == PERM_RW && b.attr == 0);
+    CHECK(gr32(src) == 0xD65F03C0 && gr32(src + 0x4) == 0);
+    check_tracking(src, size);
+    CHECK(state(dst - 0x1000) == MS_STACK && state(dst + size) == MS_STACK); /* the neighbours were no guard */
+    CHECK(svc_set_heap_size(0) == 0); /* the source is the game's again: nothing locks the heap */
+    CHECK(svc_set_heap_size(2 * MIB) == 0); /* (the heap's contents go with it, and src is written again below) */
+    /* unmap, write, map again: what the runtime compiles is the new code */
+    gw32(src, 0xD503201F);
+    CHECK(svc_map_process_code_memory(0x1234, dst, src, size) == 0);
+    CHECK(svc_set_process_mem_perm(0x1234, dst, size, PERM_RX) == 0);
+    CHECK(gr32(dst) == 0xD503201F);
+    CHECK(svc_unmap_process_code_memory(0x1234, dst, src, size) == 0);
+    gw32(src, 0xD65F03C0);
+    CHECK(svc_map_process_code_memory(0x1234, dst, src, size) == 0);
+    CHECK(svc_set_process_mem_perm(0x1234, dst, size, PERM_RX) == 0);
+    CHECK(gr32(dst) == 0xD65F03C0);
+    CHECK(svc_unmap_process_code_memory(0x1234, dst, src, size) == 0);
+    CHECK(mem_pool_used() == 0);
+    /* A range can be part of a view, or all that its parts leave: the console unmaps what it is given, and the
+       source keeps its lock only where a view is left */
+    {
+        const u64 src3 = HEAP_BASE + 0xA0000, dst3 = STACK_BASE + 0xB0000;
+        CHECK(svc_map_process_code_memory(0x1234, dst3, src3, 0x3000) == 0);
+        CHECK(svc_unmap_process_code_memory(0x1234, dst3 + 0x1000, src3 + 0x1000, 0x1000) == 0);
+        CHECK(state(dst3) == MS_ALIASCODE && state(dst3 + 0x1000) == MS_FREE &&
+              state(dst3 + 0x2000) == MS_ALIASCODE);
+        mem_query(src3, &b);
+        CHECK(b.perm == PERM_NONE && b.attr == MA_LOCKED);
+        mem_query(src3 + 0x1000, &b);
+        CHECK(b.perm == PERM_RW && b.attr == 0);
+        mem_query(src3 + 0x2000, &b);
+        CHECK(b.perm == PERM_NONE && b.attr == MA_LOCKED);
+        {   /* the view's table keeps its parts, not one entry over the hole */
+            const KMapView* v = view_at(dst3);
+            CHECK(v && v->size == 0x1000 && v->src == src3);
+            v = view_at(dst3 + 0x2000);
+            CHECK(v && v->size == 0x1000 && v->src == src3 + 0x2000);
+            CHECK(!view_at(dst3 + 0x1000));
+        }
+        CHECK(svc_unmap_process_code_memory(0x1234, dst3, src3, 0x1000) == 0);
+        CHECK(svc_unmap_process_code_memory(0x1234, dst3 + 0x2000, src3 + 0x2000, 0x1000) == 0);
+        CHECK(state(dst3) == MS_FREE && state(dst3 + 0x2000) == MS_FREE);
+        mem_query(src3, &b);
+        CHECK(b.perm == PERM_RW && b.attr == 0 && mem_pool_used() == 0);
+        /* a part's source must be that part's: the whole view's source is not the second page's source */
+        CHECK(svc_map_process_code_memory(0x1234, dst3, src3, 0x2000) == 0);
+        CHECK(svc_unmap_process_code_memory(0x1234, dst3 + 0x1000, src3, 0x1000) == SNX_RC_SVC_INVALID_MEMORY_REGION);
+        CHECK(svc_unmap_process_code_memory(0x1234, dst3, src3, 0x2000) == 0);
+        CHECK(mem_pool_used() == 0);
+        /* a view whose attribute changed still owns its source's lock: the console's page table keeps the source
+           Locked, so the game cannot take the heap back while the view is there. Clearing the attribute lets the
+           unmap through again, and an attribute the unmap does not take refuses it */
+        CHECK(svc_map_process_code_memory(0x1234, dst3, src3, 0x1000) == 0);
+        CHECK(svc_set_process_mem_perm(0x1234, dst3, 0x1000, PERM_RW) == 0);
+        CHECK(svc_set_mem_attr(dst3, 0x1000, MA_UNCACHED, MA_UNCACHED) == 0);
+        mem_query(dst3, &b);
+        CHECK(b.state == MS_ALIASCODEDATA && b.attr == MA_UNCACHED);
+        CHECK(svc_set_mem_attr(src3, 0x1000, MA_UNCACHED, MA_UNCACHED) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+        mem_query(src3, &b);
+        CHECK(b.perm == PERM_NONE && b.attr == MA_LOCKED); /* the lock has an owner still */
+        CHECK(svc_unmap_process_code_memory(0x1234, dst3, src3, 0x1000) == SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+        CHECK(svc_set_mem_attr(dst3, 0x1000, MA_UNCACHED, 0) == 0);
+        CHECK(svc_unmap_process_code_memory(0x1234, dst3, src3, 0x1000) == 0);
+        mem_query(src3, &b);
+        CHECK(b.perm == PERM_RW && b.attr == 0 && mem_pool_used() == 0);
+    }
+    /* the process's own code, as a module's is (Code, not AliasCode): read-execute, then read-write as code data */
+    CHECK(mem_map(dst + 0x400000, 0x1000, MS_CODE, PERM_RX) == 0);
+    CHECK(svc_set_process_mem_perm(0x1234, dst + 0x400000, 0x1000, PERM_R) == 0);
+    mem_query(dst + 0x400000, &b);
+    CHECK(b.state == MS_CODE && b.perm == PERM_R);
+    CHECK(svc_set_process_mem_perm(0x1234, dst + 0x400000, 0x1000, PERM_RW) == 0);
+    mem_query(dst + 0x400000, &b);
+    CHECK(b.state == MS_CODEDATA && b.perm == PERM_RW);
+    CHECK(svc_set_process_mem_perm(0x1234, dst + 0x400000, 0x1000, PERM_NONE) ==
+          SNX_RC_SVC_INVALID_CURRENT_MEMORY);
+    CHECK(mem_unmap(dst + 0x400000, 0x1000) == 0);
+    CHECK(mem_unmap(dst - 0x1000, 0x1000) == 0 && mem_unmap(dst + size, 0x1000) == 0);
+    test_handle = NULL;
+}
+/* The same calls on a host without the pool: the view is a copy, so what the game writes through it reaches the
+   source only at the unmap, which writes it back */
+static void test_process_code_copies(void) {
+    KObj process = {0};
+    const u64 src = HEAP_BASE + 0x60000, dst = STACK_BASE + 0x90000, size = 0x2000;
+    MemBlock b;
+    process.type = KO_PROCESS;
+    process.refs = 1;
+    test_handle = &process;
+    CHECK(mem_map(src, size, MS_NORMAL, PERM_RW) == 0); /* the heap the game's own memory comes from */
+    gw32(src, 0xD503201F);
+    CHECK(svc_map_process_code_memory(0x1234, dst, src, size) == 0);
+    CHECK(gr32(dst) == 0xD503201F && mem_pool_used() == 0);
+    CHECK(svc_set_process_mem_perm(0x1234, dst, size, PERM_RW) == 0);
+    gw32(dst, 0xD65F03C0);
+    CHECK(gr32(src) == 0xD503201F); /* a copy, as MapMemory's views are without the pool */
+    CHECK(svc_unmap_process_code_memory(0x1234, dst, src, size) == 0);
+    CHECK(gr32(src) == 0xD65F03C0 && state(dst) == MS_FREE); /* the copy went back */
+    mem_query(src, &b);
+    CHECK(b.state == MS_NORMAL && b.perm == PERM_RW && b.attr == 0);
+    CHECK(mem_unmap(src, size) == 0);
+    test_handle = NULL;
+}
+
 /* MapProcessMemory on a host without the pool (Windows, or alias_pool=0): the view is a copy, and a mod that
    keeps it mapped writes its hook pool through the RW bytes and flushes the line it wrote (IC IVAU). The flush must
-   copy the line back into the code before the runtime compiles it, as a host with the pool gets for free */
-static void test_process_memory_copies(void) {
+   copy the line back into the code before the runtime compiles it, as a host with the pool gets for free */static void test_process_memory_copies(void) {
     KObj process = {0};
     u64 src = HEAP_BASE + 0x1000, dst = STACK_BASE + 0x20000, code;
     int i;
@@ -511,6 +755,7 @@ static void scanner_ask(UnpoolScans* u, int scan) {
 static void test_unpool_under_scans(void) {
     UnpoolScans u = {HEAP_BASE + 0x140000, 0x40000, 0, 0, 0};
     pthread_t t;
+    int hot;
     if (!g_ww) return;
     CHECK(pthread_create(&t, NULL, scanner, &u) == 0);
     for (u32 i = 0; i < 300; i++) {
@@ -524,6 +769,22 @@ static void test_unpool_under_scans(void) {
     atomic_store_explicit(&u.stop, 1, memory_order_seq_cst);
     pthread_join(t, NULL);
     CHECK(mem_pool_used() == 0);
+    /* A scan between the commit of the source's own pages and the pool's read into them reports them, and the next
+       one reports them again, written by the read: two reports in a row, which leave a page hot where protection
+       tracks the writes (write_tracking_hot_pages 1, or its Auto), and every scan then reports it with nothing
+       written (plat.h). The scanner lands there in some runs only, so the pages are made hot here in every run, then
+       cooled, as a consumer whose "written" must be exact cools them, before check_tracking holds the scans to
+       exact answers */
+    plat_ww_cool(GP(u.a), u.size, on_scanned); /* one the scanner left hot may stop being hot at a report below */
+    for (u32 i = 0; i < 2; i++) {
+        for (u64 at = 0; at < u.size; at += 0x1000) gw32(u.a + at, i);
+        CHECK(scan_reports(u.a, u.size, u.a) == 1);
+    }
+    hot = plat_ww_hot_in(GP(u.a), u.size);
+    if (g_settings.write_tracking == 1) CHECK(hot == (g_settings.write_tracking_hot_pages != 0));
+    CHECK(scan_reports(u.a, u.size, u.a) == hot); /* nothing wrote it since the last scan */
+    plat_ww_cool(GP(u.a), u.size, on_scanned);
+    CHECK(!plat_ww_hot_in(GP(u.a), u.size));
     check_tracking(u.a, u.size);
 }
 
@@ -541,24 +802,33 @@ static u8 fill(u64 i) { return (u8)(i * 7 + 3); }
    memory) and back: the same bytes at the same addresses, one memory with the buffer's other view while moved, moved on
    from one buffer into a bigger one, back in the reservation's own pages; a part unmapped while moved reads zero when
    mapped again and the buffer keeps its bytes; only the guest's data on the reservation's own pages moves, and write
-   tracking keeps working over all of it */
+   tracking keeps working over all of it. A move is no write: of pages a scan left quiet, the next scan reports only
+   the one written since, after each move (into a buffer, on into a bigger one, back) */
 static void test_migrate(void) {
     const u64 a = HEAP_BASE + 32 * MIB, size = MIB, src = HEAP_BASE + MIB, dst = STACK_BASE + 0x200000;
+    const u64 page = (u64)sysconf(_SC_PAGESIZE);
     u8 *v1, *v2;
     int f1 = buffer(size, &v1), f2 = buffer(2 * size, &v2), zero = 1;
     CHECK(mem_map(a, 2 * size, MS_NORMAL, PERM_RW) == 0);
     u8* g = GP(a);
     for (u64 i = 0; i < 2 * size; i++) g[i] = fill(i);
     CHECK(mem_movable(a, 2 * size) && !mem_movable(a, 2 * size + 0x1000) && !mem_movable(a + 0x800, 0x1000));
-    CHECK(mem_migrate(a, size, f1) == 0);
+    if (g_ww) {
+        CHECK(scan_reports(a, 2 * size, a) >= 0); /* the fill's writes taken */
+        g[5 * page] = fill(5 * page);             /* a write of the byte it holds, before the move, not scanned yet */
+    }
+    CHECK(mem_migrate(a, size, f1, NULL) == 0);
     for (u64 i = 0; i < size; i += 4093) CHECK(v1[i] == fill(i) && g[i] == v1[i]);
+    if (g_ww) CHECK(scan_only(a, 2 * size, a + 5 * page) == 1 && scan_only(a, 2 * size, a) == 0);
     g[100] = 0x77;
     v1[200] = 0x55;
     CHECK(v1[100] == 0x77 && g[200] == 0x55);
     check_tracking(a, size);
     /* the first megabyte moves on from f1's pages, with the second from the reservation's */
-    CHECK(mem_migrate(a, 2 * size, f2) == 0);
+    if (g_ww) g[size + 9 * page] = fill(size + 9 * page);
+    CHECK(mem_migrate(a, 2 * size, f2, NULL) == 0);
     CHECK(v2[100] == 0x77 && v2[200] == 0x55 && v2[size + 5] == fill(size + 5));
+    if (g_ww) CHECK(scan_only(a, 2 * size, a + size + 9 * page) == 1 && scan_only(a, 2 * size, a) == 0);
     g[300] = 0x11;
     CHECK(v2[300] == 0x11 && v1[300] != 0x11);
     /* a part unmapped: fresh pages when mapped again, the buffer keeps its bytes, the rest stays moved */
@@ -568,29 +838,34 @@ static void test_migrate(void) {
     g[400] = 0x33;
     CHECK(v2[size] != 0x22 && v2[400] == 0x33);
     /* back in the reservation's own pages, each with its bytes */
-    CHECK(mem_unmigrate(a, 2 * size) == 0);
+    if (g_ww) {
+        CHECK(scan_reports(a, 2 * size, a) >= 0); /* the writes above, and the pages mapped again, taken */
+        g[13 * page] = fill(13 * page);
+    }
+    CHECK(mem_unmigrate(a, 2 * size, NULL) == 0);
+    if (g_ww) CHECK(scan_only(a, 2 * size, a + 13 * page) == 1 && scan_only(a, 2 * size, a) == 0);
     g[500] = 0x44;
     CHECK(v2[500] != 0x44 && g[100] == 0x77 && g[300] == 0x11 && g[400] == 0x33 && g[size] == 0x22 &&
           g[size + 0x10000] == fill(size + 0x10000));
     check_tracking(a, 2 * size);
-    CHECK(mem_unmigrate(a, 2 * size) == 0); /* none moved */
+    CHECK(mem_unmigrate(a, 2 * size, NULL) == 0); /* none moved */
     /* moved, then unmapped: zero when mapped again, the buffer's bytes its own */
     g[100] = 0x99;
-    CHECK(mem_migrate(a, size, f1) == 0 && mem_unmap(a, 2 * size) == 0 &&
+    CHECK(mem_migrate(a, size, f1, NULL) == 0 && mem_unmap(a, 2 * size) == 0 &&
           mem_map(a, 2 * size, MS_NORMAL, PERM_RW) == 0);
     for (u64 i = 0; i < 2 * size && zero; i += 512) zero = g[i] == 0;
     CHECK(zero && v1[100] == 0x99);
     /* moved, then the source of a view (MapMemory): its pages move on into the pool, which a move back leaves alone */
     gw32(src, 0x600d);
-    CHECK(mem_migrate(src, 0x4000, f1) == 0 && svc_map_memory(dst, src, 0x4000) == 0 && gr32(dst) == 0x600d);
-    CHECK(mem_unmigrate(src, 0x4000) == 0);
+    CHECK(mem_migrate(src, 0x4000, f1, NULL) == 0 && svc_map_memory(dst, src, 0x4000) == 0 && gr32(dst) == 0x600d);
+    CHECK(mem_unmigrate(src, 0x4000, NULL) == 0);
     gw32(src, 0x1234abcd);
     CHECK(gr32(dst) == 0x1234abcd && snx_ld_le32(v1) == 0x600d); /* the buffer keeps what it had */
     /* only the guest's data on the reservation's own pages: not past the mapped pages, not code, not the pool's */
-    CHECK(mem_migrate(a + 2 * size - 0x1000, 0x2000, f1) == MEM_BADSTATE);
+    CHECK(mem_migrate(a + 2 * size - 0x1000, 0x2000, f1, NULL) == MEM_BADSTATE);
     CHECK(mem_map(a + 4 * size, 0x1000, MS_CODE, PERM_RX) == 0);
-    CHECK(!mem_movable(a + 4 * size, 0x1000) && mem_migrate(a + 4 * size, 0x1000, f1) == MEM_BADSTATE);
-    CHECK(!mem_movable(src, 0x4000) && mem_migrate(src, 0x4000, f1) == MEM_BADSTATE);
+    CHECK(!mem_movable(a + 4 * size, 0x1000) && mem_migrate(a + 4 * size, 0x1000, f1, NULL) == MEM_BADSTATE);
+    CHECK(!mem_movable(src, 0x4000) && mem_migrate(src, 0x4000, f1, NULL) == MEM_BADSTATE);
     CHECK(svc_unmap_memory(dst, src, 0x4000) == 0);
     CHECK(mem_unmap(a, 2 * size) == 0 && mem_unmap(a + 4 * size, 0x1000) == 0);
     munmap(v1, (size_t)size);
@@ -628,13 +903,13 @@ static void test_migrate_placed(void) {
     mem_set_placed(&fake);
     CHECK(mem_map(a, 2 * MIB, MS_NORMAL, PERM_RW) == 0);
     g_fake_held = a; /* the renderer's: it stays */
-    CHECK(!mem_movable(a, MIB) && mem_migrate(a, MIB, f) == MEM_BADSTATE);
+    CHECK(!mem_movable(a, MIB) && mem_migrate(a, MIB, f, NULL) == MEM_BADSTATE);
     g_fake_held = 0;
     CHECK(mem_movable(a, MIB));
     CHECK(mem_unmap(a, 2 * MIB) == 0);
     g_fake_ask = p; /* half a window of physical memory, moved, then the other half committed */
     CHECK(mem_map_physical(p, MIB, 1ull << 30) == 0 && g_fake_asked == 1);
-    CHECK(mem_migrate(p, MIB, f) == 0);
+    CHECK(mem_migrate(p, MIB, f, NULL) == 0);
     CHECK(mem_map_physical(p + MIB, MIB, 1ull << 30) == 0);
     if (g_fake_asked != 1) fprintf(stderr, "placed: the renderer was offered a window with moved pages\n");
     CHECK(g_fake_asked == 1);
@@ -659,22 +934,22 @@ static void test_migrate_owned(void) {
     CHECK(mem_own_prepare(a, size, runs, 4, &n) == 0 && n == 1 && mem_pool_used() == used + size);
     mem_query(a, &b);
     CHECK(b.pool && GP(a)[5] == fill(5));
-    CHECK(mem_movable(a, size) && mem_migrate(a, size, f) == 0);
+    CHECK(mem_movable(a, size) && mem_migrate(a, size, f, NULL) == 0);
     CHECK(mem_pool_used() == used && v[5] == fill(5) && v[size - 1] == fill(size - 1));
     mem_query(a, &b);
     CHECK(!b.pool);
     GP(a)[7] = 0x5A;
     CHECK(v[7] == 0x5A);
-    CHECK(mem_unmigrate(a, size) == 0 && GP(a)[7] == 0x5A);
+    CHECK(mem_unmigrate(a, size, NULL) == 0 && GP(a)[7] == 0x5A);
     /* one pool page among the reservation's own */
     CHECK(mem_own_prepare(a + 0x1000, 0x1000, runs, 4, &n) == 0 && n == 1 && mem_pool_used() == used + 0x1000);
-    CHECK(mem_migrate(a, size, f) == 0 && mem_pool_used() == used);
+    CHECK(mem_migrate(a, size, f, NULL) == 0 && mem_pool_used() == used);
     CHECK(v[7] == 0x5A && v[0x1003] == fill(0x1003) && v[0x2003] == fill(0x2003));
-    CHECK(mem_unmigrate(a, size) == 0);
+    CHECK(mem_unmigrate(a, size, NULL) == 0);
     /* a service's mapping of the pool pages outside the reservation, which a move would leave behind */
     u8* p = mem_pool_host(0x1000, &off);
     CHECK(p && mem_map_pool(a + size, off, 0x1000, MS_SHARED, PERM_RW) == 0);
-    CHECK(!mem_movable(a + size, 0x1000) && mem_migrate(a + size, 0x1000, f) == MEM_BADSTATE);
+    CHECK(!mem_movable(a + size, 0x1000) && mem_migrate(a + size, 0x1000, f, NULL) == MEM_BADSTATE);
     CHECK(mem_unmap_pool(a + size, off, 0x1000, MS_SHARED) == 0);
     mem_pool_host_free(p, off, 0x1000);
     CHECK(mem_unmap(a, size) == 0 && mem_pool_used() == used);
@@ -804,7 +1079,9 @@ int main(int argc, char** argv) {
 #endif
     }
     mem_init();
+    mem_set_code_invalidate(on_invalidate);
     if (copies) {
+        test_process_code_copies();
         test_process_memory_copies();
         test_process_memory_two_views();
         test_process_memory_two_copies_one_line();
@@ -842,6 +1119,7 @@ int main(int argc, char** argv) {
     test_map_memory(info);
     test_code_memory();
     test_code_view();
+    test_process_code();
     test_shared_memory();
     test_pool_full(info);
     test_cycles();

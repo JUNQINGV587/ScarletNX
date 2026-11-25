@@ -27,14 +27,15 @@
    a file of the new key. After an update of the runtime or the driver every pipeline would otherwise be new again,
    made as the game first draws with it, with the frame waiting (a second on NVIDIA for one game's largest)
 
-   The main file packs its records: once those after its last unit reach PF_UNIT_BYTES (pipeline_file.c), they are
-   read back, packed into one zstd frame and written over themselves as a PF_UNIT record. So the file is its units,
-   then the records of the open unit as they were appended, and reading unpacks each unit in its place. A crash while a unit is written
-   over its records loses them, as the unit's check then fails, the way a record cut short ends the reading. The
+   The main file's records are written when the game closes, not as they are made: while it runs they are held in
+   memory (PFile.held), and nothing touches the file. pf_save cuts them into units of PF_UNIT_BYTES, packs each into
+   one zstd frame at zstd's highest level and appends it as a PF_UNIT record. So the file is its units (with the
+   records an older version left unpacked between them), and reading unpacks each unit in its place. A run that
+   crashes keeps nothing of what it made. The
    shipped file's records are read in place, by where each starts (pf_payload), so each shader record is packed alone:
    a PF_ZSHADER keeps its PfShader as it is, for the index its reading makes, and its reads and SPIR-V in one zstd
-   frame, which pf_payload unpacks. Whether a file packs is its pack (compress_shader_cache, compress_prepared_shaders);
-   what is packed already is read either way */
+   frame, which pf_payload unpacks. Whether a file packs is its pack (PF_PACK_UNITS the main file's, PF_PACK_SHADERS by
+   compress_prepared_shaders); what is packed already is read either way */
 #define PF_SHADER  1
 #define PF_PIPE    2
 #define PF_SCAN    3 /* the shipped programs' walk (gpu/shipped_pass.c) read a file, or all of them: two u64s */
@@ -48,6 +49,10 @@
 #define PF_PACK_UNITS   1
 #define PF_PACK_SHADERS 2
 #define PF_MAX          (256u << 20) /* past this size nothing more is appended */
+/* the records a PF_PACK_UNITS file holds in memory at most, past which nothing more is kept until they are saved: this
+   share of the machine's memory (4 GiB of 32, 460 MiB of 3.7), and PF_HELD_UNKNOWN where the system doesn't tell */
+#define PF_HELD_SHARE   8u
+#define PF_HELD_UNKNOWN (256u << 20)
 #define PF_REC          16           /* a record's header: type, payload bytes, check */
 /* a shader record: this, then ncbr constant buffer reads ({idx, off, ok, v}, VkCbRead's words) and nspv SPIR-V
    words. Everything vk_shader_get keys a shader by and checks a found one with */
@@ -100,14 +105,23 @@ typedef struct {
     int kept;        /* pf_open_mapped's file that is there but couldn't be mapped or rewritten: never appended to */
     int pack;        /* how what is appended is packed, set before the file is opened: PF_PACK_UNITS for pf_open's file,
                  PF_PACK_SHADERS for pf_open_mapped's, 0 for none */
-    u64 open;        /* pf_open's file with PF_PACK_UNITS: where the open unit's records start, packed once they reach
-                 PF_UNIT_BYTES. 0 when nothing is packed into units */
+    u64 open;        /* pf_open's file with PF_PACK_UNITS: the bytes of the file itself, which the records held follow
+                 (size is both). 0 for a file whose records are written as they are appended */
+    u8* held;        /* PF_PACK_UNITS: the records appended since the file was opened or last saved, held bytes of
+                 them, for pf_save */
+    u64 held_n, held_cap;
+    u64 held_max;    /* the most of them: pf_open sets it where it is 0 (PF_HELD_SHARE) */
+    int held_full;   /* they reached held_max, or memory ran out: no more are kept until pf_save, said once */
     PFileMap view;   /* pf_open_mapped's: the file as it was mapped, its records read from there */
     /* pf_open's files only: the shader records in it, and each module with a record, its number and check, by open
        addressing on the handle (cap a power of two), for pf_pipe */
     u32 nsh;
     PfMod* map;
     u32 cap, nmap;
+    /* pf_save's, for other threads while it runs (pf_saving, pf_save_stop): the bytes of the records it packs, those
+       packed so far and, once it is done, those written; and a stop asked */
+    _Atomic u64 save_total, save_packed, save_kept;
+    _Atomic int save_stop;
 } PFile;
 /* What reading a file hands back. shader: a record, with its reads and SPIR-V, made into a module; the module's u64
    (its handle's bits), or 0 when it couldn't be made. pipe: a record whose shaders were all made, with their modules'
@@ -132,6 +146,17 @@ typedef struct {
    new file), and each pipeline whose shaders were made to load->pipe. A file of version 2, whose records are those of
    this one unpacked, is rebuilt so too. The counts of shader and pipeline records handed on go in loaded[0] and [1] */
 void pf_open(PFile* pf, const char* path, const char* key, size_t guest, PfLoad* load, u32 loaded[2]);
+/* a PF_PACK_UNITS file's records held in memory written to it, packed into units at zstd's highest level: when the game
+   closes (any thread; records appended meanwhile are held for the next call). The log says the bytes and the time */
+void pf_save(PFile* pf);
+/* the save under way, from any thread: the bytes of the records it packs, those packed so far, and those it wrote once
+   it is done (all of them but after a stop, or a write that failed); 0 of 0 before the first save */
+void pf_saving(PFile* pf, u64* total, u64* packed, u64* kept);
+/* from any thread: the save under way ends after the step of PF_SAVE_STEP bytes each of its threads is packing, the
+   units packed whole up to the first that isn't written and the rest not, which the log says with their bytes; a save
+   after it writes nothing, as the records it holds are numbered after those left out */
+void pf_save_stop(PFile* pf);
+#define PF_SAVE_STEP (128u << 10) /* zstd's largest block */
 /* a shader record for module (made from spv; 0 for none), whose number pf_pipe then refers to; skipped once the file
    is full. With src (its reads src_cbr, its program code, xfb with PF_SRC_XFB), a PF_SOURCE record right before it.
    Where the shader record starts in the file (pf_open_mapped's: pf_open's records move as they are packed), 0 when it
@@ -168,6 +193,14 @@ unsigned pf_pid(void);
    made it finds its cache there, another starts its file over (pf_open). legacy stays where it is. 1 copied (its bytes
    in *bytes), 0 nothing to copy (path there, or no legacy), -1 the copy failed (why) */
 int pf_adopt(const char* path, const char* legacy, u64* bytes, char* why, size_t n);
+/* 1 when commit (snx_build_commit's) names more than one source, so builds under it can differ: a tree with changes
+   ("-dirty"), and a build outside a git checkout ("unknown") */
+int pf_build_unnamed(const char* commit);
+/* the key's words for what snx_build_info leaves out, in out: for a commit that names more than one source, the
+   runtime's own bytes (self, its file mapped; NULL where it can't be read), as exe=<their hash>; and the translator's
+   compile flags, as flags=<their stamp>, where they aren't a normal build's (flags, cmake/shader_flags.cmake: "" for a
+   normal build). "" for a build its commit names whole */
+void pf_build_words(char* out, size_t n, const char* commit, const char* flags, const PFileMap* self);
 /* what differs between a file's key (key, len bytes) and want: "name A in the file, B now" for each, "; " between,
    in out (cut to n), and the count */
 int pf_key_diff(char* out, size_t n, const char* key, size_t len, const char* want);

@@ -3,8 +3,12 @@
 /* The game's menu (runtime/platform/overlay.c): where it goes, its pages, what a tap, a move or a step does, its look;
    and ui.c's atlas and text */
 #include "nx/runtime/platform/overlay.h"
+#include <math.h>
+#include "nx/runtime/platform/hud.h"
 #include "nx/runtime/platform/stats.h"
 #include "nx/runtime/platform/prepare_screen.h"
+#include "nx/runtime/platform/wait_screen.h"
+#include "nx/runtime/platform/ui_colors.h"
 #include "nx/runtime/platform/fatal_screen.h"
 #include "nx/runtime/platform/backend.h"
 #include "nx/runtime/platform/gamepad.h"
@@ -97,6 +101,36 @@ static struct {
     char applied[128]; /* key=value, as the Settings page gave it */
     _Atomic int changes;
 } picks;
+/* unattended.c's, as the Save states page asks for them: the slots' recordings in frames, what runs, the last ask */
+static struct {
+    int frames[10], recording, replaying, asked_record, asked_replay;
+    const char* refuse; /* why the next ask is refused, NULL none */
+} tas = {.asked_record = -1, .asked_replay = -1};
+int unattended_recording(void) { return tas.recording; }
+int unattended_replaying(void) { return tas.replaying; }
+int unattended_slot_frames(int slot, char* why, size_t n) {
+    if (n) why[0] = 0;
+    if (tas.frames[slot] < 0) snprintf(why, n, "slot %d's file is no recording: line 1", slot);
+    return tas.frames[slot];
+}
+int unattended_record_from_menu(int slot, char* why, size_t n) {
+    tas.asked_record = slot;
+    if (tas.refuse) {
+        snprintf(why, n, "%s", tas.refuse);
+        return 0;
+    }
+    tas.recording = slot;
+    return 1;
+}
+int unattended_replay_from_menu(int slot, char* why, size_t n) {
+    tas.asked_replay = slot;
+    if (tas.refuse) {
+        snprintf(why, n, "%s", tas.refuse);
+        return 0;
+    }
+    tas.replaying = slot;
+    return 1;
+}
 int ini_picked(const char* k) { return picks.key && !strcmp(picks.key, k); }
 void ini_unpick(const char* k) {
     snprintf(picks.unpicked, sizeof picks.unpicked, "%s", k);
@@ -158,9 +192,9 @@ static int capture(int ask) {
 }
 static const Renderer renderer = {.capture = capture};
 const Renderer* g_renderer = &renderer;
-const IniOpt g_backend_ini[] = {
-    {"touch", "2", NULL, INI_INT, 0, &touch, 0, 2, NULL, "Touch screen", "Off|Fingers|Fingers and mouse", 0, 0, 0},
-    {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0}};
+const IniOpt g_backend_ini[] = {{"touch", "2", NULL, INI_INT, 0, &touch, 0, 2, NULL, "Touch screen",
+                                 "Off|Fingers|Fingers and mouse", 0, 0, 0, NULL},
+                                {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0, NULL}};
 /* each player's own, two of them here: swap and vibration, every player's until picked, and a map */
 static SnxPlayerConfig players[2];
 static int player_maps_stored;
@@ -170,18 +204,19 @@ void gamepad_store_player_map(int p) {
     ++player_maps_stored;
 }
 const IniOpt g_gamepad_players_ini[] = {{"gamepad_p1_swap_ab", "-1", NULL, INI_INT, 0, &g_settings.player_swap_a_b[0],
-                                         -1, 1, NULL, "Swap A/B", "As All|Off|On", 0, 0, 0},
+                                         -1, 1, NULL, "Swap A/B", "As All|Off|On", 0, 0, 0, NULL},
                                         {"gamepad_p1_rumble", "-10", NULL, INI_INT, 0, &g_settings.player_vibration[0],
-                                         -10, 100, NULL, "Vibration", "As All|Off|#%", 10, 0, 0},
-                                        {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0}};
+                                         -10, 100, NULL, "Vibration", "As All|Off|#%", 10, 0, 0, NULL},
+                                        {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0, NULL}};
 const IniOpt g_gamepad_ini[] = {
-    {"gamepad_swap_ab", "0", NULL, INI_INT, 0, &g_settings.swap_a_b, 0, 1, NULL, "Swap A/B", "Off|On", 0, 0, 0},
+    {"gamepad_swap_ab", "0", NULL, INI_INT, 0, &g_settings.swap_a_b, 0, 1, NULL, "Swap A/B", "Off|On", 0, 0, 0, NULL},
     {"gamepad_deadzone", "20", NULL, INI_INT, 0, &g_settings.stick_dead_zone, 0, 90, NULL, "Stick dead zone", "#%", 5,
-     0, 0},
-    {"gamepad_rumble", "100", NULL, INI_INT, 0, &g_settings.vibration, 0, 100, NULL, "Vibration", "Off|#%", 10, 0, 0},
+     0, 0, NULL},
+    {"gamepad_rumble", "100", NULL, INI_INT, 0, &g_settings.vibration, 0, 100, NULL, "Vibration", "Off|#%", 10, 0, 0,
+     NULL},
     {"gamepad_background", "0", NULL, INI_INT, 0, &g_settings.background_input, 0, 1, NULL, "Background input",
-     "Off|On", 0, 0, 0},
-    {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0}};
+     "Off|On", 0, 0, 0, NULL},
+    {NULL, NULL, NULL, 0, 0, NULL, 0, 0, NULL, NULL, NULL, 0, 0, 0, NULL}};
 static char stored[64], log_[512]; /* the last key kept, and every key=value since log_ was emptied */
 static void store(const char* key, const char* value) {
     size_t n = strlen(log_);
@@ -338,7 +373,7 @@ static int draw_fades(u64 now_ns, SnxUiFade fades[SNX_UI_FADES]) {
 /* the keys page's first screen: a build with the client holds its capture's row, which takes the last one's place */
 #if defined(SNX_TRACY)
 enum { KEYS_TRACY_ROWS = 1 };
-static const char* const KEYS_LAST = "Tracy, 60 s";
+static const char* const KEYS_LAST = "Tracy capture";
 static const char* const KEYS_UNDER = "quit the game"; /* under the fold, as its icon is */
 #else
 enum { KEYS_TRACY_ROWS = 0 };
@@ -1092,6 +1127,186 @@ static void finger_rows(void) {
     assert(!overlay_shown() && s == 2);
 }
 
+/* the turning ring's quads in l (ui_loading_ring's: two circles and UI_RING_BAR_DOTS filled ones), and where the
+   first is centred */
+static int ring_in(const SnxUiList* l, float* cx, float* cy) {
+    int n = 0;
+    for (int i = 0; i < l->n; ++i) {
+        const SnxUiQuadView v = qv(&l->q[i]);
+        if (v.ink != UI_SHAPE || l->q[i].u != UI_SHAPE_CIRCLE) continue;
+        if (!n++) {
+            *cx = v.x + v.w / 2;
+            *cy = v.y + v.h / 2;
+        }
+    }
+    return n;
+}
+/* The screen's ring where the theme puts it, as the launcher's: at the right edge (YoRHa's), left of the title, which
+   then starts three columns on, after the name and its dots' whole width, or none; 7 pixels a scale step in radius,
+   its inner circle's edge 1.5 times the scale rounded up, its bar's dots on that edge, going round with the time and
+   still once every step is done */
+static void prepare_screen_ring(void) {
+    static SnxUiQuad q[4096];
+    SnxUiList l = {q, 0, 4096};
+    SnxPrepareStep st[1] = {{0}};
+    SnxRunTheme t;
+    char row[160];
+    float cx = 0, cy = 0, dx[2][UI_RING_BAR_DOTS];
+    st[0].label = "PREPARING SHADERS";
+    st[0].value = 1;
+    st[0].total = 2;
+    prepare_screen_theme(NULL, &t); /* YoRHa's: its ring at the right */
+    assert(t.ring == SNX_RUN_RING_RIGHT && t.steps);
+    prepare_screen_set(&t, "GAME", st, 1, NULL, 0, "FOOT", 1000);
+    prepare_screen_draw(&l, 1280, 720, NULL, 100); /* 2x */
+    assert(ring_in(&l, &cx, &cy) == 2 + UI_RING_BAR_DOTS && cx == 1280 - 16 * 2 && cy == 32 * 1.5f);
+    for (int i = 0, k = 0; i < l.n; ++i) {
+        const SnxUiQuadView v = qv(&q[i]);
+        if (v.ink != UI_SHAPE || q[i].u != UI_SHAPE_CIRCLE) continue;
+        if (k == 0) assert(v.w == 28 && q[i].vh == 1 && !(q[i].uw & UI_SHAPE_FILLED)); /* 7 x 2, its edge 1 */
+        if (k == 1) { /* its size a place in quarter pixels */
+            assert(fabsf(v.w - 28 * 0.62f) <= 0.25f && q[i].vh == 3 && v.rgba == ui_rgba(UI_RGB(t.soft)));
+        }
+        if (k >= 2) { /* on the inner circle's edge, 1.5 pixels in, in ink */
+            const float ox = v.x + v.w / 2 - cx, oy = v.y + v.h / 2 - cy, r = 28 * 0.62f / 2 - 1.5f;
+            assert((q[i].uw & UI_SHAPE_FILLED) && v.w == 3 && v.rgba == ui_rgba(UI_RGB(t.ink)));
+            assert(fabsf(sqrtf(ox * ox + oy * oy) - r) <= 0.5f);
+            dx[0][k - 2] = v.x;
+        }
+        ++k;
+    }
+    /* 100 ms on: the bar went round 25 degrees */
+    prepare_screen_set(&t, "GAME", st, 1, NULL, 0, "FOOT", 1100);
+    l.n = 0;
+    prepare_screen_draw(&l, 1280, 720, NULL, 100);
+    for (int i = 0, k = 0; i < l.n; ++i)
+        if (qv(&q[i]).ink == UI_SHAPE && q[i].u == UI_SHAPE_CIRCLE && k++ >= 2) dx[1][k - 3] = qv(&q[i]).x;
+    assert(memcmp(dx[0], dx[1], sizeof dx[0]));
+    /* every step done: still, its bar from 3 o'clock whatever the time */
+    st[0].done = 1;
+    st[0].value = 2;
+    prepare_screen_set(&t, "GAME", st, 1, NULL, 0, "FOOT", 1100);
+    l.n = 0;
+    prepare_screen_draw(&l, 1280, 720, NULL, 100);
+    for (int i = 0, k = 0; i < l.n; ++i)
+        if (qv(&q[i]).ink == UI_SHAPE && q[i].u == UI_SHAPE_CIRCLE && k++ == 2)
+            assert(qv(&q[i]).y + qv(&q[i]).h / 2 == cy && qv(&q[i]).x > cx);
+    /* left: the title three columns on, the ring two in */
+    t.ring = SNX_RUN_RING_LEFT;
+    snprintf(t.title, sizeof t.title, "%s", "BOOTING");
+    prepare_screen_set(&t, "GAME", st, 1, NULL, 0, "FOOT", 1000);
+    l.n = 0;
+    prepare_screen_draw(&l, 1280, 720, NULL, 100);
+    assert(ring_in(&l, &cx, &cy) == 2 + UI_RING_BAR_DOTS && cx == 16 * 2);
+    prepare_row(&l, 32.0f, 2, row, sizeof row);
+    assert(!strcmp(row, "    BOOTING GAME..."));
+    /* after the name: its dots' columns and one more, then the ring's radius */
+    t.ring = SNX_RUN_RING_NEAR_TEXT;
+    prepare_screen_set(&t, "GAME", st, 1, NULL, 0, "FOOT", 1000);
+    l.n = 0;
+    prepare_screen_draw(&l, 1280, 720, NULL, 100);
+    assert(ring_in(&l, &cx, &cy) == 2 + UI_RING_BAR_DOTS && cx == 16 * (1 + 8 + 4 + 4) + 14);
+    /* at 1x (the launcher's UI scale 1): the inner circle's edge and the bar's dots 2 pixels, the 1.5 rounded up as the
+       launcher's lines take it, the outer edge 1 */
+    t.ring = SNX_RUN_RING_RIGHT;
+    t.text_size = 1;
+    prepare_screen_set(&t, "GAME", st, 1, NULL, 0, "FOOT", 1000);
+    l.n = 0;
+    prepare_screen_draw(&l, 1280, 720, NULL, 100);
+    for (int i = 0, k = 0; i < l.n; ++i) {
+        if (qv(&q[i]).ink != UI_SHAPE || q[i].u != UI_SHAPE_CIRCLE) continue;
+        assert(k == 0 ? q[i].vh == 1 && qv(&q[i]).w == 14 : k == 1 ? q[i].vh == 2 : qv(&q[i]).w == 2);
+        ++k;
+    }
+    t.text_size = 0;
+    t.ring = SNX_RUN_RING_NONE;
+    prepare_screen_set(&t, "GAME", st, 1, NULL, 0, "FOOT", 1000);
+    l.n = 0;
+    prepare_screen_draw(&l, 1280, 720, NULL, 100);
+    assert(ring_in(&l, &cx, &cy) == 0);
+    prepare_screen_set(NULL, NULL, NULL, 0, NULL, 0, NULL, 0);
+}
+/* The game closing's screen (main.c's save at exit) as the screen before the game draws it: its row says the MiB
+   packed of the save's and the seconds since it began, its progress as the theme says it (the MiB for an amount), and
+   the bar the share packed */
+static void closing_screen(void) {
+    static SnxUiQuad q[4096];
+    SnxUiList l = {q, 0, 4096};
+    SnxClosing w = {.began_ms = 10000};
+    SnxPrepareStep st;
+    SnxRunTheme t;
+    char row[160];
+    const u64 total = 166408602, packed = 100663296; /* 158.7 and 96.0 MiB */
+    prepare_screen_theme(NULL, &t);
+    snprintf(t.title, sizeof t.title, "%s", "CLOSING");
+    snx_closing_step(&w, total, packed, &st);
+    prepare_screen_set(&t, "GAME", &st, 1, NULL, 0, "FOOT", 14200);
+    prepare_screen_draw(&l, 1280, 720, NULL, 100);
+    prepare_row(&l, 32.0f, 2, row, sizeof row);
+    assert(!strcmp(row, " CLOSING GAME...")); /* 14200 ms: three dots */
+    prepare_row(&l, 32.0f * 3, 2, row, sizeof row);
+    assert(!strcmp(row, " SAVING SHADERS: 96.0 OF 158.7 MIB 60%..."));
+    prepare_row(&l, 32.0f * 19, 2, row, sizeof row);
+    assert(strstr(row, " 60%"));
+    t.steps = 0;
+    t.progress = SNX_RUN_PROGRESS_AMOUNT;
+    prepare_screen_set(&t, "GAME", &st, 1, NULL, 0, "FOOT", 14200);
+    l.n = 0;
+    prepare_screen_draw(&l, 1280, 720, NULL, 100);
+    prepare_row(&l, 32.0f * 3, 2, row, sizeof row);
+    assert(!strcmp(row, " SAVING SHADERS 96.0 of 158.7 MiB: 96.0 / 158.7 MiB"));
+    prepare_screen_set(NULL, NULL, NULL, 0, NULL, 0, NULL, 0);
+}
+/* A save state's box (overlay_loading): nothing before it; then the whole picture shaded black, its alpha coming in
+   from 0 to the launcher's 128 over OVERLAY_LOADING_FADE_MS, the first faded span; over it the box with the save
+   states' head, its words and the slot's, and the ring at their right. It stays as the load ends well until the game's
+   first frame after that, and goes at once when the load fails */
+static void loading_box(void) {
+    SnxUiFade fades[SNX_UI_FADES];
+    const u64 t0 = 5000000000ull;
+    float x, y, cx = 0, cy = 0;
+    int n;
+    assert(!overlay_loading_shown());
+    n = draw_fades(t0, fades);
+    assert(n == 0 && !shows("Loading the save state"));
+    overlay_loading("Slot 2", t0);
+    assert(overlay_loading_shown());
+    n = draw_fades(t0, fades);
+    {
+        const SnxUiQuadView shade = qv(&list.q[fades[0].first]);
+        assert(n == 1 && fades[0].end == fades[0].first + 1 && fades[0].alpha == 0);
+        assert(shade.x == 0 && shade.y == 0 && shade.w == SW && shade.h == SH && (shade.rgba & 0xFFFFFFu) == 0);
+    }
+    n = draw_fades(t0 + 75000000ull, fades);
+    assert(n == 1 && fades[0].alpha == 64);
+    n = draw_fades(t0 + 900000000ull, fades);
+    assert(n == 1 && fades[0].alpha == 128);
+    assert(shows("SCARLETNX  /  SAVE STATES") && shows("Loading the save state") && shows("Slot 2"));
+    assert(text_xy("Loading the save state", &x, &y));
+    {
+        SnxUiList shown = list;
+        int s, px, py;
+        overlay_place(SW, SH, &px, &py, &s);
+        assert(ring_in(&shown, &cx, &cy) == 2 + UI_RING_BAR_DOTS);
+        assert(cy == y + 16.0f * (float)s && cx > x + 8.0f * (float)s * (float)strlen("Loading the save state"));
+    }
+    overlay_game_drew(); /* the game's frames while it loads leave it */
+    assert(overlay_loading_shown());
+    overlay_loading_done();
+    assert(overlay_loading_shown());
+    overlay_game_drew();
+    assert(!overlay_loading_shown());
+    n = draw_fades(t0 + 900000000ull, fades);
+    assert(n == 0 && !shows("Loading the save state"));
+    /* a load that failed: gone at once */
+    overlay_loading("The auto slot", t0);
+    draw_fades(t0, fades);
+    assert(shows("The auto slot"));
+    overlay_loading_end();
+    assert(!overlay_loading_shown());
+    n = draw_fades(t0 + 900000000ull, fades);
+    assert(n == 0 && !shows("The auto slot"));
+}
 int main(void) {
     const u32 ink = 0xFF3A4145u;
     int x, y, sc;
@@ -1103,6 +1318,9 @@ int main(void) {
     prepare_screen_steps_from();
     prepare_screen_cut();
     prepare_screen_switching();
+    prepare_screen_ring();
+    closing_screen();
+    loading_box();
     assert(!overlay_shown());
     overlay_toggle();
     assert(overlay_shown());
@@ -1293,6 +1511,15 @@ int main(void) {
         overlay_move(1); /* Eden room: a text with no words */
         picks.applied[0] = 0;
         assert(overlay_select() == OVERLAY_NONE && overlay_side(1) == OVERLAY_NONE && !picks.applied[0]);
+        assert(overlay_back() == OVERLAY_NONE);
+        overlay_move(
+            1); /* Debug's first, a row of boxes (a set of items): the menu reads its value, the launcher sets it */
+        g_settings.fsr_input_conventions = 9;
+        assert(overlay_select() == OVERLAY_NONE);
+        draw();
+        assert(text_at(1, 3, "\xFE FSR input conventions") && shows("9") && !shows("< 9 >") && !shows("< 9 * >"));
+        assert(overlay_select() == OVERLAY_NONE && overlay_side(1) == OVERLAY_NONE && !picks.applied[0]);
+        g_settings.fsr_input_conventions = 0;
         assert(overlay_back() == OVERLAY_NONE && overlay_back() == OVERLAY_NONE);
         draw();
         assert(text_at(1, 0, "SCARLETNX  /  MENU") && overlay_select() == OVERLAY_NONE); /* on Settings again */
@@ -1650,7 +1877,8 @@ int main(void) {
     assert(tap(1, 3) == OVERLAY_NONE);
     draw();
     assert(text_at(1, 0, "SCARLETNX  /  CONTROLLERS") && text_at(1, 1, "None connected."));
-    assert(qv(&list.q[0]).h == 11 * 32 && text_at(1, 3, "\xFE Player") && shows("< All >"));
+    assert(qv(&list.q[0]).h == 12 * 32 && text_at(1, 3, "\xFE Player") && shows("< All >"));
+    assert(text_at(1, 9, "\xFE Assign players") && tap(6, 3) == OVERLAY_CONTROLLERS); /* the controller applet's dialog */
     assert(text_at(1, 4, "\xFE Swap A/B") && text_at(C - 4, 4, "Off"));
     tap(1, 3);
     assert(g_settings.swap_a_b && pad_stored == &g_settings.swap_a_b);
@@ -1695,9 +1923,9 @@ int main(void) {
     pad_names[0] = pad_names[2];
     draw();
     assert(text_at(1, 1, "A controller with a very lo and 2 more"));
-    /* Button map: NieR's CONTROLS over the picture, no presets, the first control focused; its button changed (the map
-       the player's from then on), a press on the pad while waiting swapping two, that press no menu key; Back goes up
-       to its item */
+    /* Button map: the CONTROLS page over the picture, no presets, the first control focused; its button changed (the
+       map the player's from then on), a press on the pad while waiting swapping two, that press no menu key; Back goes
+       up to its item */
     pad_names[0] = "Xbox Wireless Controller";
     pad_names[1] = pad_names[2] = NULL;
     pad_of_player[0] = 0;
@@ -1779,7 +2007,7 @@ int main(void) {
     draw();
     assert(shows("< All >"));
     /* Back, on its item or the key, comes up to the controllers' item */
-    assert(tap(6, 3) == OVERLAY_NONE);
+    assert(tap(7, 3) == OVERLAY_NONE);
     draw();
     assert(text_at(1, 0, "SCARLETNX  /  MENU") && overlay_select() == OVERLAY_NONE);
     draw();
@@ -1854,6 +2082,78 @@ int main(void) {
         assert(overlay_back() == OVERLAY_NONE && overlay_back() == OVERLAY_NONE && !overlay_states_shown());
         draw();
         assert(shows("SCARLETNX  /  MENU"));
+    }
+    /* the page's rows after the slots: player 1's input recorded and played. The arrows choose a slot, round, and
+       nothing is asked of the recorder before Enter; a slot that has a recording is asked over first, and what is
+       refused is said */
+    {
+        OverlaySlot sl[3];
+        memset(sl, 0, sizeof sl);
+        tas.frames[2] = 60;
+        tas.frames[4] = -1;
+        assert(overlay_select() == OVERLAY_NONE && overlay_states_shown());
+        overlay_slots_set(sl, 3);
+        overlay_move(3); /* Record input */
+        draw();
+        assert(shows("SCARLETNX  /  SAVE STATES") && shows("\xFE Record input") && shows("\xFE Play input") &&
+               shows("Left and Right choose a slot, Enter takes it."));
+        assert(text_at(3, 0, "") || 1);
+        assert(tas.asked_record == -1);
+        overlay_side(1); /* slot 1, free: nothing asked of the recorder yet */
+        draw();
+        assert(shows("Slot 1") && tas.asked_record == -1);
+        overlay_side(1);
+        draw();
+        assert(shows("Slot 2, over its recording") && tas.asked_record == -1);
+        assert(overlay_select() == OVERLAY_NONE); /* it has one: asked, Cancel in focus */
+        draw();
+        assert(shows("SCARLETNX  /  RECORD OVER SLOT 2?") && shows("Its recording, 60 frames, is replaced.") &&
+               shows_as("\xFE Record", 0, FAILURE) && tas.asked_record == -1);
+        assert(overlay_select() == OVERLAY_NONE); /* Cancel */
+        draw();
+        assert(shows("SCARLETNX  /  SAVE STATES") && tas.asked_record == -1 && shows("Off"));
+        overlay_side(1);
+        overlay_side(1);
+        assert(overlay_select() == OVERLAY_NONE);
+        overlay_move(-1);
+        assert(overlay_select() == OVERLAY_NONE && tas.asked_record == 2 && tas.recording == 2);
+        draw();
+        assert(shows("SCARLETNX  /  SAVE STATES") && shows("Slot 2, recording"));
+        assert(overlay_select() == OVERLAY_NONE && tas.asked_record == 0 && !tas.recording); /* Enter again ends it */
+        /* a free slot is recorded at once, and one that is no recording asks */
+        overlay_side(1);
+        assert(overlay_select() == OVERLAY_NONE && tas.recording == 1 && tas.asked_record == 1);
+        tas.recording = 0;
+        overlay_side(1); /* the rows' choices are as the page opened: this one's slot 1 is chosen already */
+        /* Play input: only the slots with a recording, round through none */
+        overlay_move(1);
+        overlay_side(1);
+        draw();
+        assert(shows("Slot 2") && tas.asked_replay == -1);
+        overlay_side(1);
+        draw();
+        assert(shows("Off"));
+        overlay_side(-1);
+        draw();
+        assert(shows("Slot 2"));
+        tas.refuse = "Slot 2's recording ends at frame 59: the game is at frame 90";
+        assert(overlay_select() == OVERLAY_NONE && tas.asked_replay == 2 && !tas.replaying);
+        draw();
+        assert(shows("Slot 2's recording ends at frame 59: the game is at frame 90"));
+        tas.refuse = NULL;
+        overlay_side(1);
+        overlay_side(1);
+        overlay_side(-1);
+        assert(overlay_select() == OVERLAY_NONE && tas.replaying == 2);
+        draw();
+        assert(shows("Slot 2, playing"));
+        overlay_move(1); /* Back */
+        assert(overlay_select() == OVERLAY_NONE && !overlay_states_shown());
+        draw();
+        assert(shows("SCARLETNX  /  MENU"));
+        toasts_gone();
+        memset(&tas, 0, sizeof tas);
+        tas.asked_record = tas.asked_replay = -1;
     }
     /* a notification over the game, closed or open, until its time is up */
     toasts_gone();
@@ -1965,6 +2265,51 @@ int main(void) {
         g_settings.stats = 0;
         draw();
         assert(qv(&list.q[0]).x == cw && qv(&list.q[0]).y == ch);
+    }
+    /* the Debug list, under the stats' box in its column: the band goes under it, half a line apart, and back under the
+       stats' box once the list is empty; with no stats' box the list is at the top's middle, where a short band does not
+       reach it and a long one goes under it; in the top right corner, under the list where that is, when there is no room
+       under it */
+    {
+        static const int all[4] = {0, 0, SW, SH}, narrow[4] = {0, 0, 900, SH};
+        static SnxUiQuad kept[1024], under[1024];
+        SnxUiList box_quads = {kept, 0, 1024}, list_quads = {under, 0, 1024};
+        const IniOpt* corner = ini_find(g_display_ini, "stats_corner");
+        float box[4], debug[4], cw = (float)(8 * stats_scale(s)), ch = (float)(16 * stats_scale(s));
+        int h, short_x, short_y, short_s;
+        assert(!hud_box_drawn(debug));
+        g_settings.stats = 1;
+        stats_corner_set(corner, "tl");
+        stats_draw(&box_quads, all, s, 1000);
+        assert(stats_box_drawn(box));
+        hud_debug_set("log=2, vk_validation=1");
+        hud_draw(&list_quads, all, stats_scale(s), box, 0);
+        assert(hud_box_drawn(debug) && debug[0] == box[0] && debug[1] == box[1] + box[3] + ch / 2);
+        draw();
+        assert(qv(&list.q[0]).x == box[0] && qv(&list.q[0]).y == debug[1] + debug[3] + ch / 2);
+        h = (int)(debug[1] + debug[3]) + 4; /* a picture that ends four pixels under the list */
+        overlay_place(SW, h, &short_x, &short_y, &short_s);
+        list.n = 0;
+        overlay_draw(&list, SW, h, 0);
+        assert(qv(&list.q[list.n - 1]).x + qv(&list.q[list.n - 1]).w == (float)(SW - 8 * stats_scale(short_s)));
+        hud_debug_set("");
+        draw();
+        assert(qv(&list.q[0]).y == box[1] + box[3] + ch / 2);
+        g_settings.stats = 0;
+        hud_debug_set("log=2, vk_validation=1");
+        list_quads.n = 0;
+        hud_draw(&list_quads, all, stats_scale(s), NULL, 0);
+        assert(hud_box_drawn(debug) && debug[0] > cw + 15 * cw);
+        draw();
+        assert(qv(&list.q[0]).x == cw && qv(&list.q[0]).y == ch);
+        list_quads.n = 0;
+        hud_draw(&list_quads, narrow, stats_scale(s), NULL, 0);
+        assert(hud_box_drawn(debug) && debug[0] < 40 * cw);
+        overlay_toast(GUI_ICON_FIRST, "a notification whose words reach the list in the middle", 1000);
+        draw();
+        assert(qv(&list.q[0]).x == cw && qv(&list.q[0]).y == debug[1] + debug[3] + ch / 2);
+        overlay_toast(GUI_ICON_FIRST, "", 1000);
+        hud_debug_set("");
     }
     toasts_gone();
     /* a notice from any thread (RenderDoc's): the notification once the next frame draws it, the last given before
@@ -2133,6 +2478,84 @@ int main(void) {
         toasts_gone();
         assert(!overlay_toasting(0));
     }
+    /* the settings off their default that change how fast the game runs (options_perf_notice): nothing before the
+       game's first frame, then the game's keys after a gamepad, the launcher's after a globe and this kind of game's
+       values after an info mark, a line each, for SNX_OVERLAY_SETTINGS_MS from that frame; given once, and none for no
+       key. The kind's alone is a notice too */
+    {
+        const u64 ms = 1000000ull, t0 = 9000 * ms;
+        SnxUiFade fades[SNX_UI_FADES];
+        float x, y;
+        overlay_settings_notice("", "", "");
+        assert(!overlay_settings_waiting());
+        overlay_settings_notice("", "", "emulated_cores Off");
+        assert(overlay_settings_waiting());
+        overlay_settings_notice("fps_limit, jit_opt", "opt, llvm_batch", "emulated_cores Off");
+        assert(overlay_settings_waiting());
+        draw_fades(t0, fades);
+        assert(!list.n && !overlay_toasting(t0)); /* no frame of the game's yet */
+        overlay_settings_start(t0);
+        assert(!overlay_settings_waiting());
+        draw_fades(t0 + 1000 * ms, fades);
+        assert(text_xy("fps_limit, jit_opt", &x, &y) && y == 16.0f * (float)stats_scale(s) &&
+               toast_icon("fps_limit, jit_opt") == GUI_ICON_GAMEPAD_2);
+        assert(text_xy("opt, llvm_batch", &x, &y) && y == 32.0f * (float)stats_scale(s) &&
+               toast_icon("opt, llvm_batch") == GUI_ICON_GLOBE);
+        assert(text_xy("emulated_cores Off, for this kind of game", &x, &y) && y == 48.0f * (float)stats_scale(s) &&
+               toast_icon("emulated_cores Off, for this kind of game") == GUI_ICON_INFO);
+        assert(overlay_toasting(t0 + (u64)SNX_OVERLAY_SETTINGS_MS * ms - 1) &&
+               !overlay_toasting(t0 + (u64)SNX_OVERLAY_SETTINGS_MS * ms) && SNX_OVERLAY_SETTINGS_MS == 30000);
+        overlay_settings_start(t0 + 2000 * ms); /* taken already: nothing again */
+        draw_fades(t0 + (u64)SNX_OVERLAY_SETTINGS_MS * ms, fades);
+        assert(!list.n);
+        toasts_gone();
+    }
+    /* its lines: as many keys a line as fit it, the game's first, then the launcher's, then this kind of game's, one
+       kept for each list after while it has keys, OVERLAY_SETTINGS_LINES in all; keys past a list's last line end it
+       with how many more there are, as many of its own keys left out as that takes; a key longer than a line cut there.
+       The kind's last line ends with what its keys are, its keys narrowed to leave room for those words */
+    {
+        unsigned icon[OVERLAY_SETTINGS_LINES];
+        char text[OVERLAY_SETTINGS_LINES][OVERLAY_COLS_MAX + 1];
+        assert(OVERLAY_SETTINGS_LINES == 3);
+        assert(overlay_settings_lines("", "", "", 72, icon, text) == 0);
+        assert(overlay_settings_lines("a, b", "", "", 72, icon, text) == 1 && !strcmp(text[0], "a, b") &&
+               icon[0] == GUI_ICON_GAMEPAD_2);
+        assert(overlay_settings_lines("", "opt", "", 72, icon, text) == 1 && !strcmp(text[0], "opt") &&
+               icon[0] == GUI_ICON_GLOBE);
+        assert(overlay_settings_lines("alpha, beta, gamma", "", "", 12, icon, text) == 2 &&
+               !strcmp(text[0], "alpha, beta") && !strcmp(text[1], "gamma") && icon[1] == GUI_ICON_GAMEPAD_2);
+        assert(overlay_settings_lines("alpha, beta, gamma, delta, epsilon", "opt", "", 12, icon, text) == 3);
+        assert(!strcmp(text[0], "alpha, beta") && !strcmp(text[1], "+3 more") && icon[1] == GUI_ICON_GAMEPAD_2);
+        assert(!strcmp(text[2], "opt") && icon[2] == GUI_ICON_GLOBE);
+        assert(overlay_settings_lines("alpha, beta, gamma, delta, epsilon", "", "", 16, icon, text) == 3);
+        assert(!strcmp(text[0], "alpha, beta") && !strcmp(text[1], "gamma, delta") &&
+               !strcmp(text[2], "epsilon")); /* three lines of its own: all of them */
+        assert(overlay_settings_lines("a, b, c, d, e, f, g, h, i, j", "", "", 7, icon, text) == 3);
+        assert(!strcmp(text[0], "a, b, c") && !strcmp(text[1], "d, e, f") && !strcmp(text[2], "+4 more"));
+        assert(overlay_settings_lines("vk_ext_vertex_input_dynamic_state", "", "", 12, icon, text) == 1 &&
+               !strcmp(text[0], "vk_ext_verte"));
+        assert(overlay_settings_lines("x", "a, b, c, d, e, f, g", "", 7, icon, text) == 3 && !strcmp(text[0], "x") &&
+               !strcmp(text[1], "a, b, c") && !strcmp(text[2], "+4 more") && icon[2] == GUI_ICON_GLOBE);
+        /* the kind's alone: its line, after an info mark */
+        assert(overlay_settings_lines("", "", "emulated_cores Off", 72, icon, text) == 1 &&
+               !strcmp(text[0], "emulated_cores Off, for this kind of game") && icon[0] == GUI_ICON_INFO);
+        /* all three: a line each, the game's narrowed to one, the kind's last */
+        assert(overlay_settings_lines("alpha, beta, gamma, delta", "opt", "emulated_cores Off", 12, icon, text) == 3);
+        assert(!strcmp(text[0], "+4 more") && icon[0] == GUI_ICON_GAMEPAD_2);
+        assert(!strcmp(text[1], "opt") && icon[1] == GUI_ICON_GLOBE);
+        assert(!strcmp(text[2], "emulated_cor") && icon[2] == GUI_ICON_INFO); /* narrower than its words: cut */
+        assert(overlay_settings_lines("alpha, beta, gamma, delta", "opt", "a Off, b On", 72, icon, text) == 3);
+        assert(!strcmp(text[0], "alpha, beta, gamma, delta") && !strcmp(text[2], "a Off, b On, for this kind of game"));
+        /* the kind's keys narrowed for its words: on the lines it has, the words after the last; past its one line,
+           how many more, then the words */
+        assert(overlay_settings_lines("", "", "alpha On, beta Off, gamma On", 40, icon, text) == 3 &&
+               !strcmp(text[0], "alpha On") && !strcmp(text[1], "beta Off") &&
+               !strcmp(text[2], "gamma On, for this kind of game") && icon[2] == GUI_ICON_INFO);
+        assert(overlay_settings_lines("a", "b", "alpha On, beta Off, gamma On", 40, icon, text) == 3 &&
+               !strcmp(text[2], "alpha On, +2 more, for this kind of game"));
+    }
+
     /* the caches of earlier runs found empty as the game starts: the shaders' words, else the textures'; none for
        neither, nor while the shader cache is still read (-1), which then says nothing to keep; said once a run, as
        the next frame's notification */
@@ -2195,7 +2618,7 @@ int main(void) {
         float top, row_h;
         int total, i, close_band = -1, share_band = -1;
         unsigned plain, focused;
-        SnxOverlayError panel = panel_of("ENDER MAGNOLIA", "vulkan: the GPU device was lost (driver reset or crash)",
+        SnxOverlayError panel = panel_of("FIXTURE TITLES", "vulkan: the GPU device was lost (driver reset or crash)",
                                          "Share Log sends the game's log, which has what ran last.", NULL, NULL);
         list.n = 0;
         overlay_error_draw(&list, SW, SH, &panel);
@@ -2208,7 +2631,7 @@ int main(void) {
                qv(&list.q[0]).rgba >> 24 == 0xFFu);
         assert(top >= 0 && top + qv(&list.q[0]).h <= (float)SH && qv(&list.q[1]).y == top && qv(&list.q[1]).h == row_h);
         py = (int)top;
-        assert(text_at(1, 0, "SCARLETNX  /  STOPPED") && text_at(1, 1, "ENDER MAGNOLIA"));
+        assert(text_at(1, 0, "SCARLETNX  /  STOPPED") && text_at(1, 1, "FIXTURE TITLES"));
         assert(
             text_at(1, 3, "vulkan: the GPU device was lost (driver reset or crash)")); /* one row, as wide as it is */
         i = glyph_at(1, 3, 'v');

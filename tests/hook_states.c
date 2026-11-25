@@ -9,6 +9,7 @@
 #include "nx/hle/hook/hook.c"
 #include "nx/hle/hook/family.c"
 #include <assert.h>
+#include <stdarg.h>
 #include <stdio.h>
 
 #define CODE 0x1000u
@@ -85,10 +86,16 @@ GuestFn hook_ext_skyline(const char* symbol, u32 sdk, const char** handler) {
     return (void)symbol, (void)sdk, (void)handler, NULL;
 }
 void fatal(const char* fmt, ...) {
-    fprintf(stderr, "fatal: %s\n", fmt);
+    va_list ap;
+    va_start(ap, fmt);
+    fputs("fatal: ", stderr);
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
     exit(1);
 }
 int alloc_ready(void) { return 0; }
+const char* alloc_kept(void) { return NULL; }
 int libc_wide_ready(void) { return 0; }
 static int g_os_ready = 1;
 int os_sync_ready(void) { return g_os_ready; }
@@ -134,6 +141,22 @@ int main(void) {
     /* hooks_off names the family: the same */
     assert(install(1, "cond_var") == 0);
     assert(hook_states_refused(why, sizeof why) == 0);
+    /* what a stop says of the settings that turn a family off: nothing while its hooks run; the setting, its value and
+       the family when hooks_off names it, and nothing of a family it does not name; hooks=0 over both */
+    install(1, "");
+    hook_off_text(why, sizeof why, "cond_var");
+    assert(!*why);
+    install(1, "libc,cond_var");
+    hook_off_text(why, sizeof why, "cond_var");
+    assert(strstr(why, "hooks_off=libc,cond_var (its default is \"\") names the cond_var family"));
+    hook_off_text(why, sizeof why, "nn_pctl");
+    assert(!*why);
+    g_settings.native_hooks = 0;
+    hook_off_text(why, sizeof why, "nn_pctl");
+    assert(!strncmp(why, "hooks=0 (its default is 1) runs every SDK function's own code", 60));
+    hook_off_text(why, 12, "nn_pctl"); /* cut to the buffer */
+    assert(!strcmp(why, "hooks=0 (it"));
+    g_settings.native_hooks = 1;
     /* a 32-bit game runs none of the family */
     g_arm_mod = (const SnxArmModule*)&module;
     assert(!strcmp(hook_family_unready("cond_var"), "its handlers are for 64-bit games"));

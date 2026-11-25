@@ -19,23 +19,30 @@
    published, so the batches after it don't compile it again */
 #include "common/cpu/recompiler/llvm/jit_service.h"
 #include "common/cpu/recompiler/llvm/jit_cache.h"
+#include "nx/runtime/ini.h"
+#include "snx_settings.h"
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <stdatomic.h>
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <sched.h>
-#endif
 #ifdef __linux__
 #include <errno.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+
+/* the set functions of the performance table, whose jit_threads is read here (options.c's): none runs for that key */
+void options_fps_set(const IniOpt* o, const char* v) {
+    (void)o;
+    (void)v;
+}
+void options_heap_max_set(const IniOpt* o, const char* v) {
+    (void)o;
+    (void)v;
+}
 
 #define MEMORY     0x40000
 #define CODE_LO    0x1000
@@ -63,6 +70,67 @@ static RtAPI rt = {.cas128 = snx_runtime_cas128};
 static _Atomic unsigned misses, wrapped;
 /* the batches the report saw, and the first after which 0x3800 had code */
 static _Atomic unsigned batch_count, live_batch;
+/* the compile threads wait in their batch's report while held.on, the miss thread never: what the test does
+   meanwhile comes before their next batch, however long the host stops the test's thread */
+static _Thread_local int miss_thread;
+static void thread_role(const SnxJitThread* t) { miss_thread = t->misses; }
+static struct {
+    pthread_mutex_t lock;
+    pthread_cond_t over;
+    int on;
+} held = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0};
+static void hold(int on) {
+    pthread_mutex_lock(&held.lock);
+    held.on = on;
+    if (!on) pthread_cond_broadcast(&held.over);
+    pthread_mutex_unlock(&held.lock);
+}
+static void hold_wait(void) {
+    pthread_mutex_lock(&held.lock);
+    while (held.on) pthread_cond_wait(&held.over, &held.lock);
+    pthread_mutex_unlock(&held.lock);
+}
+
+/* the batch of in_flight.pc waits as it begins, having taken its epoch, until in_flight_release: a change of memory made
+   between the two is one the batch must see. Then its report says how it ended */
+static struct {
+    pthread_mutex_t lock;
+    pthread_cond_t moved;
+    u64 pc; /* the batch's first pc, 0: none waits */
+    int begun, released, ended, dropped;
+} in_flight = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, 0, 0, 0, 0, 0};
+static void batch_begins(SnxU64 pc) {
+    pthread_mutex_lock(&in_flight.lock);
+    if (pc == in_flight.pc) {
+        in_flight.pc = 0;
+        in_flight.begun = 1;
+        pthread_cond_broadcast(&in_flight.moved);
+        while (!in_flight.released) pthread_cond_wait(&in_flight.moved, &in_flight.lock);
+    }
+    pthread_mutex_unlock(&in_flight.lock);
+}
+static void in_flight_hold(u64 pc) {
+    pthread_mutex_lock(&in_flight.lock);
+    in_flight.pc = pc;
+    in_flight.begun = in_flight.released = in_flight.ended = in_flight.dropped = 0;
+    pthread_mutex_unlock(&in_flight.lock);
+}
+/* whether *flag is set, within a minute */
+static int in_flight_wait(const int* flag) {
+    struct timespec until = {time(NULL) + 60, 0};
+    pthread_mutex_lock(&in_flight.lock);
+    while (!*flag && pthread_cond_timedwait(&in_flight.moved, &in_flight.lock, &until) == 0) {}
+    int set = *flag;
+    pthread_mutex_unlock(&in_flight.lock);
+    return set;
+}
+static void in_flight_release(void) {
+    pthread_mutex_lock(&in_flight.lock);
+    in_flight.pc = 0;
+    in_flight.released = 1;
+    pthread_cond_broadcast(&in_flight.moved);
+    pthread_mutex_unlock(&in_flight.lock);
+}
 
 /* the guest's code is little-endian whatever the host's byte order */
 static void put(u64 address, const u32* words, size_t count) {
@@ -128,6 +196,16 @@ static void report(const SnxJitReport* r) {
         fprintf(stderr, "jit: %llx: %s\n", (unsigned long long)r->pc, r->error);
         atomic_fetch_add_explicit(&failures, 1, memory_order_relaxed);
     }
+    if (miss_thread) return;
+    /* the one compile thread reports a batch before it begins the next: this is the held one's */
+    pthread_mutex_lock(&in_flight.lock);
+    if (in_flight.begun && !in_flight.ended) {
+        in_flight.ended = 1;
+        in_flight.dropped = r->dropped;
+        pthread_cond_broadcast(&in_flight.moved);
+    }
+    pthread_mutex_unlock(&in_flight.lock);
+    hold_wait();
 }
 
 /* the function at 0x3400 behind a wrapper put into an empty slot: its original is the miss */
@@ -183,7 +261,9 @@ static SnxJitService* start(size_t batch, unsigned threads) {
     config.region_instructions = region_limit;
     config.budget = discovery_budget;
     config.threads = threads;
+    config.begin = batch_begins;
     config.report = report;
+    config.thread = thread_role;
     config.cache_path = cache_path;
     atomic_store_explicit(&batch_count, 0, memory_order_relaxed);
     atomic_store_explicit(&live_batch, ~0u, memory_order_relaxed);
@@ -733,58 +813,50 @@ static void test_invalidated_callee(void) {
 /* an invalidation of another range while a pc compiles: the batch read code that may be stale, so it publishes nothing
    and its pcs go back to their queue. Before, they were left GONE with their pending bit set, which snx_jit_resolve's
    fast path reads as "queued, wait for it": nothing queued them again, and the pc was never compiled (rt_miss's fatal,
-   DQ7 at 98f1fc4). Each round invalidates elsewhere until its batch ends, so the batch reads the epoch before one of
-   them and is dropped, unless it was quicker than the first; a run where none was dropped proves nothing and fails.
-   The function is long so its batch outlasts a scheduler slice: on one CPU (a loaded runner, taskset -c 0) the woken
-   compile thread ran a short batch to its end before this thread ran again, and no round dropped one */
-#define IN_FLIGHT_PC   0x10000
-#define IN_FLIGHT_ADDS 4000
-/* a spin of a round: an invalidation elsewhere and the stats, then the processor to the others. A lock taken again at
-   once by the thread that let it go (Windows' SRW lock is not fair) leaves the compile thread waiting for it, its
-   batch never begun */
-static void in_flight_spin(SnxJitStats* stats) {
+   a game's at 98f1fc4). Each batch is held from its epoch until the invalidation: without that the batch may end
+   before it however long the function is, when the host runs that thread first */
+#define IN_FLIGHT_PC 0x10000
+/* whether the batch queued for pc, held as it begins while memory elsewhere changes, is dropped, with nothing published
+   by its end (its thread is held in its report) */
+static int dropped_in_flight(u64 pc) {
+    int dropped = in_flight_wait(&in_flight.begun);
     snx_jit_invalidate(service, 0x8000, 0x10);
-    snx_jit_stats(service, stats);
-#ifdef _WIN32
-    SwitchToThread();
-#else
-    sched_yield();
-#endif
+    hold(1);
+    in_flight_release();
+    dropped = dropped && in_flight_wait(&in_flight.ended) && in_flight.dropped && get(pc) == NULL;
+    hold(0);
+    return dropped;
 }
 static void test_invalidate_in_flight(void) {
     static const u32 words[] = {0x91000400, 0xD65F03C0}; /* add x0, x0, #1; ret */
     static const SnxU64 warm_pc[] = {0x4800};
-    static u32 long_words[IN_FLIGHT_ADDS + 1];
     SnxJitStats stats;
-    unsigned long batches, dropped;
-    time_t until;
+    unsigned long dropped;
     unsigned round;
-    size_t i;
+    int ok = 1;
     service = start(1, 1);
     if (!service) {
         ++failures;
         return;
     }
-    for (i = 0; i < IN_FLIGHT_ADDS; ++i) long_words[i] = words[0];
-    long_words[IN_FLIGHT_ADDS] = words[1];
-    put(IN_FLIGHT_PC, long_words, IN_FLIGHT_ADDS + 1);
+    put(IN_FLIGHT_PC, words, 2);
     snx_jit_stats(service, &stats);
     dropped = stats.dropped;
-    for (round = 0; round < 8; ++round) {
+    for (round = 0; ok && round < 8; ++round) {
         snx_jit_invalidate(service, IN_FLIGHT_PC, 4); /* the pc is new to the service again */
-        snx_jit_stats(service, &stats);
-        batches = stats.batches;
+        in_flight_hold(IN_FLIGHT_PC);
         CHECK(snx_jit_resolve(service, IN_FLIGHT_PC) == NULL);
-        for (until = time(NULL) + 60; stats.batches == batches && time(NULL) < until;) in_flight_spin(&stats);
-        CHECK(stats.batches != batches);
+        ok = dropped_in_flight(IN_FLIGHT_PC);
+        CHECK(ok);
         CHECK(snx_jit_wait(service, IN_FLIGHT_PC) != NULL); /* queued again, and compiled once nothing changes */
+        snx_jit_stats(service, &stats);
+        CHECK(stats.dropped == dropped + round + 1);
     }
     /* a warm pc goes back to the warm queue, and is compiled from there */
     put(0x4800, words, 2);
-    snx_jit_stats(service, &stats);
-    batches = stats.batches;
+    in_flight_hold(0x4800);
     CHECK(snx_jit_warm(service, warm_pc, 1) == 1);
-    for (until = time(NULL) + 60; stats.batches == batches && time(NULL) < until;) in_flight_spin(&stats);
+    CHECK(dropped_in_flight(0x4800));
     snx_jit_drain(service);
     CHECK(get(0x4800) != NULL);
     snx_jit_stats(service, &stats);
@@ -1087,6 +1159,33 @@ int main(int argc, char** argv) {
     CHECK(stats.compiled == before + 1 && !stats.failures && stats.bytes > 0);
     snx_jit_service_free(service);
 
+    /* jit_threads, read as the game's .ini gives it and passed on as guest_jit.c passes it, is the compile threads the
+       service starts, up to SNX_JIT_THREADS, the setting's top; Auto (0) stays at SNX_JIT_THREADS_AUTO at most */
+    {
+        const IniOpt* o = ini_find(g_performance_ini, "jit_threads");
+        CHECK(o && o->lo == 0 && o->hi == SNX_JIT_THREADS && g_settings.jit_threads == 0);
+        ini_read(o, "12");
+        CHECK(g_settings.jit_threads == 12);
+        service = start(0, (unsigned)g_settings.jit_threads);
+        if (!service) return 1;
+        snx_jit_stats(service, &stats);
+        CHECK(stats.threads == 12);
+        snx_jit_service_free(service);
+        service = start(0, SNX_JIT_THREADS + 8);
+        if (!service) return 1;
+        snx_jit_stats(service, &stats);
+        CHECK(stats.threads == SNX_JIT_THREADS);
+        snx_jit_service_free(service);
+        ini_read(o, "0");
+        service = start(0, (unsigned)g_settings.jit_threads);
+        if (!service) return 1;
+        snx_jit_stats(service, &stats);
+        CHECK(stats.threads >= 1 && stats.threads <= SNX_JIT_THREADS_AUTO);
+        snx_jit_service_free(service);
+        printf("jit_threads=12 starts 12 compile threads, %u asked start %u, Auto %u\n", SNX_JIT_THREADS + 8,
+               SNX_JIT_THREADS, stats.threads);
+    }
+
     /* the bank, missed by THREADS threads at once: on every compile thread there can be, then one pc per compile on
        one thread. Each thread waits for its miss, so the queue holds at most THREADS pcs and the batches are small:
        the compile threads work in parallel instead (the warm start below takes large batches) */
@@ -1124,21 +1223,37 @@ int main(int argc, char** argv) {
     run(&c, 0x1000);
     CHECK(c.x[0] == 1 * 3 + 1 + 100 + 5 && misses == before_misses);
     snx_jit_service_free(service);
-    /* a miss goes ahead of the warm queue: the bank queued warm, then a miss at 0x3800 (and 0x1000, which it calls
-       through the table), compiled by one of the first batches on the one compile thread while the bank takes many
-       more */
+    /* a miss goes ahead of the warm queue: the bank queued warm, then a miss at 0x3800 that nobody waits for, compiled
+       by one of the first batches on the one compile thread while the bank takes many more. That thread is held in its
+       first batch until the miss is queued */
     service = start(0, 1);
     if (!service) return 1;
     for (i = 0; i < BANK_COUNT; ++i) bank_pcs[i] = BANK + 0x40 * (SnxU64)i;
+    hold(1);
+    CHECK(snx_jit_warm(service, bank_pcs, BANK_COUNT) == BANK_COUNT);
+    CHECK(!snx_jit_resolve(service, 0x3800));
+    hold(0);
+    snx_jit_drain(service);
+    printf("warm start: %d pcs and a miss in %u batches, the miss at 0x3800 compiled by batch %u\n", BANK_COUNT,
+           batch_count, live_batch);
+    CHECK(live_batch <= 2 && batch_count > 8);
+    snx_jit_stats(service, &stats);
+    CHECK(stats.compiled + stats.failures >= BANK_COUNT + 1 && !stats.failures);
+    snx_jit_service_free(service);
+    /* one that a thread waits for (and 0x1000, which it calls through the table) is the miss thread's, with the compile
+       thread held in its first batch until the code has run: the rest of the bank is queued all that time */
+    service = start(0, 1);
+    if (!service) return 1;
+    hold(1);
     CHECK(snx_jit_warm(service, bank_pcs, BANK_COUNT) == BANK_COUNT);
     cpu_init(&c, 0xF000);
     c.x[0] = 1;
     run(&c, 0x3800);
     CHECK(c.x[0] == 2 * (1 * 3 + 1 + 100 + 5));
+    snx_jit_stats(service, &stats);
+    CHECK(stats.queued >= BANK_COUNT - (SNX_JIT_BATCH + 7) / 8); /* but the batch it is held in */
+    hold(0);
     snx_jit_drain(service);
-    printf("warm start: %d pcs and 3 misses in %u batches, the miss at 0x3800 compiled by batch %u\n", BANK_COUNT,
-           batch_count, live_batch);
-    CHECK(live_batch <= 2 && batch_count > 8);
     snx_jit_stats(service, &stats);
     CHECK(stats.compiled + stats.failures >= BANK_COUNT + 1 && !stats.failures);
     snx_jit_service_free(service);

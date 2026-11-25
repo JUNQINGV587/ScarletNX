@@ -22,6 +22,7 @@
 #include "nx/gpu/vk/pagespace.h"
 #include "nx/gpu/vk/pending_pages.h"
 #include "nx/gpu/vk/descriptors.h"
+#include "nx/gpu/vk/cb_dynamic.h"
 #include "common/gpu/vk/extension_bans.h"
 #include "common/gpu/vk/extension_commands.h"
 #include "nx/gpu/vk/pipeline_parts.h"
@@ -104,7 +105,7 @@ static u32 later_drain(void) {
 
 /* The fatal path of a lost device runs on the recording thread: record.c's submit_run calls fatal(), whose window
    release asks the ring to drain (vk_rec_sync). A wait there waits for the thread that runs it, so the process spun at
-   full speed instead of showing the error (Super Mario Bros. Wonder on MoltenVK). A call that the recording thread
+   full speed instead of showing the error (a game on MoltenVK). A call that the recording thread
    makes into the ring must return at once, and the packet after it must still run */
 static void recorder_self_sync(void* arg) {
     vk_rec_sync();
@@ -119,6 +120,113 @@ static int check_recorder_self_sync(void) {
     vk_rec_run(recorder_self_sync, &ran);
     CHECK(ran == 1);
     printf("The recording thread's own vk_rec_sync returns\n");
+    return 0;
+}
+
+/* A submission to the graphics queue from outside the ring (a compute batch's where the queue is shared, a landing's)
+   waits for the ring's submissions before it (vk_rec_queue), not for the commands queued after the last of them: a
+   packet after the submission blocks until a thread lets it go, 10 s on, and vk_rec_queue returns before that. The
+   recording thread is held in a packet of its own until the submission and the packet after it are both published,
+   so it finds them in one batch, as a slow runner did: its position went to the producer only at a batch's end, and
+   vk_rec_queue waited for the blocked packet too */
+static _Atomic int g_rq_go, g_rq_held, g_rq_hold;
+static _Atomic u64 g_rq_behind;
+static void rq_block(const void* arg) {
+    (void)arg;
+    while (!atomic_load_explicit(&g_rq_go, memory_order_acquire)) plat_sleep_ns(100000);
+}
+static void rq_hold(const void* arg) {
+    (void)arg;
+    atomic_store_explicit(&g_rq_held, 1, memory_order_release);
+    while (atomic_load_explicit(&g_rq_hold, memory_order_acquire)) plat_sleep_ns(100000);
+}
+/* lets the recording thread go once the packet after the submission is published (vk_rec_queue publishes first), and
+   the blocked packet 10 s on */
+static void rq_go_later(void* arg) {
+    (void)arg;
+    const u64 end = plat_ns() + 10000000000ull;
+    while (plat_ns() < end && vk_rec_behind() <= atomic_load_explicit(&g_rq_behind, memory_order_acquire))
+        plat_sleep_ns(100000);
+    atomic_store_explicit(&g_rq_hold, 0, memory_order_release);
+    while (plat_ns() < end && !atomic_load_explicit(&g_rq_go, memory_order_acquire)) plat_sleep_ns(1000000);
+    atomic_store_explicit(&g_rq_go, 1, memory_order_release);
+}
+static int check_rec_queue_submissions(void) {
+    if (!vk_rec_threaded()) {
+        puts("SKIP the ring's submissions before a queue's: vk_record=0 runs the commands on the GPU thread");
+        return 0;
+    }
+    const u8 nothing = 0;
+    vk_lock();
+    vk_finish();
+    (void)vk_cmd();
+    atomic_store_explicit(&g_rq_hold, 1, memory_order_release);
+    vk_rec_call(rq_hold, &nothing, sizeof nothing);
+    vk_rec_queue(g_vk.gfx); /* publishes the hold alone: every submission before it is done */
+    for (const u64 end = plat_ns() + 10000000000ull; !atomic_load_explicit(&g_rq_held, memory_order_acquire);) {
+        if (plat_ns() >= end) {
+            atomic_store_explicit(&g_rq_hold, 0, memory_order_release);
+            vk_unlock();
+            fprintf(stderr, "ring before a queue: the recording thread never ran the hold packet in 10 s\n");
+            CHECK(0);
+        }
+        plat_sleep_ns(100000);
+    }
+    vk_submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+    const u64 submitted = vk_last_submit();
+    atomic_store_explicit(&g_rq_behind, vk_rec_behind(), memory_order_release);
+    vk_rec_call(rq_block, &nothing, sizeof nothing);
+    CHECK(!plat_thread(rq_go_later, NULL, 1u << 16));
+    const u64 t0 = plat_ns();
+    vk_rec_queue(g_vk.gfx);
+    const int early = !atomic_load_explicit(&g_rq_go, memory_order_acquire);
+    const u64 took = plat_ns() - t0;
+    const u64 queued = vk_rec_gfx_queued();
+    atomic_store_explicit(&g_rq_go, 1, memory_order_release);
+    vk_rec_sync();
+    vk_unlock();
+    if (!early || queued < submitted)
+        fprintf(stderr,
+                "ring before a queue: vk_rec_queue returned %s the packet after the submission ran, in %llu ms, with "
+                "submission %llu on the queue (%llu made)\n",
+                early ? "before" : "after", (unsigned long long)(took / 1000000), (unsigned long long)queued,
+                (unsigned long long)submitted);
+    CHECK(early && queued >= submitted);
+    puts("ring before a queue: its submissions on the queue, not the commands after them");
+    return 0;
+}
+
+/* A slot whose use took every command buffer it had gets as many again at its next recycle, when its pool is reset and
+   no thread records in it: that use, as busy plus one submission, grows none in use, each of which waited for the
+   recording thread first (g_vk_cb_grows_waited). Before, it grew in use at its last submission */
+static int check_cb_grow_at_recycle(void) {
+    vk_lock();
+    vk_finish();
+    vk_frame_next(); /* a slot of its own: its first vk_cmd recycles it */
+    const u32 slot = vk_frame_slot();
+    (void)vk_cmd();
+    const u32 had = vk_frame_cbs();
+    for (u32 i = 0; i < had; i++) {
+        (void)vk_cmd();
+        vk_submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+    }
+    CHECK(vk_frame_cbs() == had);
+    for (u32 k = 0; k < VK_FRAMES; k++) vk_frame_next();
+    CHECK(vk_frame_slot() == slot);
+    const u64 grows = g_vk_cb_grows_waited;
+    for (u32 i = 0; i <= had; i++) {
+        (void)vk_cmd();
+        vk_submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+    }
+    vk_finish();
+    vk_unlock();
+    if (g_vk_cb_grows_waited != grows)
+        fprintf(stderr,
+                "command buffers at the recycle: a slot of %u that used them all grew %llu times in its next "
+                "use of %u submissions\n",
+                had, (unsigned long long)(g_vk_cb_grows_waited - grows), had + 1);
+    CHECK(g_vk_cb_grows_waited == grows && vk_frame_cbs() > had);
+    puts("command buffers at the recycle: a slot that used them all grew before its next use");
     return 0;
 }
 
@@ -182,6 +290,81 @@ static int check_release_stopped_recorder(void) {
     return 0;
 }
 
+/* A full ring sleeps: with the recording thread held in a packet (a read of a slow disk held it 184 s in a race, #2487),
+   the producer that finds no room waits on a condition, where it spun on sched_yield and took a whole core. The
+   producer here, with vk_lock as the GPU thread has it, adds 5 MiB to the 4 MiB ring past a held packet: its own CPU
+   time over the 1.5 s it waits stays far under that while, and its packets all run once the packet lets go */
+#if !defined(_WIN32) && defined(CLOCK_THREAD_CPUTIME_ID)
+#define FULL_RING_PACKET (64u << 10)
+static _Atomic u32 g_full_ring_done; /* 0 adding, 1 all added */
+static _Atomic u32 g_full_ring_ran;  /* the producer's packets the recording thread ran */
+static u64 g_full_ring_cpu_ns;       /* the producer's CPU time while it added them */
+static u64 thread_cpu_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
+}
+static void full_ring_packet(const void* arg) {
+    (void)arg;
+    atomic_fetch_add_explicit(&g_full_ring_ran, 1, memory_order_relaxed);
+}
+static void full_ring_producer(void* arg) {
+    static u8 bytes[FULL_RING_PACKET];
+    const u32 n = *(const u32*)arg;
+    const u64 t0 = thread_cpu_ns();
+    vk_lock();
+    for (u32 i = 0; i < n; i++) vk_rec_call(full_ring_packet, bytes, sizeof bytes);
+    vk_unlock();
+    g_full_ring_cpu_ns = thread_cpu_ns() - t0;
+    atomic_store_explicit(&g_full_ring_done, 1, memory_order_release);
+    plat_wake_word(&g_full_ring_done);
+}
+/* what a drain costs (vk_rec_run: the packet published, run and waited for), printed to compare builds: the wait
+   spins a while before it sleeps (record.c's REC_ROOM_SPIN_NS) */
+static void drain_run(void* arg) { (void)arg; }
+static void drain_time(void) {
+    const u64 t0 = plat_ns();
+    for (int i = 0; i < 20000; i++) vk_rec_run(drain_run, NULL);
+    printf("The recording ring drained in %.2f us on average over 20,000 runs\n",
+           (double)(plat_ns() - t0) / 20000 / 1e3);
+}
+static int check_full_ring_sleeps(void) {
+    static const int no_queue = 0;
+    drain_time();
+    static const u32 packets = (5u << 20) / FULL_RING_PACKET;
+    if (!vk_rec_threaded()) {
+        puts("SKIP the full ring's wait: vk_record=0 has no ring");
+        return 0;
+    }
+    atomic_store_explicit(&g_rec_stop, 0, memory_order_release);
+    atomic_store_explicit(&g_full_ring_done, 0, memory_order_release);
+    atomic_store_explicit(&g_full_ring_ran, 0, memory_order_release);
+    vk_lock();
+    vk_rec_call(recorder_stops, &no_queue, sizeof no_queue); /* the producer's packets publish it */
+    vk_unlock();
+    CHECK(plat_thread(full_ring_producer, (void*)&packets, 0) == 0);
+    plat_sleep_ns(1500000000ull);
+    const u32 added_early = atomic_load_explicit(&g_full_ring_done, memory_order_acquire);
+    const u32 stop = atomic_load_explicit(&g_rec_stop, memory_order_acquire);
+    atomic_store_explicit(&g_rec_stop, 2, memory_order_release);
+    plat_wake_word(&g_rec_stop);
+    while (!atomic_load_explicit(&g_full_ring_done, memory_order_acquire)) plat_wait_word(&g_full_ring_done, 0, -1);
+    vk_rec_sync();
+    printf("The full ring's producer used %.1f ms of CPU while it waited 1.5 s for room\n",
+           (double)g_full_ring_cpu_ns / 1e6);
+    CHECK(stop == 1);                         /* the recording thread was held in the packet */
+    CHECK(!added_early);                      /* the ring had no room for 5 MiB past it */
+    CHECK(g_full_ring_cpu_ns < 300000000ull); /* asleep: spinning on sched_yield took the whole 1.5 s */
+    CHECK(atomic_load_explicit(&g_full_ring_ran, memory_order_relaxed) == packets);
+    return 0;
+}
+#else
+static int check_full_ring_sleeps(void) {
+    puts("SKIP the full ring's wait: no CPU clock for a thread here");
+    return 0;
+}
+#endif
+
 /* A frame's descriptor pool holds VK_POOL_ARRAY_SETS sets of the arrays layouts, not 1024: a driver may make a pool's
    memory for all it can hold as the pool is made (Qualcomm's: 470 MiB for 1024 sets that all could hold the arrays).
    Its 1024 sets are for the layouts without them; a pool made because a set with the arrays didn't fit holds
@@ -207,10 +390,10 @@ static int check_desc_pool_arrays(void) {
     /* each kind of frame pool as vk_desc_pool_new makes it, and how many sets of each fragment layout it holds */
     u32 held[2][2];
     for (int kind = 0; kind < 2; kind++) {
-        vk_pool_sizes(sz, 1024, kinds[kind]);
+        const u32 types = vk_pool_sizes(sz, 1024, kinds[kind]);
         VkDescriptorPoolCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
                                          .maxSets = 1024,
-                                         .poolSizeCount = VK_POOL_TYPES,
+                                         .poolSizeCount = types,
                                          .pPoolSizes = sz};
         for (int arrays = 0; arrays < 2; arrays++) {
             VkDescriptorPool pool;
@@ -456,8 +639,9 @@ static int check_uma(void) {
 
 /* uma_copies (gpu/vk/uma.c's vk_uma_imports_dear): 2 copies a vertex range and a constant buffer, so no import is made
    for them and the GPU reads the bytes of the binding; 1 reads them in place, a CPU write after the binding included;
-   0 copies them on amdgpu's drivers only, where each import costs every submission. A range a write in place is
-   pending over stays in place either way (buffer.c's IN_DEAR) */
+   0 copies them on amdgpu's drivers, where each import costs every submission, and on a discrete GPU with host
+   imports, whose reads cross the bus. There read-only storage is copied too (vk_uma_storage_copied), with 2 as well,
+   and never with 1. A range a write in place is pending over stays in place either way (buffer.c's IN_DEAR) */
 static int check_uma_copies(void) {
     const u64 gva = 0x7400000, cpu = HEAP_BASE + 0x3400000, span = 0x10000;
     const int was = g_settings.guest_buffers_copied;
@@ -475,7 +659,9 @@ static int check_uma_copies(void) {
     g_settings.guest_buffers_copied = 0;
     const int amd =
         g_vk.driver_id == VK_DRIVER_ID_MESA_RADV || g_vk.driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE || linux_amd;
-    CHECK(vk_uma_imports_dear() == amd);
+    const int host_discrete = g_vk.mem_model != VK_MEM_UMA && !vk_uma_through_dmabuf();
+    CHECK(vk_uma_imports_dear() == (g_vk.mem_model != VK_MEM_UMA ? host_discrete : amd));
+    CHECK(vk_uma_storage_copied() == host_discrete);
     CHECK(mem_map(cpu, span, MS_NORMAL, PERM_RW) == 0);
     gmmu_map(gva, cpu, span);
     memset(GP(cpu), 0x11, (size_t)span);
@@ -484,6 +670,7 @@ static int check_uma_copies(void) {
     /* copied: no import, and the bytes of the binding */
     g_settings.guest_buffers_copied = 2;
     CHECK(vk_uma_imports_dear() == 1);
+    CHECK(vk_uma_storage_copied() == host_discrete);
     vk_lock();
     CHECK(vk_buf_get_input(gva + 0x100, 256, 4, &b, &off));
     CHECK(vk_uma_imports(cpu, span) == 0);
@@ -499,6 +686,7 @@ static int check_uma_copies(void) {
     /* in place: the import, and the write after the binding */
     g_settings.guest_buffers_copied = 1;
     CHECK(vk_uma_imports_dear() == 0);
+    CHECK(!vk_uma_storage_copied());
     vk_lock();
     CHECK(vk_buf_get_input(gva + 0x2000, 256, 4, &b, &off));
     CHECK(vk_uma_imports(cpu + 0x2000, 256) == 1);
@@ -875,6 +1063,68 @@ static int check_gpuprof_small_pool(void) {
     printf("gpu profile pool of 1024 queries: a frame of 1000 passes wrote %llu timestamps\n",
            (unsigned long long)stamps);
     CHECK(stamps > 0 && stamps <= 1024);
+    return 0;
+}
+
+/* vk_gpu_profile's fill (gpuprof_gap.h): the GPU idle while the next submission held recorded commands. A copy of 32
+   MiB recorded, then 20 ms with the GPU idle before it goes: that idle held the copy, so it counts, up to the copy's own
+   GPU time. Then 20 ms idle before anything is recorded, and the copy recorded and submitted at once: the idle held
+   nothing, and only the moment between the command buffer's begin and its submit counts. The first is four times the
+   second at least: a copy's GPU time against a few microseconds of the CPU's (on RADV, 0.21 ms against 0.011). The
+   frames after them read the times back (frame_recycle) */
+static int gpuprof_fill_case(VkBuffer from, VkBuffer to, u64 size, int record_first, u64* fill, u64* busy) {
+    VkBufferCopy copy = {0, 0, size};
+    u64 subs0, fill0, subs, after;
+    vk_finish();
+    vk_frame_next();
+    vk_gpuprof_fill_totals(&subs0, &fill0);
+    *busy = vk_gpuprof_busy_ns();
+    if (record_first) rec_CmdCopyBuffer(vk_cmd(), from, to, 1, &copy);
+    plat_sleep_ns(20000000);
+    if (!record_first) rec_CmdCopyBuffer(vk_cmd(), from, to, 1, &copy);
+    vk_submit_recorded();
+    for (u32 i = 0; i <= VK_FRAMES; i++) {
+        vk_cmd();
+        vk_frame_next();
+    }
+    vk_finish();
+    vk_frame_next();
+    vk_gpuprof_fill_totals(&subs, &after);
+    *fill = after - fill0;
+    *busy = vk_gpuprof_busy_ns() - *busy;
+    return subs > subs0;
+}
+static int check_gpuprof_fill(void) {
+    const u64 size = 32ull << 20;
+    VkBufferCreateInfo bci = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                              .size = size,
+                              .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                              .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+    DevMemWant aci = {.at = DM_DEVICE};
+    DevMemInfo info;
+    VkBuffer buf[2];
+    DevMem mem[2];
+    u64 held, empty, held_busy, empty_busy;
+    if (!vk_gpuprof_timed()) {
+        printf("SKIP gpu profile fill: the graphics queue writes no timestamps (timestampValidBits %u)\n",
+               g_vk.gfx_timestamp_bits);
+        return 0;
+    }
+    for (int i = 0; i < 2; i++) CHECK(vk_buffer_create(&bci, &aci, &buf[i], &mem[i], &info) == VK_SUCCESS);
+    int placed = gpuprof_fill_case(buf[0], buf[1], size, 1, &held, &held_busy);
+    placed &= gpuprof_fill_case(buf[0], buf[1], size, 0, &empty, &empty_busy);
+    vk_finish();
+    for (int i = 0; i < 2; i++) vk_devmem_buffer_destroy(buf[i], mem[i]);
+    if (!placed) {
+        printf("SKIP gpu profile fill: no submission placed on the CPU's clock (calibrated timestamps: host %d, "
+               "monotonic %d)\n",
+               g_vk.has_calibrated_host, g_vk.has_calibrated_mono);
+        return 0;
+    }
+    printf("gpu profile fill: 20 ms idle with a 32 MiB copy recorded counts %.3f ms of the copy's %.3f ms; 20 ms idle "
+           "before it was recorded counts %.3f ms of its %.3f ms\n",
+           (double)held / 1e6, (double)held_busy / 1e6, (double)empty / 1e6, (double)empty_busy / 1e6);
+    CHECK(held && held <= held_busy && held >= 4 * empty);
     return 0;
 }
 
@@ -2093,6 +2343,60 @@ static int check_alias_newer_target(void) {
         return 1;
     }
     CHECK(mem_unmap(cpu, 0x10000) == 0);
+    free(ch);
+    return 0;
+}
+
+/* A render target whose GPU address the game maps to other memory: its pixels go to the memory it showed, and it goes,
+   as it describes memory that is gone. One game unmapped its scene targets, its movie player took their memory for
+   VIC's output and the game mapped that at the old targets' addresses: the targets stayed, and each movie frame
+   reached the scene through them read as floats. A mapping of the same memory again keeps its target */
+static int check_remapped_target(void) {
+    GpuChannel* ch = calloc(1, sizeof *ch);
+    CHECK(ch);
+    u32* r = ch->r3d;
+    const u64 cpu = HEAP_BASE + 0xAA0000, other = HEAP_BASE + 0xAB0000, gva = 0x9A00000ull, kept = 0x9B00000ull;
+    CHECK(mem_map(cpu, 0x20000, MS_NORMAL, PERM_RW) == 0);
+    memset(GP(cpu), 0, 0x10000);
+    memset(GP(other), 0x40, 0x10000);
+    gmmu_map(gva, cpu, 0x10000);
+    gmmu_map(kept, cpu, 0x10000);
+    r[0x487] = 1;
+    r[0x202] = 64; /* 16 RGBA pixels, pitch linear */
+    r[0x203] = 16;
+    r[0x204] = 0xD5; /* A8B8G8R8 */
+    r[0x205] = 0x1000;
+    r[0x206] = 1;
+    const float red[4] = {1, 0, 0, 1}, green[4] = {0, 1, 0, 1};
+    r[0x201] = (u32)gva;
+    memcpy(&r[0x360], red, sizeof red);
+    engine_clear(ch, 15 << 2);
+    vk_render_end();
+    CHECK(vk_rt_find(gva));
+    u64 went = g_vk_rt_remapped;
+    gmmu_map(gva, other, 0x10000); /* the same GPU address, other memory */
+    if (vk_rt_find(gva) || g_vk_rt_remapped != went + 1) {
+        fprintf(stderr, "a target whose GPU address shows other memory now stayed (%llu went)\n",
+                (unsigned long long)(g_vk_rt_remapped - went));
+        return 1;
+    }
+    const u8* old = GP(cpu);
+    CHECK(old[0] == 255 && old[1] == 0 && old[2] == 0 && old[3] == 255); /* its pixels, in the memory it showed */
+    CHECK(GP(other)[0] == 0x40); /* the other memory as it was */
+    /* the same memory mapped again: its target stays */
+    r[0x201] = (u32)kept;
+    memcpy(&r[0x360], green, sizeof green);
+    engine_clear(ch, 15 << 2);
+    vk_render_end();
+    Surf* k = vk_rt_find(kept);
+    CHECK(k);
+    went = g_vk_rt_remapped;
+    gmmu_map(kept, cpu, 0x10000);
+    CHECK(vk_rt_find(kept) == k && g_vk_rt_remapped == went);
+    u8 px[4];
+    CHECK(!read_pixel0(k, px));
+    CHECK(px[0] == 0 && px[1] == 255);
+    CHECK(mem_unmap(cpu, 0x20000) == 0);
     free(ch);
     return 0;
 }
@@ -4067,7 +4371,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL sc_submit(VkQueue q, u32 n, const VkSubmit
 }
 static void sc_waited(u64 t0, u64 timeout) {
     if (!timeout) return; /* a look, no wait */
-    if (plat_tid() == vk_timeline_tid()) return; /* the thread that follows the timeline waits on it by design */
     atomic_fetch_add_explicit(&g_sc.n.waits, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_sc.n.wait_ns, plat_ns() - t0, memory_order_relaxed);
 }
@@ -5732,7 +6035,7 @@ static int check_dma_bands_frames(void) {
            (unsigned long long)(grown >> 10));
     CHECK(!failed && bands1 - bands0 >= 8);
     /* the frames the bands end, with the stream or without it (vk_stream_ring=0). The submissions are not theirs to
-       count: one comes after a millisecond of recording, which a fast GPU leaves none of here, and the stream's own
+       count: one comes after vk_submit_every bands of work, which the count since an earlier one decides, and the stream's own
        comes at a frame's worth of its bytes since the last submission of any kind, which one of those can put off.
        The rings' growth below is what must hold */
     CHECK(ended >= 2);
@@ -6879,6 +7182,88 @@ static int check_rt_watch_holder(void) {
     free(ch);
     return 0;
 }
+/* A pitch-linear color target is watched at a release as a block linear one is: drawn over three releases and never
+   read, it is armed once, copied back never and lands nothing. The CPU's read publishes it and gets the last clear's
+   pixels, and once read, the next release publishes it at once. Before, every release copied it back */
+#define LWATCH_A  (HEAP_BASE + 0x7400000)
+#define LWATCH_GA 0x3A0800000ull
+static void lin_clear(GpuChannel* ch, u64 gva, const float color[4]) {
+    u32* r = ch->r3d;
+    r[0x487] = 1;
+    r[0x200] = (u32)(gva >> 32);
+    r[0x201] = (u32)gva;
+    r[0x202] = 256; /* 64 RGBA pixels a row, pitch linear */
+    r[0x203] = 16;
+    r[0x204] = 0xD5;
+    r[0x205] = 0x1000;
+    r[0x206] = 1;
+    r[0x207] = 0;
+    r[0x43E] &= ~0x100u;
+    r[0x380] = 0;
+    memcpy(&r[0x360], color, 16);
+    engine_clear(ch, 15 << 2);
+    vk_lock();
+    vk_render_end();
+    vk_unlock();
+}
+static int check_rt_watch_linear(void) {
+    const u64 size = 256 * 16;
+    const float blue[4] = {0, 0, 1, 1}, red[4] = {1, 0, 0, 1};
+    static const u8 px_blue[4] = {0, 0, 255, 255};
+    if (!own_traps() || vk_uma()) {
+        puts("pitch-linear target watch: needs traps and no unified memory, skipped");
+        return 0;
+    }
+    GpuChannel* ch = calloc(1, sizeof *ch);
+    CHECK(ch);
+    CHECK(mem_map(LWATCH_A, 0x10000, MS_NORMAL, PERM_RW) == 0);
+    gmmu_map(LWATCH_GA, LWATCH_A, 0x10000);
+    memset(GP(LWATCH_A), 0x11, 0x10000);
+    g_renderer->mem_may_have_changed();
+    vk_lock();
+    vk_rt_publish_drawn(); /* the targets the tests before drew */
+    vk_unlock();
+    VkRtWatchStats w0 = g_vk_rt_watch;
+    u64 lands = own_landings();
+    for (int i = 0; i < 3; i++) {
+        lin_clear(ch, LWATCH_GA, i & 1 ? red : blue);
+        vk_lock();
+        vk_rt_publish_drawn();
+        vk_unlock();
+    }
+    if (g_vk_rt_watch.arms != w0.arms + 1 || g_vk_rt_watch.publishes != w0.publishes)
+        fprintf(stderr,
+                "pitch-linear target watch: %llu arms and %llu publishes over three releases (1 and 0 expected)\n",
+                (unsigned long long)(g_vk_rt_watch.arms - w0.arms),
+                (unsigned long long)(g_vk_rt_watch.publishes - w0.publishes));
+    CHECK(g_vk_rt_watch.arms == w0.arms + 1 && g_vk_rt_watch.publishes == w0.publishes);
+    CHECK(own_watched(LWATCH_A, size) && own_lookup(LWATCH_A, size, NULL, 0) == 0 && own_landings() == lands);
+    /* this thread holds no lock: its read faults, publishes the target and lands the GPU's pixels. The trap thread does
+       that work while the copy waits, so the compiler must not read the counters before the copy */
+    u8* got = malloc(size);
+    CHECK(got);
+    memcpy(got, GP(LWATCH_A), size);
+    atomic_signal_fence(memory_order_seq_cst);
+    CHECK(g_vk_rt_watch.hits == w0.hits + 1 && own_landings() > lands);
+    int same = 1;
+    for (u64 i = 0; i < size; i += 4) same &= !memcmp(got + i, px_blue, 4);
+    free(got);
+    CHECK(same);
+    /* read lately: the next release publishes it at once */
+    lin_clear(ch, LWATCH_GA, red);
+    vk_lock();
+    vk_rt_publish_drawn();
+    vk_unlock();
+    CHECK(g_vk_rt_watch.publishes == w0.publishes + 1 && !own_watched(LWATCH_A, 1));
+    CHECK(GP(LWATCH_A)[0] == 255 && GP(LWATCH_A)[2] == 0);
+    puts("pitch-linear target watch: armed once over three releases, published at the CPU's read and after it");
+    vk_lock();
+    vk_rt_before_write(LWATCH_GA, 0x10000, 0);
+    vk_unlock();
+    CHECK(mem_unmap(LWATCH_A, 0x10000) == 0);
+    free(ch);
+    return 0;
+}
 /* Depth targets the 3D engine clears and the CPU then reads from memory, as edenprobe's zeta and msaa suites do after a
    barrier and a wait for idle: a release watches them as it does color ones, and the CPU's first read publishes them
    and lands them in their format's layout (S8's a byte a texel, its stencil). Each format a 80x40 block linear target
@@ -7440,6 +7825,7 @@ static void results_copied(u64 cpu, u64 len) { vk_own_cpu_touched(cpu, len); }
 #include "vulkan_shader_windows.inc"
 #include "vulkan_shared_clamp.inc"
 #include "vulkan_compute_arena.inc"
+#include "vulkan_compute_owned_input.inc"
 #include "vulkan_rt_aside.inc"
 #include "vulkan_so_note.inc"
 #include "vulkan_index_draws.inc"
@@ -7485,6 +7871,74 @@ static int check_pipeline_stats_compute(void) {
 #include "vulkan_compute_depth.inc"
 #include "vulkan_depth_state.inc"
 #include "vulkan_owned_readback.inc"
+/* A finish that lets go (vk_finish_letting_go, the GPU mirror's for a CPU read of pages it holds) lets go of vk_lock
+   while it waits for the GPU: another thread takes the lock meanwhile. So does the wait for one submission
+   (vk_wait_submit_letting_go, the mirror's where a submission made already wrote the pages). The submission waits for a
+   semaphore that thread signals once it held the lock, or after 5 s without it, so the wait cannot end first. Before,
+   the finish held the lock through its wait, and the other thread got it only after */
+static _Atomic int g_fl_got, g_fl_done;
+static VkSemaphore g_fl_gate;
+static void fl_thread(void* p) {
+    (void)p;
+    const u64 end = plat_ns() + 5000000000ull;
+    while (plat_ns() < end) {
+        if (vk_trylock()) {
+            vk_unlock();
+            atomic_store_explicit(&g_fl_got, 1, memory_order_release);
+            break;
+        }
+        plat_sleep_ns(100000);
+    }
+    VkSemaphoreSignalInfo signal = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g_fl_gate, .value = 1};
+    VK_OK(vkSignalSemaphore(g_vk.dev, &signal));
+    atomic_store_explicit(&g_fl_done, 1, memory_order_release);
+}
+/* the gate, and the next submission waiting for it (vk_lock held) */
+static int fl_gate(void) {
+    VkSemaphoreTypeCreateInfo type = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+    VkSemaphoreCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &type};
+    CHECK(VK_OK(vkCreateSemaphore(g_vk.dev, &ci, NULL, &g_fl_gate)));
+    (void)vk_cmd(); /* a submission to make */
+    vk_submit_after(g_fl_gate, 1, 2);
+    atomic_store_explicit(&g_fl_got, 0, memory_order_relaxed);
+    atomic_store_explicit(&g_fl_done, 0, memory_order_relaxed);
+    return 0;
+}
+/* the thread done: 0 when it took the lock meanwhile */
+static int fl_ended(const char* what) {
+    while (!atomic_load_explicit(&g_fl_done, memory_order_acquire)) plat_sleep_ns(1000000);
+    const int got = atomic_load_explicit(&g_fl_got, memory_order_acquire);
+    if (!got) fprintf(stderr, "%s: the other thread did not get vk_lock in 5 s of the wait\n", what);
+    vkDestroySemaphore(g_vk.dev, g_fl_gate, NULL);
+    return !got;
+}
+static int check_finish_lets_go(void) {
+    vk_lock();
+    vk_finish();
+    CHECK(!fl_gate());
+    CHECK(!plat_thread(fl_thread, NULL, 1u << 16));
+    vk_finish_letting_go();
+    vk_unlock();
+    CHECK(!fl_ended("finish letting go"));
+    vk_lock();
+    vk_finish();
+    CHECK(!fl_gate());
+    vk_submit(VK_NULL_HANDLE, 0, VK_NULL_HANDLE);
+    const u64 at = vk_last_submit();
+    CHECK(!plat_thread(fl_thread, NULL, 1u << 16));
+    vk_wait_submit_letting_go(at);
+    u64 submitted, done;
+    vk_submit_progress(&submitted, &done);
+    vk_unlock();
+    CHECK(!fl_ended("a submission's wait letting go"));
+    CHECK(done >= at);
+    puts("finish letting go: another thread took vk_lock while the finish waited for the GPU, and while a submission's "
+         "wait did");
+    return 0;
+}
+
 #include "vulkan_own_trim.inc"
 #include "vulkan_wlog_again.inc"
 #include "vulkan_wlog_clear.inc"
@@ -7494,6 +7948,7 @@ static int check_pipeline_stats_compute(void) {
 #include "vulkan_storage_suffix.inc"
 #include "vulkan_storage_logged.inc"
 #include "vulkan_mirror.inc"
+#include "vulkan_mirror_batch.inc"
 #include "vulkan_pending_index.inc"
 #include "vulkan_unmapped_tail.inc"
 #include "vulkan_draw_storage_stages.inc"
@@ -7506,13 +7961,17 @@ static int check_pipeline_stats_compute(void) {
 #include "vulkan_vertex_input.inc"
 #include "vulkan_frag_coord.inc"
 #include "vulkan_varying.inc"
+#include "vulkan_perspective_fold.inc"
 #include "vulkan_vertex_restride.inc"
 #include "vulkan_msaa.inc"
 #include "vulkan_cross_stage_alias.inc"
 #include "vulkan_draw_texture.inc"
 #include "vulkan_lone_lane.inc"
+#include "vulkan_compute_lone_lane.inc"
+#include "vulkan_sm86_lanes.inc"
 #include "vulkan_memory_release.inc"
 #include "vulkan_descriptor_heaps.inc"
+#include "vulkan_link_presents.inc"
 #include "vulkan_cb_address.inc"
 #include "vulkan_descriptor_memo.inc"
 #include "vulkan_sample_raster.inc"
@@ -7528,6 +7987,7 @@ static int check_pipeline_stats_compute(void) {
 #include "vulkan_uma_imports.inc"
 #include "vulkan_uma_pages.inc"
 #include "vulkan_uma_region_reads.inc"
+#include "vulkan_uma_region_watch.inc"
 #include "vulkan_write_tracking.inc"
 #include "vulkan_poll_kick.inc"
 #include "vulkan_tex_partial.inc"
@@ -7537,6 +7997,8 @@ static int check_pipeline_stats_compute(void) {
 #include "vulkan_texture_quiet_other.inc"
 #include "vulkan_memo_over_target.inc"
 #include "vulkan_astc_later.inc"
+#include "vulkan_pool_map.inc"
+#include "vulkan_dma_named.inc"
 #include "vulkan_astc_kind.inc"
 
 /* hmma_mode at the renderer's start (vk/hmma_pick.c), on this device: 1 to 5 take that way; Auto with no file of the
@@ -7720,6 +8182,7 @@ static int check_hmma_file_key(void) {
 #include "vulkan_capture_cap.inc"
 #include "vulkan_trim.inc"
 #include "vulkan_owned_page_reads.inc"
+#include "vulkan_writeback_sweep.inc"
 
 /* key's row among the settings the runtime applies itself (options.c's), or NULL */
 static const IniOpt* setting_row(const char* key) {
@@ -7844,7 +8307,8 @@ static int check_vk12_way(void) {
     char why[64] = "";
     CHECK(vk_api_setting("auto", &cap, why, sizeof why) && cap == 0);
     CHECK(vk_api_setting("1.2", &cap, why, sizeof why) && cap == VK_API_VERSION_1_2);
-    CHECK(!vk_api_setting("1.3", &cap, why, sizeof why) && !strcmp(why, "vk_api=1.3 is not auto or 1.2"));
+    CHECK(vk_api_setting("1.1", &cap, why, sizeof why) && cap == VK_API_VERSION_1_1);
+    CHECK(!vk_api_setting("1.3", &cap, why, sizeof why) && !strcmp(why, "vk_api=1.3 is not auto, 1.2 or 1.1"));
     /* a swapchain the driver could not make, said with the device, its driver and the result's name and number */
     {
         char said[300];
@@ -7855,7 +8319,10 @@ static int check_vk12_way(void) {
         CHECK(strstr(said, "(its driver): VK_ERROR_SURFACE_LOST_KHR (-1000000000)") != NULL);
     }
     CHECK(!g_vk.api_cap == !strcmp(g_settings.vulkan_api, "auto"));
-    if (g_vk.api_cap) {
+    if (g_vk.api_cap == VK_API_VERSION_1_1) { /* lavapipe has 1.3 and more: it runs as auto */
+        CHECK(!strcmp(g_settings.vulkan_api, "1.1"));
+        CHECK(g_vk.api >= VK_API_VERSION_1_3 && version == 0x00010600u && g_vk.feat12.pNext == &g_vk.feat13);
+    } else if (g_vk.api_cap) {
         CHECK(!strcmp(g_settings.vulkan_api, "1.2"));
         CHECK(g_vk.api < VK_API_VERSION_1_3 && g_vk.api >= VK_API_VERSION_1_2);
         CHECK(version == 0x00010500u);
@@ -7938,6 +8405,22 @@ static int check_vk12_way(void) {
     snprintf(list[n - 1].extensionName, sizeof list[n - 1].extensionName, "VK_EXT_not_this");
     CHECK(vk_1_2_missing(&ext, names, sizeof names) == 2 &&
           !strcmp(names, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME ", " VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME));
+    /* on a 1.1 device the timeline semaphore and the driver's identity before them, as 1.2 has them in its core;
+       the list cut to the room given */
+    {
+        char longer[512], cut[40];
+        CHECK(vk_1_1_missing(&ext, longer, sizeof longer) == 4 &&
+              !strcmp(longer, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME ", " VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME
+                                                                       ", " VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME
+                                                                       ", " VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME));
+        CHECK(vk_1_1_missing(&ext, cut, sizeof cut) == 4 && strlen(cut) == sizeof cut - 1);
+        snprintf(list[n - 1].extensionName, sizeof list[n - 1].extensionName, "%s",
+                 VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+        CHECK(vk_1_1_missing(&ext, longer, sizeof longer) == 3 &&
+              !strcmp(longer, VK_KHR_DRIVER_PROPERTIES_EXTENSION_NAME ", " VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME
+                                                                      ", " VK_KHR_LOAD_STORE_OP_NONE_EXTENSION_NAME));
+        snprintf(list[n - 1].extensionName, sizeof list[n - 1].extensionName, "VK_EXT_not_this");
+    }
     /* all of them on a driver the bans keep from dynamic rendering: the filter create_device runs first takes it out,
        and the device lacks it by name. The table and the device are put back after */
     ext.list = list;
@@ -8002,6 +8485,10 @@ static int run_headless(int argc, char** argv) {
             free(copy);
             free(text);
         }
+    /* the checks read each draw's counts and pixels right after the draw is made, on this thread: the renderer's side
+       runs here too unless an argument asks for its thread (--gpu-split=1), where a draw is done only once that
+       thread has taken it */
+    g_settings.gpu_split = 0;
     /* the checks of guest memory read in place bind vertices and constant buffers there, as the runtime did before
        uma_copies, whose auto copies them on amdgpu (vk_uma_imports_dear): in place unless the command line says
        otherwise (--uma_copies=0 or 2), and check_uma_copies takes each value itself */
@@ -8134,6 +8621,9 @@ static int run_headless(int argc, char** argv) {
         CHECK(start_log);
         t_plat.log_redirect = start_log;
     }
+    /* SNX_TEST_SM86_TABLE=1: the renderer starts with the SM86 frontend, and takes the texture table where the device
+       has it, for the cases of Ounce programs that read it alone (vulkan_pool_map.inc) */
+    if (getenv("SNX_TEST_SM86_TABLE")) g_shader_sm86 = 1;
     video_init("Headless Vulkan fixture", "");
     if (start_log) {
         t_plat.log_redirect = NULL;
@@ -8167,6 +8657,9 @@ static int run_headless(int argc, char** argv) {
     if (getenv("SNX_TEST_RECORDER_ONLY")) { /* the recording thread's own sync alone, on the driver the loader picks */
         CHECK(!check_recorder_self_sync());
         CHECK(!check_release_stopped_recorder());
+        CHECK(!check_full_ring_sleeps());
+        CHECK(!check_rec_queue_submissions());
+        CHECK(!check_cb_grow_at_recycle());
         vk_finish();
         vk_pipeline_quiesce();
         printf("PASS headless Vulkan recorder only: %u validation messages\n", g_vk_validation_messages);
@@ -8174,6 +8667,9 @@ static int run_headless(int argc, char** argv) {
     }
     CHECK(!check_recorder_self_sync());
     CHECK(!check_release_stopped_recorder());
+    CHECK(!check_full_ring_sleeps());
+    CHECK(!check_rec_queue_submissions());
+    CHECK(!check_cb_grow_at_recycle());
     viw_install();
     /* every check with each draw binding the pipeline linked from its parts and never the one made whole
        (SNX_TEST_GPL=linked), or with each pipeline made whole, with the dynamic state the libraries gave (whole) */
@@ -8342,13 +8838,23 @@ static int run_headless(int argc, char** argv) {
         else if (!strcmp(name, "late_depth_shadow"))
             result = check_late_depth_shadow();
         else if (!strcmp(name, "shader_windows"))
-            result = check_shader_read_windows();
+            result = check_shader_read_windows() || check_sm86_long_window();
         else if (!strcmp(name, "texture_half"))
             result = check_texture_half_rounding();
         else if (!strcmp(name, "cross_stage_alias"))
             result = check_cross_stage_image_alias();
+        else if (!strcmp(name, "dma_named"))
+            result = check_dma_named();
+        else if (!strcmp(name, "writer_storage"))
+            result = check_writer_storage();
+        else if (!strcmp(name, "pool_map")) /* with SNX_TEST_SM86_TABLE=1 and --pool-map=1 (vulkan_pool_map.inc) */
+            result = check_pool_map_draws();
         else if (!strcmp(name, "lone_lane"))
             result = check_lone_lane();
+        else if (!strcmp(name, "compute_lone_lane"))
+            result = check_compute_lone_lane();
+        else if (!strcmp(name, "sm86_lanes"))
+            result = check_sm86_lanes();
         else if (!strcmp(name, "fragment_flow_lod"))
             result = check_fragment_flow_lod();
         else if (!strcmp(name, "fragment_quad"))
@@ -8361,6 +8867,8 @@ static int run_headless(int argc, char** argv) {
             result = check_targetless_stores();
         else if (!strcmp(name, "owned_page_reads"))
             result = check_owned_page_reads();
+        else if (!strcmp(name, "index_draws"))
+            result = check_index_draws();
         else if (!strcmp(name, "memory_release"))
             result = check_memory_release();
         else if (!strcmp(name, "cross_stage_blend"))
@@ -8388,7 +8896,9 @@ static int run_headless(int argc, char** argv) {
         else if (!strcmp(name, "cube_take"))
             result = check_cube_take();
         else if (!strcmp(name, "rt_stride"))
-            result = check_rt_stride();
+            result = check_rt_stride() || check_rt_stride_apart() || check_rt_stride_written();
+        else if (!strcmp(name, "rt_stride_written"))
+            result = check_rt_stride_written();
         else if (!strcmp(name, "cube_take_frames"))
             result = check_cube_take_frames();
         else if (!strcmp(name, "texture_quiet"))
@@ -8401,12 +8911,28 @@ static int run_headless(int argc, char** argv) {
             result = check_wlog_clear();
         else if (!strcmp(name, "poll_kick"))
             result = check_poll_kick();
+        else if (!strcmp(name, "mirror"))
+            result = check_mirror();
+        else if (!strcmp(name, "mirror_batch"))
+            result = check_mirror_batch();
+        else if (!strcmp(name, "finish_lets_go"))
+            result = check_finish_lets_go();
         else if (!strcmp(name, "descriptor_heaps"))
             result = check_descriptor_heaps();
+        else if (!strcmp(name, "heap_pipeline_flags"))
+            result = check_heap_pipeline_flags();
+        else if (!strcmp(name, "mesh_draws"))
+            result = check_mesh_draws();
+        else if (!strcmp(name, "vertex_restride"))
+            result = check_vertex_restride();
+        else if (!strcmp(name, "heap_shader_objects"))
+            result = check_heap_shader_objects();
         else if (!strcmp(name, "cb_address"))
             result = check_cb_address();
         else if (!strcmp(name, "indirect_dispatch"))
             result = check_indirect_dispatch_once();
+        else if (!strcmp(name, "compute_owned"))
+            result = check_compute_owned_input() || check_compute_owned_chain();
         else if (!strcmp(name, "integer_half"))
             result = check_shader_integer_half_rounding();
         else if (!strcmp(name, "integer_float"))
@@ -8442,6 +8968,7 @@ static int run_headless(int argc, char** argv) {
     if (getenv("SNX_TEST_RT_WATCH_ONLY")) { /* the watched targets' checks alone, for their mutants */
         CHECK(!check_rt_watch());
         CHECK(!check_zt_watch());
+        CHECK(!check_rt_watch_linear());
         vk_finish();
         vk_pipeline_quiesce();
         printf("PASS headless Vulkan watched targets only: %u validation messages\n", g_vk_validation_messages);
@@ -8562,6 +9089,7 @@ static int run_headless(int argc, char** argv) {
     }
     if (getenv("SNX_TEST_GPUPROF_POOL_ONLY")) { /* a smaller pool than the profile asks for, alone */
         CHECK(!check_gpuprof_small_pool());
+        CHECK(!check_gpuprof_fill());
         printf("PASS headless Vulkan profile pool only: %u validation messages\n", g_vk_validation_messages);
         return 0;
     }
@@ -8613,11 +9141,12 @@ static int run_headless(int argc, char** argv) {
         if (!strcmp(name, "way") && ++ran) CHECK(!check_uma_way());
         if (!strcmp(name, "region_writes") && ++ran) CHECK(!check_uma_region_writes());
         if (!strcmp(name, "region_merge") && ++ran) CHECK(!check_uma_region_merge());
+        if (!strcmp(name, "region_trap") && ++ran) CHECK(!check_uma_region_trap());
         if (!strcmp(name, "writes") && ++ran) CHECK(!check_uma_writes());
         if (!strcmp(name, "atlas_pending") && ++ran) CHECK(!check_uma_atlas_pending());
         if (!strcmp(name, "feedback") && ++ran) CHECK(!check_uma_feedback());
         if (!strcmp(name, "publish") && ++ran) CHECK(!check_uma_publish());
-        if (!strcmp(name, "publish_notraps") && ++ran) CHECK(!check_uma_publish_notraps());
+        if (!strcmp(name, "nvdec") && ++ran) CHECK(!check_uma_nvdec());
         if (!strcmp(name, "dispatch") && ++ran) CHECK(!check_uma_dispatch());
         if (!strcmp(name, "dispatch_atlas") && ++ran) CHECK(!check_uma_dispatch_atlas());
         if (!strcmp(name, "dispatch_open") && ++ran) CHECK(!check_uma_dispatch_open());
@@ -8635,6 +9164,17 @@ static int run_headless(int argc, char** argv) {
         if (!strcmp(name, "pages_partial") && ++ran) CHECK(!check_uma_pages_partial());
         if (!strcmp(name, "texture_region") && ++ran) CHECK(!check_uma_texture_region());
         if (!strcmp(name, "dma_region") && ++ran) CHECK(!check_uma_dma_region());
+#if !defined(_WIN32)
+        if (!strcmp(name, "region_dmabuf_trap") && ++ran) CHECK(!check_uma_region_dmabuf_trap());
+        if (!strcmp(name, "region_watch") && ++ran) CHECK(!check_uma_region_watch());
+        if (!strcmp(name, "region_letgo") && ++ran) CHECK(!check_uma_region_letgo());
+        if (!strcmp(name, "region_dead_bind") && ++ran) CHECK(!check_uma_region_dead_bind());
+        if (!strcmp(name, "region_watch_frames") && ++ran) CHECK(!check_uma_region_watch_frames());
+        if (!strcmp(name, "region_watch_writes") && ++ran) CHECK(!check_uma_region_watch_writes());
+        if (!strcmp(name, "region_watch_engine") && ++ran) CHECK(!check_uma_region_watch_engine());
+        if (!strcmp(name, "region_table") && ++ran) CHECK(!check_uma_region_table());
+        if (!strcmp(name, "region_stays") && ++ran) CHECK(!check_uma_region_stays());
+#endif
         if (!strcmp(name, "storage_region") && ++ran) CHECK(!check_uma_storage_region());
         if (!strcmp(name, "storage_order") && ++ran) CHECK(!check_uma_storage_order());
         if (!strcmp(name, "alias_in_place") && ++ran) CHECK(!check_uma_alias_in_place());
@@ -8646,10 +9186,14 @@ static int run_headless(int argc, char** argv) {
         if (!ran) {
             fprintf(stderr,
                     "SNX_TEST_UMA_ONLY=%s names no check: 1, runtime_write, constants, constants_copied, migrate, way, "
-                    "region_writes, region_merge, writes, atlas_pending, feedback, publish, dispatch, dispatch_open, "
-                    "texture_pending, dispatch_constants, "
+                    "region_writes, region_merge, region_trap, writes, atlas_pending, feedback, publish, dispatch, "
+                    "dispatch_open, "
+                    "nvdec, texture_pending, dispatch_constants, "
                     "dispatch_table, header_words, placed, placed_view, logged_back, trapped_window, copies, "
-                    "pages_producers, pages_counts, pages_partial, texture_region, dma_region, storage_region, "
+                    "pages_producers, pages_counts, pages_partial, texture_region, dma_region, region_dmabuf_trap, "
+                    "region_watch, region_letgo, region_dead_bind, region_watch_frames, region_watch_writes, "
+                    "region_watch_engine, region_table, region_stays, "
+                    "storage_region, "
                     "storage_order, alias_in_place, alias_fallback, alias_merge, alias_cpu_read, alias_shader or "
                     "alias_order\n",
                     name);
@@ -8671,7 +9215,7 @@ static int run_headless(int argc, char** argv) {
         CHECK(!check_uma_atlas_pending());
         CHECK(!check_uma_feedback());
         CHECK(!check_uma_publish());
-        CHECK(!check_uma_publish_notraps());
+        CHECK(!check_uma_nvdec());
         CHECK(!check_uma_dispatch());
         CHECK(!check_uma_dispatch_atlas());
         CHECK(!check_uma_dispatch_open());
@@ -8689,6 +9233,7 @@ static int run_headless(int argc, char** argv) {
         CHECK(!check_uma_migrate());
         CHECK(!check_uma_region_writes());
         CHECK(!check_uma_region_merge());
+        CHECK(!check_uma_region_trap());
         CHECK(!check_uma_pages_counts());
         CHECK(!check_uma_pages_producers());
         CHECK(!check_uma_pages_partial());
@@ -8732,6 +9277,8 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_chunk_written_first());
     CHECK(!check_stream_epoch());
     CHECK(!check_owned_readback());
+    CHECK(!check_owned_landing_stages());
+    CHECK(!check_finish_lets_go());
     CHECK(!check_mapping_lock());
     CHECK(!check_landing_wait());
     CHECK(!check_frame_ready());
@@ -8760,6 +9307,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_storage_logged());
     CHECK(!check_need_unlocked());
     CHECK(!check_mirror());
+    CHECK(!check_mirror_batch());
     CHECK(!check_pending_index());
     CHECK(!check_unmapped_tail());
     CHECK(!check_draw_storage_stages());
@@ -8795,6 +9343,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_nvn_blend_capture());
     CHECK(!check_late_depth_shadow());
     CHECK(!check_shader_read_windows());
+    CHECK(!check_sm86_long_window());
     CHECK(!check_texture_half_rounding());
     CHECK(!check_cross_stage_image_alias());
     CHECK(!check_cross_stage_blend_snapshots());
@@ -8817,6 +9366,10 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_texture_quiet_present());
     CHECK(!check_memo_over_target());
     CHECK(!check_descriptor_heaps());
+    CHECK(!check_heap_pipeline_flags());
+    CHECK(!check_heap_shader_objects());
+    CHECK(!check_link_optimized_after_presents());
+    CHECK(!check_blend_one_pipeline());
     CHECK(!check_cb_address());
     CHECK(!check_descriptor_memo());
     CHECK(!check_fragment_barrier_backend());
@@ -8846,6 +9399,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_frag_coord_origin());
     CHECK(!check_varying_passes());
     CHECK(!check_sm86_perspective_fold());
+    CHECK(!check_perspective_fold());
     CHECK(!check_rt_other_layout());
     CHECK(!check_vertex_restride());
     CHECK(!check_vertex_input_layouts());
@@ -8868,6 +9422,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_present_effects());
     CHECK(!check_clear_load_op());
     CHECK(!check_alias_newer_target());
+    CHECK(!check_remapped_target());
     CHECK(!check_sparse_while_submitting());
     CHECK(!check_multisample_shader_gate());
     CHECK(!check_translation_dead_code());
@@ -8885,6 +9440,10 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_shared_clamp());
     CHECK(!check_shared_spill());
     CHECK(!check_compute_arena_count());
+    CHECK(!check_compute_lone_lane());
+    CHECK(!check_sm86_lanes());
+    CHECK(!check_compute_owned_input());
+    CHECK(!check_compute_owned_chain());
     CHECK(!check_vic());
     CHECK(!check_vic_chain(shot));
     CHECK(!check_nvdec_vic());
@@ -8896,9 +9455,12 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_rt_superseded());
     CHECK(!check_rt_aside());
     CHECK(!check_rt_stride());
+    CHECK(!check_rt_stride_apart());
+    CHECK(!check_rt_stride_written());
     CHECK(!check_so_note());
     CHECK(!check_dma_bands_frames());
     CHECK(!check_flush_parts());
+    CHECK(!check_writeback_sweep());
     CHECK(!check_publish_bands());
     CHECK(!check_vic_bands());
     CHECK(!check_publish_padding());
@@ -8941,7 +9503,7 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_uma_atlas_pending());
     CHECK(!check_uma_feedback());
     CHECK(!check_uma_publish());
-    CHECK(!check_uma_publish_notraps());
+    CHECK(!check_uma_nvdec());
     CHECK(!check_uma_dispatch());
     CHECK(!check_uma_dispatch_atlas());
     CHECK(!check_uma_dispatch_open());
@@ -8956,12 +9518,14 @@ static int run_headless(int argc, char** argv) {
     CHECK(!check_rt_overlap());
     CHECK(!check_rt_watch());
     CHECK(!check_zt_watch());
+    CHECK(!check_rt_watch_linear());
     CHECK(!check_uma());
     CHECK(!check_uma_copies());
     CHECK(!check_uma_way());
     CHECK(!check_uma_migrate());
     CHECK(!check_uma_region_writes());
     CHECK(!check_uma_region_merge());
+    CHECK(!check_uma_region_trap());
     CHECK(!check_uma_pages_counts());
     CHECK(!check_uma_pages_producers());
     CHECK(!check_uma_pages_partial());
@@ -8987,17 +9551,17 @@ static int run_headless(int argc, char** argv) {
           snx_vk_pipeline_workers(0, 64) == 12);
     CHECK(snx_vk_pipeline_workers(5, 12) == 5 && snx_vk_pipeline_workers(32, 4) == 32 &&
           snx_vk_pipeline_workers(1, 64) == 1);
-    /* how a draw reads a target it writes at its own pixel: the interlock's capture on NVIDIA's and AMD's GPUs that
-       have all it needs, else two draws with dynamic rendering local read, else in place */
-    CHECK(vk_feedback_choice(0x10DE, 1, 1, 1, 1) == VK_FEEDBACK_INTERLOCK &&
-          vk_feedback_choice(0x1002, 1, 1, 1, 1) == VK_FEEDBACK_INTERLOCK &&
-          vk_feedback_choice(0x1002, 1, 1, 1, 0) == VK_FEEDBACK_INTERLOCK);
-    CHECK(vk_feedback_choice(0x8086, 1, 1, 1, 1) == VK_FEEDBACK_PREDRAW &&
-          vk_feedback_choice(0x1002, 1, 0, 1, 1) == VK_FEEDBACK_PREDRAW &&
-          vk_feedback_choice(0x1002, 0, 1, 1, 1) == VK_FEEDBACK_PREDRAW &&
-          vk_feedback_choice(0x10DE, 1, 1, 0, 1) == VK_FEEDBACK_PREDRAW);
-    CHECK(vk_feedback_choice(0x8086, 1, 1, 1, 0) == VK_FEEDBACK_IN_PLACE &&
-          vk_feedback_choice(0x1002, 1, 0, 1, 0) == VK_FEEDBACK_IN_PLACE);
+    /* how a draw reads a target it writes at its own pixel: the interlock's capture where a prefer line of the
+       extension bans holds for the driver and the device has all it needs, else two draws with dynamic rendering
+       local read, else in place */
+    CHECK(vk_feedback_choice(1, 1, 1, 1, 1) == VK_FEEDBACK_INTERLOCK &&
+          vk_feedback_choice(1, 1, 1, 1, 0) == VK_FEEDBACK_INTERLOCK);
+    CHECK(vk_feedback_choice(0, 1, 1, 1, 1) == VK_FEEDBACK_PREDRAW &&
+          vk_feedback_choice(1, 1, 0, 1, 1) == VK_FEEDBACK_PREDRAW &&
+          vk_feedback_choice(1, 0, 1, 1, 1) == VK_FEEDBACK_PREDRAW &&
+          vk_feedback_choice(1, 1, 1, 0, 1) == VK_FEEDBACK_PREDRAW);
+    CHECK(vk_feedback_choice(0, 1, 1, 1, 0) == VK_FEEDBACK_IN_PLACE &&
+          vk_feedback_choice(1, 1, 0, 1, 0) == VK_FEEDBACK_IN_PLACE);
 #if defined(__linux__)
     if (vk_rec_threaded()) { /* the workers started with the first draws': two at the main thread's nice, the rest low */
         int n = snx_vk_pipeline_workers(g_settings.pipeline_threads, plat_cpu_count()), low, normal, other;

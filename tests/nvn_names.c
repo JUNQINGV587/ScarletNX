@@ -25,7 +25,8 @@
 #include <stdlib.h>
 #include <string.h>
 
-static u8 memory[4 << 20];
+/* 16 MiB: the cases' programs are at GPU addresses up to 0xa00000, where an Ounce program's header is read */
+static u8 memory[16 << 20];
 u8* g_mem = memory; /* guest address a is memory + a */
 u64 g_code_lo, g_code_hi;
 const SnxNros* g_nros; /* main.c's: a game module without NROs of its own */
@@ -36,6 +37,9 @@ _Atomic int g_vi_refresh_hz = 60; /* present.c's: the display at VI_REFRESH_HZ *
 #define POOL      0x1000u
 #define POOL_B    0x1100u
 #define POOL_MEM  0x100000u
+#define POOL3     0x1400u
+#define POOL3_B   0x1500u
+#define POOL3_MEM 0x80000u
 #define CMDBUF    0x2000u
 #define TEX       0x3000u
 #define TEX_B     0x3100u
@@ -122,6 +126,11 @@ void core_leave(KThread* t) { (void)t; }
 u64 guest_ticks(void) { return 0; }
 static u64 g_gpu_ticks; /* guest_gpu_ticks's answer */
 u64 guest_gpu_ticks(void) { return g_gpu_ticks; }
+int gpu_release_stamp_sync(u64 cpu, int may_wait) {
+    (void)cpu;
+    (void)may_wait;
+    return 0;
+}
 u64 plat_ns(void) { return 1; }
 static i64 g_slept; /* what the runtime asked to sleep, in all */
 void plat_sleep_ns(i64 ns) { g_slept += ns; }
@@ -166,10 +175,25 @@ void gpu_pool_remove(u64 gva) { (void)gva; }
 /* the registry of the live textures (gpu/guest_textures.c), which no test here reads */
 void gpu_texture_add(u64 gva, u64 size) { (void)gva, (void)size; }
 void gpu_texture_remove(u64 gva) { (void)gva; }
+/* the allocator's answers counted: an address of its own, and the ranges a pool asks for at its storage's address,
+   which g_at_refuse turns down; given back counts what went back at once */
+static int g_alloc_calls, g_at_calls, g_at_refuse, g_given_back;
+static u64 g_given_back_at;
 u64 gmmu_space_alloc(u64 size, u64 align) {
     (void)size;
     (void)align;
+    g_alloc_calls++;
     return POOL_MEM;
+}
+u64 gmmu_space_alloc_at(u64 gva, u64 size) {
+    (void)size;
+    g_at_calls++;
+    return g_at_refuse ? 0 : gva;
+}
+void gmmu_space_give_back(u64 gva, u64 size) {
+    (void)size;
+    g_given_back++;
+    g_given_back_at = gva;
 }
 void gmmu_space_map(u64 gva, u64 cpu, u64 size) {
     (void)gva;
@@ -185,24 +209,42 @@ void gmmu_space_free(u64 gva, u64 size) {
     (void)size;
 }
 /* the page table's changes the GPU thread makes later (hle/services/nvdrv.c), made at once: no page table here, and
-   a freed pool's nvmap handle goes */
+   the nvmap handle of a pool unmapped or freed goes; the last change's kind is kept */
+static GmmuLaterKind g_later_kind;
 u32 gmmu_later(GmmuLaterKind kind, u64 gva, u64 cpu, u64 size, u32 nvmap) {
     (void)gva, (void)cpu, (void)size;
-    if (kind == GMMU_LATER_FREE) nvmap_handle_drop(nvmap);
+    g_later_kind = kind;
+    if (kind != GMMU_LATER_MAP) nvmap_handle_drop(nvmap);
     return 1;
 }
 void gmmu_later_post(u32 seq) { (void)seq; }
+/* the waits for the GPU thread's changes, counted: made at once here */
+static int g_later_waits;
+int gmmu_later_wait(u32 seq, i64 timeout_ns) {
+    (void)seq;
+    g_later_waits += timeout_ns > 0;
+    return 1;
+}
 u64 gmmu_run(u64 gva, u64 max, u64* cpu) {
     *cpu = gva;
     return max;
 }
+/* the GPU's bytes at gva, which are the test's memory's: past it they are whatever the host has there, or a fault */
+static u8* gpu_bytes(u64 gva, u64 size) {
+    if (gva > sizeof memory || size > sizeof memory - gva) {
+        fprintf(stderr, "nvn_names: %llu bytes at 0x%llx are outside the test's memory of 0x%zx bytes\n",
+                (unsigned long long)size, (unsigned long long)gva, sizeof memory);
+        abort();
+    }
+    return GP(gva);
+}
 int gmem_read(u64 gva, void* dst, u64 size) {
-    memcpy(dst, GP(gva), size);
+    memcpy(dst, gpu_bytes(gva, size), size);
     return 1;
 }
-void gmem_read_code(u64 gva, void* dst, u64 size) { memcpy(dst, GP(gva), size); }
+void gmem_read_code(u64 gva, void* dst, u64 size) { memcpy(dst, gpu_bytes(gva, size), size); }
 int gmem_write(u64 gva, const void* src, u64 size) {
-    memcpy(GP(gva), src, size);
+    memcpy(gpu_bytes(gva, size), src, size);
     return 0;
 }
 int g_shader_sm86; /* shader.c's: Maxwell programs */
@@ -319,6 +361,9 @@ static void r_draw_texture(const DsState* ds, const DrawTexture* t) {
 }
 static Renderer g_test_renderer;
 const Renderer* g_renderer = &g_test_renderer;
+/* the render enable and the reports of the engines (maxwell/engines.c) */
+void gpu_render_enable_nvn(u32 owner, u32 mode, u64 a) { (void)owner, (void)mode, (void)a; }
+void gpu_report_samples(u32 owner, u64 a, int counted, u64 value) { (void)owner, (void)a, (void)counted, (void)value; }
 
 static int failures;
 static void check(int ok, const char* what) {
@@ -354,10 +399,96 @@ static u32 replay(NvnDraw* d, u64 p, u32 want) {
     }
 }
 
+/* what the renderer answers of the GPU's results over a range (Renderer.gpu_holds), and the range it was asked of */
+static int g_holds;
+static u64 g_holds_at, g_holds_size;
+static int r_gpu_holds(u64 gva, u64 size) {
+    g_holds_at = gva;
+    g_holds_size = size;
+    return g_holds;
+}
+/* an Ounce pool that ends while the GPU's results over it haven't landed waits until its unmap has landed them,
+   within a bound; one with none over it, and a Switch device's pool, go at once */
+static void test_pool_end_waits(void) {
+    g_test_renderer.gpu_holds = r_gpu_holds;
+    nvn_MemoryPoolBuilderSetDefaults(NULL, POOL3_B);
+    nvn_MemoryPoolBuilderSetStorage(NULL, POOL3_B, POOL3_MEM, 0x10000);
+    g_ounce = 1;
+    g_holds = 1;
+    g_later_waits = 0;
+    g_holds_size = 0;
+    check(nvn_MemoryPoolInitialize(NULL, POOL3, POOL3_B), "an Ounce pool initializes");
+    const u64 gva = nvn_MemoryPoolGetBufferAddress(NULL, POOL3);
+    nvn_MemoryPoolFinalize(NULL, POOL3);
+    check(g_later_waits == 1 && g_holds_at == gva && g_holds_size == 0x10000,
+          "an Ounce pool ending with the GPU's results over it waits for them to land");
+    g_holds = 0;
+    check(nvn_MemoryPoolInitialize(NULL, POOL3, POOL3_B), "it initializes again");
+    nvn_MemoryPoolFinalize(NULL, POOL3);
+    check(g_later_waits == 1, "with none over it, it ends at once");
+    g_ounce = 0;
+    g_holds = 1;
+    check(nvn_MemoryPoolInitialize(NULL, POOL3, POOL3_B), "a Switch device's pool initializes");
+    nvn_MemoryPoolFinalize(NULL, POOL3);
+    check(g_later_waits == 1, "a Switch device's pool ends at once, as before");
+    g_test_renderer.gpu_holds = NULL;
+}
+
 static void pool_init(void) {
     nvn_MemoryPoolBuilderSetDefaults(NULL, POOL_B);
     nvn_MemoryPoolBuilderSetStorage(NULL, POOL_B, POOL_MEM, 0x100000);
     check(nvn_MemoryPoolInitialize(NULL, POOL, POOL_B), "the pool initializes");
+}
+
+/* An Ounce device's pool with storage is at the storage's own GPU address, which goes back to the allocator as the
+   pool ends, its unmap queued; a virtual pool, a Switch device's pool and a pool whose range is taken take the
+   allocator's address */
+#define POOL2      0x1200u
+#define POOL2_B    0x1300u
+#define POOL2_MEM  0x40000u
+#define POOL_FLAGS 0xa1 /* the CPU can't access it: GPU cached, compressible */
+static void test_pool_own_address(void) {
+    g_ounce = 1;
+    g_alloc_calls = g_at_calls = g_given_back = 0;
+    nvn_MemoryPoolBuilderSetDefaults(NULL, POOL2_B);
+    nvn_MemoryPoolBuilderSetFlags(NULL, POOL2_B, POOL_FLAGS);
+    nvn_MemoryPoolBuilderSetStorage(NULL, POOL2_B, POOL2_MEM, 0x30000);
+    check(nvn_MemoryPoolInitialize(NULL, POOL2, POOL2_B), "an Ounce pool initializes");
+    check(nvn_MemoryPoolGetBufferAddress(NULL, POOL2) == POOL2_MEM && nvn_MemoryPoolMap(NULL, POOL2) == POOL2_MEM,
+          "an Ounce pool's buffer address is its storage's");
+    check(g_at_calls == 1 && g_alloc_calls == 0, "its address is asked for at the storage, not of the allocator");
+    nvn_MemoryPoolFinalize(NULL, POOL2);
+    check(g_given_back == 1 && g_given_back_at == POOL2_MEM && g_later_kind == GMMU_LATER_UNMAP,
+          "the ended pool's range goes back at once, its unmap queued");
+    /* the same storage again: the same address */
+    check(nvn_MemoryPoolInitialize(NULL, POOL2, POOL2_B) && nvn_MemoryPoolGetBufferAddress(NULL, POOL2) == POOL2_MEM,
+          "a pool over the same storage takes the same address");
+    nvn_MemoryPoolFinalize(NULL, POOL2);
+    /* a range another pool holds: the allocator's, and freed as one of its own */
+    g_at_refuse = 1;
+    g_alloc_calls = g_given_back = 0;
+    nvn_MemoryPoolBuilderSetStorage(NULL, POOL2_B, POOL2_MEM + 0x1000, 0x30000);
+    check(nvn_MemoryPoolInitialize(NULL, POOL2, POOL2_B) && g_alloc_calls == 1 &&
+              nvn_MemoryPoolGetBufferAddress(NULL, POOL2) == POOL_MEM,
+          "a pool whose range is taken gets the allocator's address");
+    nvn_MemoryPoolFinalize(NULL, POOL2);
+    check(g_given_back == 0 && g_later_kind == GMMU_LATER_FREE, "which goes back after its unmap, as before");
+    g_at_refuse = 0;
+    /* a virtual pool has no storage: the allocator's */
+    g_at_calls = g_alloc_calls = 0;
+    nvn_MemoryPoolBuilderSetFlags(NULL, POOL2_B, 0x200);
+    nvn_MemoryPoolBuilderSetStorage(NULL, POOL2_B, 0, 0x30000);
+    check(nvn_MemoryPoolInitialize(NULL, POOL2, POOL2_B) && g_at_calls == 0 && g_alloc_calls == 1,
+          "a virtual pool takes the allocator's address");
+    nvn_MemoryPoolFinalize(NULL, POOL2);
+    /* a Switch device's pool: the allocator's, as before */
+    g_ounce = 0;
+    g_at_calls = g_alloc_calls = 0;
+    nvn_MemoryPoolBuilderSetFlags(NULL, POOL2_B, POOL_FLAGS);
+    nvn_MemoryPoolBuilderSetStorage(NULL, POOL2_B, POOL2_MEM, 0x30000);
+    check(nvn_MemoryPoolInitialize(NULL, POOL2, POOL2_B) && g_at_calls == 0 && g_alloc_calls == 1,
+          "a Switch pool takes the allocator's address");
+    nvn_MemoryPoolFinalize(NULL, POOL2);
 }
 
 /* ---- command buffers */
@@ -392,7 +523,7 @@ static void test_command_buffer(void) {
     nvn_CommandBufferSetPatchSize(NULL, CMDBUF, -1);
     nvn_CommandBufferSetPatchSize(NULL, CMDBUF, 33);
     check(nvn_CommandBufferGetCommandMemoryFree(NULL, CMDBUF) == patch_free,
-          "patch sizes outside1..32 record nothing");
+          "patch sizes outside 1..32 record nothing");
     nvn_CommandBufferSetAlphaRef(NULL, CMDBUF, 0.375f);
     nvn_CommandBufferSetPointSize(NULL, CMDBUF, 3.0f);
     nvn_CommandBufferSetDepthBounds(NULL, CMDBUF, 1, 0.125f, 0.875f);
@@ -425,11 +556,11 @@ static void test_command_buffer(void) {
     memory_before = nvn_CommandBufferGetCommandMemoryFree(NULL, CMDBUF);
     nvn_CommandBufferSetSubpixelPrecisionBias(NULL, CMDBUF, 3, 8);
     check(memory_before - nvn_CommandBufferGetCommandMemoryFree(NULL, CMDBUF) == 128,
-          "precision bias accounts for all16 viewport commands");
+          "precision bias accounts for all 16 viewport commands");
     nvn_CommandBufferSetSubpixelPrecisionBias(NULL, CMDBUF, 9, 0);
     nvn_CommandBufferSetSubpixelPrecisionBias(NULL, CMDBUF, 0, -1);
     check(memory_before - nvn_CommandBufferGetCommandMemoryFree(NULL, CMDBUF) == 128,
-          "precision bias outside0..8 records nothing");
+          "precision bias outside 0..8 records nothing");
     check(nvn_ProgramInitialize(NULL, PROGRAM, DEVICE), "a program");
     nvn_ProgramSetSampleShading(NULL, PROGRAM, 1);
     nvn_CommandBufferBindProgram(NULL, CMDBUF, PROGRAM, NVN_SHADER_STAGE_FRAGMENT_BIT);
@@ -616,9 +747,9 @@ static void test_tessellation_metadata(void) {
     for (u32 i = 0; i < 1153; i++)
         check(nvn_ProgramSetShaders(NULL, PROGRAM, 1, pairs), "a program update past the former metadata limit");
     check(g_nvn.object.ntess > 1024 && g_nvn.object.ntess <= g_nvn.object.tess_capacity,
-          "tessellation metadata grows beyond1024 program updates");
+          "tessellation metadata grows beyond 1024 program updates");
     check(g_nvn.object.nxfb > 1024 && g_nvn.object.nxfb <= g_nvn.object.xfb_capacity,
-          "transform feedback metadata grows beyond1024 program updates");
+          "transform feedback metadata grows beyond 1024 program updates");
     for (u32 i = 0; i < g_nvn.object.ntess; i++) {
         NvnTessStage found[2] = {{0}};
         const NvnTessEntry* entry = &g_nvn.object.tess[i];
@@ -719,6 +850,31 @@ static void test_early_tests(void) {
         check(replay(&draw, handle, OP_DRAW) == 1 && g_ds.prog.early_z == asks,
               "a bind of the fragment program gives the draw its early tests");
     }
+    /* an Ounce fragment program asks at its section's byte 0x5b (nvn_section_early_z), its header at the code's start
+       saying it is a fragment program */
+    gw32(0x900000, 2u | 4u << 5 | 5u << 10);
+    for (u32 asks = 0; asks < 2; asks++) {
+        memset(GP(control), 0, 0xd8);
+        gw32(control, 0x98761234);
+        gw32(control + 4, 0xc9);
+        gw32(control + 8, 11);
+        gw32(control + 0x54, (u32)NVN_SHADER_STAGE_FRAGMENT << 16); /* the stage, the halfword at 0x56 */
+        GP(control)[0x5b] = (u8)asks;
+        GP(control)[0xa6] = 1; /* a byte of another meaning */
+        gw64(pairs, 0x900000);
+        gw64(pairs + 8, control);
+        check(nvn_ProgramSetShaders(NULL, PROGRAM, 1, pairs), "an Ounce fragment program");
+        check(nvn_program_early_z(NVN_OBJ(const NvnProgram, PROGRAM)->serial) == (int)asks,
+              "SetShaders keeps an Ounce section's early test byte");
+        nvn_CommandBufferBeginRecording(NULL, CMDBUF);
+        nvn_CommandBufferBindProgram(NULL, CMDBUF, PROGRAM, NVN_SHADER_STAGE_FRAGMENT_BIT);
+        nvn_CommandBufferDrawArrays(NULL, CMDBUF, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
+        u64 handle = nvn_CommandBufferEndRecording(NULL, CMDBUF);
+        memset(GP(control), 0, 0xd8);
+        check(replay(&draw, handle, OP_DRAW) == 1 && g_ds.prog.early_z == asks,
+              "a bind of the Ounce fragment program gives the draw its early tests");
+    }
+    gw32(0x900000, 0);
     /* the fragment program with the byte bound, then a vertex program alone: the fragment stage's flag stays */
     tess_control(control, NVN_SHADER_STAGE_FRAGMENT, 16, (const u32[4]){0}, 0);
     GP(control)[0x718] = 1;
@@ -1106,6 +1262,42 @@ static void test_sampler(void) {
     check(g_written == written + 4 && g_written_at == slot && g_written_size == 32, "and its 32 bytes are recorded");
     g_finish_at = 0;
 }
+/* a texture's descriptor over another, which the work submitted before and not replayed yet reads as it binds: it is
+   done while the slot still holds the one it was submitted with, as with a sampler's. The one the slot holds already
+   waits for nothing */
+static void test_texture_pool_waits(void) {
+    const u64 tp = SCRATCH + 0x100, a = SCRATCH + 0x200, b = a + sizeof(NvnTexture), slot = POOL_MEM + 0x40400 + 32 * 2;
+    u32 first[8], second[8], zero[8] = {0};
+    NvnTexture t = {.magic = NVN_MAGIC('T', 'E', 'X', 0)};
+    t.d.target = NVN_TEXTURE_TARGET_2D;
+    t.d.format = NVN_FORMAT_RGBA8;
+    t.d.width = 64;
+    t.d.height = 32;
+    t.d.depth = t.d.levels = 1;
+    t.gpu = 0x10000;
+    memcpy(GP(a), &t, sizeof t);
+    t.gpu = 0x20000;
+    memcpy(GP(b), &t, sizeof t);
+    memset(GP(POOL_MEM + 0x40400), 0, 8 * 32);
+    check(nvn_TexturePoolInitialize(NULL, tp, POOL, 0x40400, 8), "a texture pool");
+    u32 waits = g_finish_all, written = g_written;
+    g_finish_at = slot;
+    nvn_TexturePoolRegisterTexture(NULL, tp, 2, a, 0);
+    memcpy(first, GP(slot), 32);
+    check(memcmp(first, zero, 32) != 0 && g_finish_all == waits + 1 && !memcmp(g_finish_saw, zero, 32),
+          "a texture's descriptor over an empty one waits before it is written");
+    nvn_TexturePoolRegisterTexture(NULL, tp, 2, b, 0);
+    memcpy(second, GP(slot), 32);
+    check(memcmp(second, first, 32) != 0 && g_finish_all == waits + 2 && !memcmp(g_finish_saw, first, 32),
+          "a texture's descriptor over another waits before it is written");
+    check(g_written == written + 2 && g_written_at == slot && g_written_size == 32, "and its 32 bytes are recorded");
+    nvn_TexturePoolRegisterTexture(NULL, tp, 2, b, 0);
+    check(g_finish_all == waits + 2 && g_written == written + 2, "the same texture again waits for nothing");
+    nvn_TexturePoolRegisterTexture(NULL, tp, 2, 0, 0);
+    check(g_finish_all == waits + 3 && !memcmp(g_finish_saw, second, 32) && !memcmp(GP(slot), zero, 32),
+          "no texture over one waits before it is written");
+    g_finish_at = 0;
+}
 
 /* ---- events, programs, syncs */
 static void test_objects(void) {
@@ -1399,11 +1591,14 @@ static void test_sync_never_fenced(void) {
 }
 
 #include "nvn_discard.inc"
+unsigned int syncpt_read(unsigned int id) { (void)id; return 0; }
 
 int main(void) {
     nvn_init();
     test_device();
     pool_init();
+    test_pool_own_address();
+    test_pool_end_waits();
     test_command_buffer();
     test_tessellation_metadata();
     test_ounce_program_records();
@@ -1414,6 +1609,7 @@ int main(void) {
     test_texture();
     test_array_surface();
     test_sampler();
+    test_texture_pool_waits();
     test_objects();
     test_state();
     test_queue_window();

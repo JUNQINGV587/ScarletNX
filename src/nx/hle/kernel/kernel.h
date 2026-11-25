@@ -97,7 +97,14 @@ struct KThread {
     /* what an IPC request it is in holds: its session's reference (kobj_id) and an nvdrv ioctl's use of its fd (the fd
        plus 1), which a request a restored thread makes again lets go of first (svc_service_retry) */
     u32 req_session, req_nvfd;
-    int wait_kind; /* 0 none, 1 objects, 2 mutex, 3 condition variable, 4 address, 5 being paused */
+    int wait_kind; /* 0 none, 1 objects, 2 mutex, 3 condition variable, 5 being paused (an address wait: arb_in) */
+    /* An address wait (svcWaitForAddress) is under its word's bucket lock (g_host.kernel.arb_lk), not g_klock: arb_in
+       is the bucket plus 1 while the thread waits there, 0 otherwise, and wait_ticket its place among waiters of one
+       priority (a priority change moves it behind them, as the console requeues it). Atomic: g_klock's holders read
+       them (a priority change, the thread dump) */
+    _Atomic int arb_in;
+    _Atomic u64 wait_ticket;
+    _Atomic int arb_prio; /* prio, as an address wait's wake reads it with no g_klock */
     /* kinds 1 and 5: the objects it waits on (kobj_id), as many times as it named each; kind 1's wait_key is the one
        whose signal woke it, 0 before */
     u32 waits[64];
@@ -132,6 +139,12 @@ typedef struct KTmem {
 } KTmem;
 
 void kernel_init(void);
+/* emulated_cores_mode's Auto (settings.txt) */
+#define SNX_KERNEL_CORES_AUTO 2
+/* 1 when a guest thread runs only while it holds one of the console's cores: emulated_cores_mode's On, and its Auto for
+   a program that is not an Ounce one (g_ounce), whose eight cores run best without the ordering (main.c's npdm_layout
+   names it as the game starts) */
+int kernel_emulated_cores(void);
 /* memory_fit_mode's measure, as the game starts: what the system can still give the process (available) and what the process
    holds (footprint), when measured says the system told both. The game is told no more than mem_fit_budget's */
 void mem_fit(int measured, u64 available, u64 footprint);

@@ -25,9 +25,11 @@
 #include <string.h>
 
 /* What a hook's versions compare (hookgen's @version): HOOK_SDK the nnSdk version of the SDK label in the module that
-   exports the function (x << 16 | y << 8 | z), HOOK_NVN the NVN API version (major << 16 | minor). HOOK_ANY is an
-   unversioned hook's, which holds for every module. A version of 0 is unknown, and only HOOK_ANY holds for it */
-enum { HOOK_ANY, HOOK_SDK, HOOK_NVN, HOOK_KEYS };
+   exports the function (x << 16 | y << 8 | z), HOOK_NVN the NVN API version (major << 16 | minor), HOOK_MOVIE the
+   version of the movie library's label in that module (NintendoSDK_movie-x_y_z, packed as HOOK_SDK's: its subsdk
+   module has no nnSdk label). HOOK_ANY is an unversioned hook's, which holds for every module. A version of 0 is
+   unknown, and only HOOK_ANY holds for it */
+enum { HOOK_ANY, HOOK_SDK, HOOK_NVN, HOOK_MOVIE, HOOK_KEYS };
 
 /* a hook's check (hookgen's check FN): whether the function at guest address addr, which the hook's pattern matched,
    has the shape its handler does the work of; 0 leaves it to its own code */
@@ -62,6 +64,18 @@ void hook_range_text(char* out, size_t n, int key, u32 lo, u32 hi);
    many symbols have declarations that all are for other versions than their module's, and the first one's name,
    module, version and the versions it is declared for */
 void hook_missed_text(char* out, size_t n);
+/* The same stop of a 32-bit game whose SDK no declaration was read in: "" unless hook_install found a function of its
+   SDK with a declaration for a 32-bit game and none for that SDK (HOOK_A32_READ_SDK), else a sentence with the SDK's
+   version and module, HOOK_A32_READ_SDK, how many of the functions each family has, and what a player can do */
+void hook_unread_text(char* out, size_t n);
+/* The same stop with the settings turning the hooks of family off: "" unless hook_family_off(family), else a sentence
+   with the setting that does, its value and its default */
+void hook_off_text(char* out, size_t n, const char* family);
+/* the SDK the declarations for a 32-bit game were read in, 0.12.16, the one 32-bit SDK read: they hold for it alone
+   (a32 @version) */
+#define HOOK_A32_READ_SDK (0u << 16 | 12u << 8 | 16u)
+/* the most families HostHook.unread counts */
+#define HOOK_FAMILY_SLOTS 64
 
 /* Runs the guest function fn(a0, a1, a2, a3) from inside a handler, as nvn_cmd.c's guest_call runs a game's
    callback: its return to the handler's own return address ends the run, and the link register is put back
@@ -200,6 +214,9 @@ typedef struct {
     u32 a32_addr[HOOK_SITES];
     SnxArmBlock a32_orig[HOOK_SITES];
     u32 missed, missed_entry, missed_module, missed_version;
+    /* in a 32-bit game, the functions hook_install found with a declaration for a 32-bit game and none for their
+       module's SDK, by family, for hook_unread_text; and how many, and the first one's module and that SDK */
+    u32 unread[HOOK_FAMILY_SLOTS], unread_total, unread_module, unread_sdk;
 } HostHook;
 
 /* hooks the functions the game exports that hooks.hook names, and those of the game's builds that the address hooks
@@ -271,6 +288,11 @@ int libc_wide_ready(void);
 /* alloc.c: the host allocator's arena in guest memory is made (made at the first call): 0 without one, and the alloc
    family is then off */
 int alloc_ready(void);
+/* alloc.c: why the game keeps its own allocator, whose malloc takes its blocks from an allocator object of its own (the
+   family is then off), NULL when the family may run */
+const char* alloc_kept(void);
+/* alloc.c: whether the function at addr (size bytes, 0 when unknown) calls through an object's virtual table */
+int alloc_object_call(u64 addr, u64 size);
 /* os_sync.c: the game's SDK exports every function that writes the lock and condition variable words the os_sync
    family owns, which it takes all of or none of */
 int os_sync_ready(void);

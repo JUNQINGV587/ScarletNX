@@ -108,6 +108,22 @@ if(WIN32)
     target_link_libraries(scarletnx-platform PUBLIC synchronization) # plat_wait_word's WaitOnAddress
 endif()
 
+# Bluetooth LE adverts a scan hears (platform/ble_scan.h): the scan over its backend, the fake backend and the Joy-Con
+# 2's advert, no OS. The system's backend is a library of its own, snx_ble_system, which only the launcher links (the
+# tests link a fake in its place, tests/support/ble_fake_system.c): BlueZ over libsystemd's sd-bus, opened at run time,
+# on Linux; none elsewhere yet (Windows' designed in ble_none.c)
+add_library(snx_ble STATIC platform/ble_scan.c)
+set_target_properties(snx_ble PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON)
+target_compile_options(snx_ble PRIVATE -Wall -Wextra -Werror=missing-prototypes)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(snx_ble_system STATIC platform/ble_bluez.c)
+else()
+    add_library(snx_ble_system STATIC platform/ble_none.c)
+endif()
+set_target_properties(snx_ble_system PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON)
+target_compile_options(snx_ble_system PRIVATE -Wall -Wextra -Werror=missing-prototypes)
+target_link_libraries(snx_ble_system PUBLIC snx_ble scarletnx-platform)
+
 # The same indexed host filesystem and shared immutable file views (platform/file.h) serve NX
 # and CTR. No guest ABI or runtime/platform dependency enters this target.
 add_library(scarletnx-filesystem STATIC filesystem/tree.c)
@@ -138,11 +154,11 @@ endif()
 
 # The DS's and the 3DS's online services through their communities' replacements (online/, its README.md): the WFC
 # services and the DS firmware's connection slot, a DNS resolver, NASC's login on Pretendo Network and the 3DS
-# console's files. Strict C99 on the host's own sockets
+# console's files. Strict ISO C23 on the host's own sockets
 if(SNX_BUILD_NDS OR SNX_BUILD_3DS OR BUILD_TESTING)
     add_library(snx_online STATIC online/wfc.c online/dns.c online/resolve.c online/socket.c online/nasc.c
         online/ctr.c online/hosts.c)
-    set_target_properties(snx_online PROPERTIES C_STANDARD 99 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
+    set_target_properties(snx_online PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF
         POSITION_INDEPENDENT_CODE ON)
     target_compile_options(snx_online PRIVATE -pedantic-errors -Wall -Wextra -Werror=missing-prototypes)
     if(WIN32)
@@ -214,6 +230,9 @@ if(TARGET Vulkan::Headers AND TARGET SDL3::SDL3)
                    DEFINES NIS_OUTPUT_RGBA8)
     snx_glsl_spirv(snx_vk_common SOURCE gpu/vk/fx/sgsr1.vert NAME fx_sgsr_vert_spv HEADER common/gpu/vk/fx_spv.h)
     snx_glsl_spirv(snx_vk_common SOURCE gpu/vk/fx/sgsr1.frag NAME fx_sgsr_frag_spv HEADER common/gpu/vk/fx_spv.h)
+    # SMAA's area and search textures, which tools/areatexgen writes (cmake/areatex.cmake)
+    include("${PROJECT_SOURCE_DIR}/cmake/areatex.cmake")
+    target_sources(snx_vk_common PRIVATE "${snx_areatex_h}" "${snx_searchtex_h}")
     # a notice's band drawn in a window's rendering (gpu/vk/notice.c), over the effects' fullscreen triangle
     snx_glsl_spirv(snx_vk_common SOURCE gpu/vk/notice.frag NAME notice_frag_spv HEADER common/gpu/vk/notice_spv.h)
     # The GPU driver a run asks for (gpu/vk/gpu_driver_load.h), which the window's instance and surface are made through:

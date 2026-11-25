@@ -28,6 +28,13 @@ int main(void) {
     feed(&s, "  compiled block 3/4: code_002 (1.0 s)\nLLVM module: 1.1 MB\nBuilt /games/Game\n", 40);
     assert(s.count == 5 && at(&s, 3)->state == GUI_STEP_DONE && !strcmp(at(&s, 4)->label, "BUILD"));
     assert(at(&s, 4)->state == GUI_STEP_DONE && gui_steps_percent(&s) == 100);
+    {
+        /* a game built before says Built alone: the whole of it is done */
+        GuiSteps built;
+        gui_steps_reset(&built);
+        feed(&built, "Built /games/Game\n", 10);
+        assert(built.count == 1 && !strcmp(at(&built, 0)->label, "BUILD") && gui_steps_percent(&built) == 100);
+    }
     feed(&s, "ScarletNX - Game\nvulkan: AMD Radeon RX 6700 XT (RADV NAVI22), Vulkan 1.4.354, driver 1\n", 50);
     feed(&s, "vulkan: pipeline cache loaded (662 KB)\nvulkan: Other GPU, Vulkan 1.3\n", 60);
     assert(s.count == 7 && !strcmp(at(&s, 5)->label, "LAUNCH") && !strcmp(at(&s, 5)->detail, "Game"));
@@ -64,12 +71,14 @@ int main(void) {
     assert(s.switching == 0 && s.program == 2 && !strcmp(at(&s, 3)->label, "LAUNCH"));
     feed(&s, "The game starts its program x, of no number\n", 5); /* not the driver's line: a note */
     assert(s.switching == 0 && s.count == 4);
+    feed(&s, "The game starts its program 7\n", 5); /* nor a number with no name after it */
+    assert(s.switching == 0 && s.count == 4 && s.program == 2);
     feed(&s, "The game starts its program 1, Other\n", 6); /* no program it started from: not known */
     assert(s.program == 1 && s.previous == -1 && !strcmp(s.next, "Other"));
 
     /* Vita's compiler reports completed parallel chunks, not NX function blocks. */
     gui_steps_reset(&s);
-    feed(&s, "Recompiling PCSG00001 (Vita AArch32)\nDiscovered 1200 blocks (4 addresses were not code)\n", 70);
+    feed(&s, "Recompiling PCSG00001 (Vita AArch32)\nDiscovered 1200 blocks\n", 70);
     assert(gui_steps_last(&s, "RECOMPILE") && gui_steps_percent(&s) == 0);
     feed(&s, "Compiled 1/12 chunks of blocks\n", 80);
     assert(gui_steps_percent(&s) == 8);

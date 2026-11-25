@@ -7,6 +7,7 @@
    signature, by which the calls with variable arguments read them */
 #define _GNU_SOURCE
 #include "android/bridge/arm32.h"
+#include "android/bridge/bridge.h"
 #include "android/bridge/jni.h"
 #include "common/utilities/common.h"
 #include "common/utilities/endian.h"
@@ -67,12 +68,28 @@ static JNIEnv* env_of(void) {
     if (!t_env && !(*j.vm)->AttachCurrentThreadAsDaemon(j.vm, (void**)&t_env, NULL)) t_attached = true;
     return t_env;
 }
+static void locals_end(void* what) {
+    if (t_locals.items == what) {
+        t_locals.items = NULL;
+        t_locals.count = t_locals.capacity = 0;
+    }
+    free(what);
+}
+static void frames_end(void* what) {
+    if (t_frames.marks == what) {
+        t_frames.marks = NULL;
+        t_frames.count = t_frames.capacity = 0;
+    }
+    free(what);
+}
 void arm32_jni_thread_end(void) {
     if (t_attached) (*j.vm)->DetachCurrentThread(j.vm);
     t_attached = false;
     t_env = NULL;
-    t_locals.count = 0;
-    t_frames.count = 0;
+    bridge_thread_keep(locals_end, NULL);
+    locals_end(t_locals.items);
+    bridge_thread_keep(frames_end, NULL);
+    frames_end(t_frames.marks);
 }
 
 /* ---- references ---- */
@@ -95,6 +112,7 @@ static uint32_t local_ref(jobject o) {
         if (!items) abort();
         t_locals.items = items;
         t_locals.capacity = n;
+        bridge_thread_keep(locals_end, items);
     }
     t_locals.items[t_locals.count++] = o;
     return t_locals.count << 2 | REF_LOCAL;
@@ -395,9 +413,12 @@ static jarray new_array(JNIEnv* e, char t, jsize n) {
     }
 }
 /* the guest's copy of an array's elements */
+/* a copy's block in the window: a Java array or string of the 64-bit VM's can be longer than the window, and its
+   size is no 32 bits then; none is made, as when the window is full */
+static uint32_t window_malloc(uint64_t size) { return size > UINT32_MAX ? 0 : arm32_malloc((uint32_t)size); }
 static uint32_t elements(JNIEnv* e, char t, jarray a, uint32_t is_copy) {
     jsize n = (*e)->GetArrayLength(e, a);
-    uint32_t p = arm32_malloc((uint32_t)n * prim_size(t) + 8);
+    uint32_t p = window_malloc((uint64_t)(uint32_t)n * prim_size(t) + 8);
     if (p) region(e, t, false, a, 0, n, arm32_mem + p);
     if (is_copy) arm32_mem[is_copy] = 1;
     return p;
@@ -592,6 +613,7 @@ static void jni_function(SnxArmCPU* c, void* data) {
             if (!marks) abort();
             t_frames.marks = marks;
             t_frames.capacity = n;
+            bridge_thread_keep(frames_end, marks);
         }
         t_frames.marks[t_frames.count++] = t_locals.count;
         R(0) = (uint32_t)(*e)->PushLocalFrame(e, (jint)R(1));
@@ -646,7 +668,7 @@ static void jni_function(SnxArmCPU* c, void* data) {
     case 224: { /* GetStringCritical */
         jstring s = host_ref(R(1));
         jsize n = (*e)->GetStringLength(e, s);
-        uint32_t p = arm32_malloc((uint32_t)n * 2 + 2);
+        uint32_t p = window_malloc((uint64_t)(uint32_t)n * 2 + 2);
         if (p) {
             (*e)->GetStringRegion(e, s, 0, n, (jchar*)(arm32_mem + p));
             snx_st_le16(arm32_mem + p + 2 * (uint32_t)n, 0);
@@ -679,7 +701,7 @@ static void jni_function(SnxArmCPU* c, void* data) {
         jstring s = host_ref(R(1));
         jsize n = s ? (*e)->GetStringLength(e, s) : 0;
         const jchar* units = s ? (*e)->GetStringChars(e, s, NULL) : NULL;
-        uint32_t p = units ? arm32_malloc((uint32_t)bridge_art_utf8(units, (size_t)n, NULL) + 1) : 0;
+        uint32_t p = units ? window_malloc((uint64_t)bridge_art_utf8(units, (size_t)n, NULL) + 1) : 0;
         if (p) arm32_mem[p + bridge_art_utf8(units, (size_t)n, arm32_mem + p)] = 0;
         if (units) (*e)->ReleaseStringChars(e, s, units);
         if (R(2)) arm32_mem[R(2)] = 1;

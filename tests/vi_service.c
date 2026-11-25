@@ -176,6 +176,17 @@ int main(void) {
     u32 v, n;
     i64 size = 0;
     u64 layer = 0;
+    {
+        /* an indirect layer's image: 4 bytes a pixel in blocks of 0x20000, and sizes of any 64 bits whose product
+           keeps its low 64 (the sanitizers' build stops on a signed product that passes them) */
+        i64 bytes = 0, align = 0;
+        CHECK(nn_visrv_sf_IApplicationDisplayService_GetIndirectLayerImageRequiredMemoryInfo(NULL, 1280, 720, &bytes,
+                                                                                             &align) == 0);
+        CHECK(bytes == 0x3A0000 && align == 0x1000);
+        CHECK(nn_visrv_sf_IApplicationDisplayService_GetIndirectLayerImageRequiredMemoryInfo(NULL, (i64)1 << 62, 4,
+                                                                                             &bytes, &align) == 0);
+        CHECK(bytes == 0);
+    }
     nn_vi_DisplayName name;
     IpcBuf window = {0x1000, 0x100, 0};
     g_mem = calloc(1, 0x10000);
@@ -376,7 +387,7 @@ int main(void) {
         CHECK(size == 0x3c && g_mem[0x1000] == 0xcc);
     }
 
-    /* IManagerDisplayService 6002, SetLayerVisibility: Minecraft calls it at boot. The runtime has one layer and
+    /* IManagerDisplayService 6002, SetLayerVisibility: a game calls it at boot. The runtime has one layer and
        always presents it, so the command succeeds and changes nothing */
     {
         SvcObj* manager = nn_visrv_sf_IManagerDisplayService_new();

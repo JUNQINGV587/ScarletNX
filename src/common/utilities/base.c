@@ -84,6 +84,22 @@ char* snx_format(const char* fmt, ...) {
     va_end(ap);
     return p;
 }
+int snx_appendf(char* out, size_t size, int at, const char* fmt, ...) {
+    if (!size) return 0;
+    if (at < 0) at = 0;
+    if ((size_t)at >= size - 1) return (int)(size - 1);
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(out + at, size - (size_t)at, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        out[at] = 0;
+        return at;
+    }
+    if ((size_t)at + (size_t)n < size) return at + n;
+    if (size >= 4) memcpy(out + size - 4, "...", 3);
+    return (int)(size - 1);
+}
 void snx_path_native(char* path) {
 #ifdef _WIN32
     for (; path && *path; ++path)
@@ -98,6 +114,20 @@ static struct {
 } g_base;
 void snx_error_sink(void (*sink)(const char* line)) {
     g_base.error_sink = sink;
+}
+int snx_memory_total(SnxU64* bytes) {
+#ifdef _WIN32
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof status;
+    if (!GlobalMemoryStatusEx(&status) || !status.ullTotalPhys) return 0;
+    *bytes = status.ullTotalPhys;
+    return 1;
+#else
+    long pages = sysconf(_SC_PHYS_PAGES), page = sysconf(_SC_PAGESIZE);
+    if (pages <= 0 || page <= 0) return 0;
+    *bytes = (SnxU64)pages * (SnxU64)page;
+    return 1;
+#endif
 }
 int snx_error(const char* fmt, ...) {
     char line[2048];
@@ -396,15 +426,23 @@ int snx_path_exists(const char* path) {
     return !lstat(path, &st);
 #endif
 }
+/* the reason a folder is not made stays the system's last (snx_os_error): the look at what is there sets another */
 static int mkdir_one(const char* path) {
 #ifdef _WIN32
     wchar_t* p = snx_wide(path);
     int ok = p && CreateDirectoryW(p, NULL);
+    DWORD error = GetLastError();
     free(p);
-    return !ok && !snx_is_dir(path);
+    if (ok || snx_is_dir(path)) return 0;
+    SetLastError(error);
 #else
-    return mkdir(path, 0700) && !snx_is_dir(path);
+    int error;
+    if (!mkdir(path, 0700)) return 0;
+    error = errno;
+    if (snx_is_dir(path)) return 0;
+    errno = error;
 #endif
+    return 1;
 }
 int snx_mkdirs(const char* path) {
     if (snx_is_dir(path)) return 0;

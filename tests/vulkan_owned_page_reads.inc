@@ -97,9 +97,9 @@ static int owned_constant_buffers(void) {
     CHECK(!cbown_case(channel, 0x6000, 0x6200, 0x22222222, 0x6b, 0x22222222, "an owner past them on their page"));
     channel->ds.bind.cb_addr[0][0] = 0;
     channel->ds.bind.cb_size[0][0] = 0;
-    /* A fragment program's lookup folds the words of its constant buffers that the CPU holds (gpu/vk/cb_fold.h): of
-       a buffer with an owner's bytes it reads none, so nothing lands, the owner keeps them and the word stays a load.
-       The owner's bytes are zeros, a word that would fold */
+    /* A fragment program's draws count the words of its constant buffers that a fold would take, of those the CPU
+       holds (gpu/vk/cb_fold.h): of a buffer with an owner's bytes they read none, so nothing lands, the owner keeps
+       them and the word stays a load, with nothing to fold. The owner's bytes are zeros, a word that would fold */
     const u64 loads[] = {0x4C98078004070000ull, 0xE30000000007000Full}; /* MOV R0, c[0x0][0x100] */
     CHECK(mesh_program(OPR_GVA + 0x2800, loads, 2, 1));
     channel->ds.bind.cb_addr[4][0] = OPR_GVA + 0x3000;
@@ -110,13 +110,15 @@ static int owned_constant_buffers(void) {
     vk_own_publish_owned(OPR_CPU + 0x3100, 16, owner, 0);
     CHECK(own_lookup(OPR_CPU + 0x3100, 16, NULL, 0) == 1);
     u64 lands = own_landings();
-    const VkSh* folded =
+    VkSh* folded =
         vk_shader_get(&channel->ds, OPR_GVA + 0x2800, 0, ST_FS, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, 0, 0, 0, 0);
+    if (folded) vk_shader_fold_draw(&channel->ds, folded, OPR_GVA + 0x2800, NULL);
     int kept = own_lookup(OPR_CPU + 0x3100, 16, NULL, 0) == 1, landed = own_landings() != lands;
     own_acquire(OPR_CPU + 0x3100, 16);
     vk_own_res_unref(owner);
     vk_unlock();
-    CHECK(folded && !folded->failed && folded->nfold == 0 && folded->cbr.n == 1 && kept && !landed);
+    CHECK(folded && !folded->failed && folded->nfold == 0 && folded->cbr.n == 1 && folded->fold_asked &&
+          !folded->fold_job && kept && !landed);
     channel->ds.bind.cb_addr[4][0] = 0;
     channel->ds.bind.cb_size[4][0] = 0;
     free(channel);
@@ -190,9 +192,7 @@ static int owned_astc_key(void) {
     al_fill(&x);
     gmmu_map(gbase, base, AL_SPAN);
     later_drain(); /* what the checks before left to the encoder */
-    char cache[sizeof g_cachedir + 40];
-    al_cache_path(cache, sizeof cache, "vulkan_headless_owned_reads.vkbc7");
-    CHECK(!al_cache_open(cache)); /* the keys are made only where a cache takes the levels */
+    vk_astc_cache_open(); /* the keys are made only where a cache takes the levels */
     vk_lock();
     VkOwnRes* owner = vk_own_res_new(16, VK_OWN_BY_DRAW);
     CHECK(owner && !owned_test_fill(owner->buf, 0, 16, 0x3c));
@@ -210,7 +210,6 @@ static int owned_astc_key(void) {
                 all, kept ? "kept" : "gone", landed ? "landed" : "nothing landed");
     later_drain();
     vk_bc7_cache_close();
-    remove(cache);
     gmmu_space_unmap(gbase, AL_SPAN);
     mem_unmap(base, AL_SPAN);
     g_settings.astc_mode = had;

@@ -32,10 +32,12 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/main.h"
 #include "nx/runtime/options.h"
+#include "nx/runtime/ini.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/runtime/nce/nce.h"
 #include "nx/memory/own.h"
 #include "nx/hle/services/nvdrv.h"
+#include "nx/gpu/vk/pool_map.h"
 
 VkState g_vk;
 VkSemaphore g_vk_csem;
@@ -45,6 +47,7 @@ static unsigned errors;
 /* uma.c isn't here: no guest memory read in place for cmd.c's draws to settle */
 void vk_uma_settle(u64 ended) { (void)ended; }
 void vk_table_forget_view(VkImageView view) { (void)view; } /* no texture table here (table.c) */
+void vk_pool_map_view_gone(VkImageView view) { (void)view; } /* no pool map here (pool_map.c) */
 int vk_own_make_room(void) { return 0; } /* no kept results here: the device ring finds no room in their pool */
 /* Synthetic upload sources have no guest GPU mappings, ownership or pending in-place writes. */
 OwnState g_own;
@@ -168,6 +171,8 @@ VkPipeline vk_pipeline_now(VkPipeline h, int* pending) {
 }
 /* and binds them, pipelines alone here: no draw of this test has shader objects */
 void vk_pipeline_bind(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline h) { vkCmdBindPipeline(cb, bp, h); }
+/* nor links, whose binds pipeline.c counts for their optimized pipelines */
+void vk_pipeline_bound(VkPipeline h) { (void)h; }
 /* cmd.c reads the frame's GPU timestamps for gpuprof.c, which isn't here */
 void vk_gpuprof_frame_done(u32 slot) { (void)slot; }
 void vk_gpuprof_cb_begin(VkCommandBuffer cb) { (void)cb; }
@@ -180,6 +185,13 @@ void vk_gpuprof_waited(u64 value, int kind) {
     (void)value;
     (void)kind;
 }
+/* and stamp.c's report timestamps, which no report here asks for */
+void vk_stamp_cb_begin(VkCommandBuffer cb) { (void)cb; }
+void vk_stamp_cb_end(VkCommandBuffer cb, u64 value) {
+    (void)cb;
+    (void)value;
+}
+void vk_stamp_fold(u64 done) { (void)done; }
 /* and record.c's dispatches and transfers, which it would time, and the block linear moves' callers */
 void vk_gpuprof_tag(u64 key) { (void)key; }
 void vk_gpuprof_tag_at(u64 key, const void* site) { (void)key, (void)site; }
@@ -218,7 +230,7 @@ int vk_dslayout_arrays(VkDescriptorSetLayout layout) {
     return 0;
 }
 u32 vk_texture_array_elements(void) { return 0; }
-void vk_pool_sizes(VkDescriptorPoolSize* sz, u32 sets, u32 array_sets) {
+u32 vk_pool_sizes(VkDescriptorPoolSize* sz, u32 sets, u32 array_sets) {
     (void)array_sets;
     sz[0] = (VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sets * 2};
     sz[1] = (VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, sets};
@@ -226,6 +238,8 @@ void vk_pool_sizes(VkDescriptorPoolSize* sz, u32 sets, u32 array_sets) {
     sz[3] = (VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, sets};
     sz[4] = (VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, sets};
     sz[5] = (VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sets * 2};
+    sz[6] = (VkDescriptorPoolSize){VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 0};
+    return 6;
 }
 
 static VKAPI_ATTR VkBool32 VKAPI_CALL debug(VkDebugUtilsMessageSeverityFlagBitsEXT severity,
@@ -642,7 +656,6 @@ static void run_blocks(u32 kind, u32 bw, u32 bh, int srgb, u32 w, u32 h, u32 dep
             rec_CmdCopyImageToBuffer(vk_cmd(), t.img, VK_LAYOUT(TRANSFER_SRC_OPTIMAL), readback, 1, &copy);
             vk_finish();
             vk_readback_ready();
-            u8* texels = NULL;
             u8* expected = malloc(size);
             (void)nx, (void)ny;
             /* the level's build of the shader, run on the CPU over the same blocks */
@@ -656,7 +669,6 @@ static void run_blocks(u32 kind, u32 bw, u32 bh, int srgb, u32 w, u32 h, u32 dep
                           "got %u\n",
                           name, bw, bh, srgb, lw, lh, ld, l, layer, (unsigned long long)i,
                           (unsigned long long)(i / block_bytes), expected[i], actual[i]);
-            free(texels);
             free(expected);
             free(blocks[layer * levels + l]);
         }
@@ -1108,18 +1120,6 @@ static void bc1_quality(int n, char** names) {
            all_n && all_sq ? 10 * log10(255.0 * 255.0 / (all_sq / all_n)) : 99.0, all_ms);
 }
 
-/* the cache file, this process's own: ctest runs the astc_vulkan entries at once in one directory (--parallel 4 on
-   the CI), and one run's remove or lock took another's file */
-static const char* cache_path(void) {
-    static char path[64];
-#if defined(_WIN32)
-    if (!path[0]) snprintf(path, sizeof path, "astc_vulkan_test.%u.vkbc7", (unsigned)_getpid());
-#else
-    if (!path[0]) snprintf(path, sizeof path, "astc_vulkan_test.%u.vkbc7", (unsigned)getpid());
-#endif
-    return path;
-}
-#define CACHE_PATH cache_path()
 /* The BC7 cache (vk/bc7_cache.c through vk_astc_upload's content): one level of random blocks, all its layers or
    slices at once, uploaded into a new BC7 image each time and read back whole. The first upload encodes, and its blocks
    go into the cache when its submission is done; the second, and a third after the cache's file is opened again as a
@@ -1216,12 +1216,21 @@ static void bc7_counts(u64* levels, u64* hits) {
     u64 bytes, rgba8;
     vk_astc_stats(levels, hits, &bytes, &rgba8);
 }
+/* the BC7 cache's counts as the checks take them: its hits, the levels it kept, those it let go, and its bytes */
+static void cache_counts(u64* reads, u64* stored, u64* gone, u64* bytes) {
+    VkBc7CacheStats s;
+    vk_bc7_cache_stats(&s);
+    *reads = s.hits;
+    *stored = s.stored;
+    *gone = s.evicted;
+    *bytes = s.bytes;
+}
 static void cache_case(const CacheCase* c) {
     const u32 slices = c->depth * c->layers;
     u8* blocks = blocks_new(c->w, c->h, slices, c->bw, c->bh);
     u64 levels, hits, levels2, hits2, took, stored, stored2, reads, restarts, bytes, encodes = vk_astc_dispatches();
     bc7_counts(&levels, &hits);
-    vk_bc7_cache_stats(&reads, &stored, &restarts, &bytes);
+    cache_counts(&reads, &stored, &restarts, &bytes);
     u8* first = cache_upload(c, blocks, &took, 0);
     if (!first) {
         printf("SKIP the BC7 cache %ux%u image=%ux%ux%u: the device has no such BC7 image, or the cache does not take "
@@ -1231,7 +1240,7 @@ static void cache_case(const CacheCase* c) {
         return;
     }
     bc7_counts(&levels2, &hits2);
-    vk_bc7_cache_stats(&reads, &stored2, &restarts, &bytes);
+    cache_counts(&reads, &stored2, &restarts, &bytes);
     if (levels2 != levels + 1 || hits2 != hits || stored2 != stored + 1 || vk_astc_dispatches() == encodes)
         fatal("the BC7 cache %ux%u %ux%ux%u: the first upload took %llu levels, %llu hits, %llu stored, %llu encoder "
               "dispatches\n",
@@ -1239,7 +1248,6 @@ static void cache_case(const CacheCase* c) {
               (unsigned long long)(hits2 - hits), (unsigned long long)(stored2 - stored),
               (unsigned long long)(vk_astc_dispatches() - encodes));
     for (int run = 0; run < 2; run++) {
-        if (run) vk_astc_cache_open(CACHE_PATH); /* a later run's */
         encodes = vk_astc_dispatches();
         u8* again = cache_upload(c, blocks, &took, 0);
         bc7_counts(&levels, &hits);
@@ -1276,7 +1284,7 @@ static void cache_burst(void) {
     Surf* t = calloc(N, sizeof *t);
     u64 reads, stored, stored2, restarts, bytes;
     if (!t) fatal("no memory for %d surfaces\n", N);
-    vk_bc7_cache_stats(&reads, &stored, &restarts, &bytes);
+    cache_counts(&reads, &stored, &restarts, &bytes);
     for (u32 i = 0; i < N; i++) {
         t[i] = (Surf){.w = W, .h = H, .layers = 1, .levels = 1, .depth3d = 1, .f = {.vk = format, .bw = 4, .bh = 4}};
         VkImageCreateInfo ii = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
@@ -1302,7 +1310,7 @@ static void cache_burst(void) {
         free(blocks);
     }
     vk_finish(); /* the captures land once their submission is done */
-    vk_bc7_cache_stats(&reads, &stored2, &restarts, &bytes);
+    cache_counts(&reads, &stored2, &restarts, &bytes);
     for (u32 i = 0; i < N; i++) vk_image_destroy(t[i].img, t[i].mem);
     free(t);
     if (stored2 != stored + N)
@@ -1445,8 +1453,7 @@ static void live_cases(void) {
     fflush(stdout);
 }
 static void cache_cases(void) {
-    remove(CACHE_PATH);
-    vk_astc_cache_open(CACHE_PATH);
+    vk_astc_cache_open();
     /* strips of 4, 2 and 1 block rows; layers and slices; many strips under --vk_max_allocation_mb=4, and two strips
        without it (texels past the 16 MiB scratch) */
     static const CacheCase cases[] = {
@@ -1456,7 +1463,6 @@ static void cache_cases(void) {
     cache_burst();
     live_cases();
     vk_bc7_cache_close();
-    remove(CACHE_PATH);
 }
 
 /* Very large levels (astc_quick_mtexels, 1 megatexel here): the first upload encodes the quick build (mode 6 from one
@@ -1484,8 +1490,7 @@ static void background_case(const CacheCase* c) {
     u8 *blocks = blocks_new(c->w, c->h, slices, c->bw, c->bh), *quick = malloc(size), *fast = malloc(size);
     u64 took;
     VkAstcBackground b0, b;
-    remove(CACHE_PATH);
-    vk_astc_cache_open(CACHE_PATH);
+    vk_astc_cache_open();
     g_settings.astc_quick_mtexels = 1;
     g_settings.astc_background = 1;
     bg_expect(c, blocks, quick, fast);
@@ -1511,7 +1516,6 @@ static void background_case(const CacheCase* c) {
               (unsigned long long)(b.finished - b0.finished), (unsigned long long)b.pending, (unsigned long long)pieces,
               (unsigned long long)(b.gpu_pieces - b0.gpu_pieces));
     for (int run = 0; run < 2; run++) {
-        if (run) vk_astc_cache_open(CACHE_PATH); /* a later run's */
         vk_astc_background_stats(&b0);
         got = cache_upload(c, blocks, &took, 0);
         vk_astc_background_stats(&b);
@@ -1571,7 +1575,6 @@ out:
     g_settings.astc_quick_mtexels = 0;
     g_settings.astc_background = 0;
     vk_bc7_cache_close();
-    remove(CACHE_PATH);
     free(blocks);
     free(quick);
     free(fast);
@@ -1598,8 +1601,7 @@ static void quick_timed_case(void) {
     u8* blocks = blocks_new(c.w, c.h, 1, c.bw, c.bh);
     u64 ns0, texels0, ns, texels, took;
     VkAstcBackground b0, b;
-    remove(CACHE_PATH);
-    vk_astc_cache_open(CACHE_PATH);
+    vk_astc_cache_open();
     g_settings.astc_quick_mtexels = 0;
     g_settings.astc_background = 1;
     vk_astc_quick_texels(&ns0, &texels0);
@@ -1659,7 +1661,6 @@ out:
     g_settings.astc_quick_mtexels = 0;
     g_settings.astc_background = 0;
     vk_bc7_cache_close();
-    remove(CACHE_PATH);
     free(blocks);
 }
 
@@ -1667,8 +1668,7 @@ out:
    stored, then hits, from the upload's start to the GPU's end and a readback */
 static void bench_cache(u32 w, u32 h, int runs) {
     if (!g_vk.feat.textureCompressionBC) return;
-    remove(CACHE_PATH);
-    vk_astc_cache_open(CACHE_PATH);
+    vk_astc_cache_open();
     const CacheCase c = {8, 8, 1, w, h, 1, 1};
     u8* blocks = blocks_new(w, h, 1, 8, 8);
     for (int r = 0; r <= runs; r++) {
@@ -1680,7 +1680,6 @@ static void bench_cache(u32 w, u32 h, int runs) {
     }
     free(blocks);
     vk_bc7_cache_close();
-    remove(CACHE_PATH);
 }
 
 /* block linear bytes deswizzled and swizzled on the GPU (vk/blocklinear.c), compared with ref_bl: a surface of

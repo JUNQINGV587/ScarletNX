@@ -24,9 +24,15 @@ static void test_fail(const char* expression, int line) {
         if (!(expr)) test_fail(#expr, __LINE__);                                                                       \
     } while (0)
 
+static char test_log[1024];
 void logf_(int level, const char* format, ...) {
+    va_list args;
+    size_t at = strlen(test_log);
     (void)level;
-    (void)format;
+    if (at >= sizeof test_log - 1) return;
+    va_start(args, format);
+    vsnprintf(test_log + at, sizeof test_log - at, format, args);
+    va_end(args);
 }
 /* log.c's: the stop of a program that opened a service the runtime answers only natively; its message is kept */
 static jmp_buf test_stopped;
@@ -45,6 +51,15 @@ void fatal(const char* format, ...) {
 /* hook.c's: what the hooks left to the game's own code for its SDK version; nothing, until the test gives a text */
 static const char* test_missed = "";
 void hook_missed_text(char* out, size_t n) { snprintf(out, n, "%s", test_missed); }
+static const char* test_unread = "";
+void hook_unread_text(char* out, size_t n) { snprintf(out, n, "%s", test_unread); }
+/* hook.c's: the setting that turns a family's hooks off, "" until the test gives one; the family sm.c asks it of */
+static const char* test_off = "";
+static char test_off_family[32];
+void hook_off_text(char* out, size_t n, const char* family) {
+    snprintf(test_off_family, sizeof test_off_family, "%s", family);
+    snprintf(out, n, "%s", test_off);
+}
 /* debug.c's: the threads and their calls, which name the SDK function that asked; counted, and before the stop */
 static unsigned test_thread_dumps;
 void kernel_dump_threads(void) {
@@ -91,6 +106,24 @@ static nn_sm_ServiceName name_of(const char* s, size_t n) {
     memset(&name, 0, sizeof name);
     memcpy(name.v, s, n);
     return name;
+}
+
+/* a TIPC request to sm's own dispatcher: cmd, and the raw data after the HIPC headers. kind adds the descriptor or
+   handle of that number, which sm takes none of: 1 an A buffer, 2 an empty X descriptor, 3 a C list, 4 a copy handle */
+static u32 ask_tipc(u32 cmd, const void* raw, u32 size, int kind) {
+    IpcCtx c = {0};
+    c.tipc = 1;
+    c.cmd = cmd;
+    c.raw = (const u8*)raw;
+    c.raw_size = size;
+    switch (kind) {
+        case 1: c.na = 1; break;
+        case 2: c.nx = 1; break; /* a descriptor of no size, which sf still counts */
+        case 3: c.nc = 1; break;
+        case 4: c.ncopy = 1; break;
+        default: break;
+    }
+    return (u32)sm_dispatch(NULL, &c);
 }
 
 void pm_init(PMutex* m) { (void)m; }
@@ -153,10 +186,49 @@ int main(void) {
     CHECK(strstr(test_stop_text, "its mode file. 41 of the SDK functions run their own code: the first is f in sdk, "
                                  "of version 3.0.1, declared for sdk < 1.0.0"));
     test_missed = "";
+    /* a 32-bit game of an SDK nobody read: the stop names the service it opened, then the reason and what to do, in
+       place of the advice for a homebrew program */
+    test_unread = "This 32-bit game's SDK is 4.4.0 (module sdk) and the runtime's declarations for a 32-bit game were "
+                  "read in SDK 0.12.16 alone, so 132 of its SDK functions run their own code (nn_fs 44)";
+    name = name_of("pctl", 4);
+    test_expects_stop = 1;
+    if (!setjmp(test_stopped)) {
+        nn_sm_detail_IUserInterface_GetServiceHandle(NULL, &name, &handle);
+        test_fail("the program went on with a session of a native-only service", __LINE__);
+    }
+    test_expects_stop = 0;
+    CHECK(!strcmp(test_stop_text, "sm: the program opened pctl, which the runtime answers only in the SDK's own "
+                                  "functions, nn::pctl (nn/pctl.c). This 32-bit game's SDK is 4.4.0 (module sdk) and "
+                                  "the runtime's declarations for a 32-bit game were read in SDK 0.12.16 alone, so "
+                                  "132 of its SDK functions run their own code (nn_fs 44)"));
+    /* the settings turn the native functions off: the stop names the setting and its value, and neither the SDK
+       functions that are not native nor a 32-bit game's reason. Each service is asked of the family whose hooks
+       answer it */
+    test_off = "hooks=0 (its default is 1) runs every SDK function's own code";
+    static const char* const off_family[][2] = {
+        {"fsp-srv", "nn_fs"},          {"time:u", "nn_time"},        {"pl:u", "nn_pl"},
+        {"pctl", "nn_pctl"},           {"nsd:u", "nn_nsd"},          {"ngc:u", "nn_ngc"},
+        {"prepo:u", "nn_prepo"},       {"audout:u", "nn_audio_out"}, {"audren:u", "nn_audio_renderer"},
+        {"hwopus", "nn_codec_hwopus"}, {"audin:u", "nn_audio_in"},
+    };
+    for (size_t i = 0; i < sizeof off_family / sizeof off_family[0]; i++) {
+        name = name_of(off_family[i][0], strlen(off_family[i][0]));
+        test_expects_stop = 1;
+        if (!setjmp(test_stopped)) {
+            nn_sm_detail_IUserInterface_GetServiceHandle(NULL, &name, &handle);
+            test_fail("the program went on with a session of a native-only service", __LINE__);
+        }
+        test_expects_stop = 0;
+        CHECK(!strcmp(test_off_family, off_family[i][1]));
+        CHECK(strstr(test_stop_text, "hooks=0 (its default is 1) runs every SDK function's own code"));
+        CHECK(!strstr(test_stop_text, "not native yet") && !strstr(test_stop_text, "4.4.0"));
+    }
+    test_off = test_unread = "";
     name = name_of("time:x", 6);
     handle = 0;
     CHECK(nn_sm_detail_IUserInterface_GetServiceHandle(NULL, &name, &handle) == 0 && handle == 0x1234);
-    CHECK(test_thread_dumps == sizeof native_only / sizeof native_only[0] + 1);
+    CHECK(test_thread_dumps ==
+          sizeof native_only / sizeof native_only[0] + 2 + sizeof off_family / sizeof off_family[0]);
 
     /* an application may host no service: NotAllowed, whether or not the name is taken */
     name = name_of("mysrv", 5);
@@ -168,6 +240,45 @@ int main(void) {
     CHECK(nn_sm_detail_IUserInterface_UnregisterService(NULL, &name) == RC(21, 7));
     name = name_of("set", 3);
     CHECK(nn_sm_detail_IUserInterface_UnregisterService(NULL, &name) == RC(21, 8));
+
+    /* The Switch 2 TIPC forms: RegisterService's name, max_sessions and is_light (16 bytes), or a service space
+       ahead of them (20); UnregisterService's name (8), or a space ahead of it (12). The fields the CMIF form orders
+       the other way (max_sessions before is_light) are read where TIPC puts them, and a size that is neither form,
+       or a request with a buffer, is one sm can not decode */
+    {
+        u8 raw[24] = {0};
+        u32 space = 3, max_sessions = 4, light = 1;
+        memcpy(raw, "mysrv", 5);
+        memcpy(raw + 8, &max_sessions, 4);
+        raw[12] = light;
+        test_log[0] = 0;
+        CHECK(ask_tipc(2, raw, 16, 0) == RC(21, 8));
+        CHECK(strstr(test_log, "mysrv (4 sessions, light)"));
+        memcpy(raw, &space, 4);
+        memcpy(raw + 4, "mysrv", 5);
+        memcpy(raw + 12, &max_sessions, 4);
+        raw[16] = light;
+        test_log[0] = 0;
+        CHECK(ask_tipc(2, raw, 20, 0) == RC(21, 8));
+        CHECK(strstr(test_log, "service space 3") && strstr(test_log, "mysrv (4 sessions, light)"));
+        CHECK(ask_tipc(2, raw, 12, 0) == 1 && ask_tipc(2, raw, 24, 0) == 1); /* neither form */
+        /* the commands take no buffer, X descriptor, C list or handle, of any size */
+        for (u32 kind = 1; kind <= 4; kind++) CHECK(ask_tipc(2, raw, 16, (int)kind) == 1);
+        memset(raw, 0, sizeof raw);
+        memcpy(raw, "set", 3);
+        CHECK(ask_tipc(3, raw, 8, 0) == RC(21, 8)); /* the runtime's own service */
+        memcpy(raw, "mysrv", 5);
+        CHECK(ask_tipc(3, raw, 8, 0) == RC(21, 7)); /* nobody serves it */
+        memcpy(raw, &space, 4);
+        memcpy(raw + 4, "mysrv", 5);
+        test_log[0] = 0;
+        CHECK(ask_tipc(3, raw, 12, 0) == RC(21, 7));
+        CHECK(strstr(test_log, "service space 3"));
+        CHECK(ask_tipc(3, raw, 16, 0) == 1); /* neither form */
+        /* a name sm refuses is refused in either form, not taken for another request */
+        memcpy(raw + 4, "se\0t", 4);
+        CHECK(ask_tipc(2, raw, 20, 0) == RC(21, 6) && ask_tipc(3, raw, 12, 0) == RC(21, 6));
+    }
 
     printf("PASS sm_service (%u checks)\n", test_checks);
     return 0;

@@ -599,6 +599,16 @@ static int records_dump(const char* folder, const char* name, const char* dump) 
     return good;
 }
 #endif
+#if !SNX_DRIVER_READY && !defined(_WIN32)
+/* 1 when the file at path holds text and nothing else */
+static int holds(const char* path, const char* text) {
+    size_t size = 0;
+    unsigned char* bytes = snx_is_file(path) ? snx_read_file(path, &size) : NULL;
+    int same = bytes && size == strlen(text) && !memcmp(bytes, text, size);
+    free(bytes);
+    return same;
+}
+#endif
 /* snx_record_source on the .ini a game has: made with [Game] when there is none, an older source= anywhere taken out
    and the new one put under [Game], CRLF lines and a last line without its newline kept, a file naming the dump
    already left as it is, and a path with a line break refused */
@@ -1266,10 +1276,12 @@ int main(int argc, char** argv) {
         }
         set_env("SNX_WORKFLOW_HEADLESS", "");
     }
-    /* Decrypted containers share the extract/recompile checkpoints, including quoted dump paths. */
+    /* Decrypted containers, and those nsz compressed (NSZ, XCZ), share the extract/recompile checkpoints, including
+       quoted dump paths. */
     {
         const char* names[] = {"My Switch DXCI's/Test [game];.dnsp", "My Switch DXCI's/Test [game];.dNsP",
-                               "My Switch DXCI's/Test [game];.dxci", "My Switch DXCI's/Test [game];.dXcI"};
+                               "My Switch DXCI's/Test [game];.dxci", "My Switch DXCI's/Test [game];.dXcI",
+                               "My Switch DXCI's/Test [game];.nsz",  "My Switch DXCI's/Test [game];.XcZ"};
         unsigned j;
         for (j = 0; j < sizeof names / sizeof names[0]; ++j) {
             char *decrypted = snx_path_join(repo, names[j]), *directory = snx_path_join(repo, "My Switch DXCI's");
@@ -1503,7 +1515,7 @@ int main(int argc, char** argv) {
         run(exe, repo, folder, log, 0, "R", NULL);
 #ifndef _WIN32
         set_env("SNX_WORKFLOW_FLAGS", "-rx");
-        run(exe, repo, game, log, 1, "", "-rx takes an XCI, NSP, DXCI or DNSP dump");
+        run(exe, repo, game, log, 1, "", "-rx takes an XCI, NSP, XCZ, NSZ, DXCI or DNSP dump");
 #endif
         set_env("SNX_WORKFLOW_FLAGS", "--backend=gcc");
         run(exe, repo, game, log, 1, "", "LLVM is the only backend");
@@ -1700,8 +1712,10 @@ int main(int argc, char** argv) {
         char *romfs = snx_path_join(data, "romfs"), *program = snx_path_join(own, "0100ABCD12345000");
         char *work = snx_path_join(temp, "scarletnx/work/0100ABCD12345000"), *ram = snx_path_join(work, "romfs/data");
         char *marker = snx_path_join(own, "0100ABCD12345000.tmpfs"), *empty = snx_path_join(root, "Not a game");
+        char *cover = snx_path_join(source, "icon.jpg"), *shown = snx_path_join(data, "icon.jpg");
         CHECK(!snx_path_exists(source) || !snx_remove_tree(source));
         write_extracted(source);
+        CHECK(!snx_write_file(cover, "cover", 5)); /* its icon beside exefs/, as -x lays one out */
         CHECK(!snx_mkdirs(temp) && !snx_mkdirs(empty));
         set_env("TMPDIR", temp);
         set_env("SNX_WORKFLOW_MODE", "exit");
@@ -1712,8 +1726,13 @@ int main(int argc, char** argv) {
         run(exe, repo, source, log, 0, "RG", NULL);
         CHECK(snx_is_file(program) && !snx_path_exists(exefs) && !snx_path_exists(romfs));
         CHECK(records_dump(own, "0100ABCD12345000", source));
+        CHECK(holds(shown, "cover")); /* Games shows the folder's icon on the game's row */
         run(exe, repo, source, log, 0, "G", NULL);
+        CHECK(!snx_write_file(cover, "another cover", 13)); /* put there after the game was made */
         run(exe, repo, program, log, 0, "G", NULL);
+        CHECK(holds(shown, "another cover"));
+        free(cover);
+        free(shown);
         /* Extract dump on: the folder read in place all the same (its RomFS can take gigabytes a copy doubles, #2110);
            what an older start copied, or a copy or an extraction of it that stopped left, taken away, said */
         set_env("SNX_WORKFLOW_EXTRACT", "1");

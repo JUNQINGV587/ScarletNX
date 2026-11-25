@@ -20,7 +20,9 @@
    recording that started in a piece moves, as it ends, into its command bytes when they hold it, or else into a
    block of a small store, and its handle is then a JUMP there from its command bytes when they hold one, as the
    driver's handle is where its commands are (spill_settle, spill_compact, spill_link). The game writing over that
-   JUMP gives its pieces back too (spill_sweep). Adding
+   JUMP gives its pieces back too (spill_sweep). A recording that started in the game's memory and went on in one
+   piece moves that piece's records into a block of the small store as it ends, the JUMP after its records in the
+   game's memory going there (spill_tail). Adding
    memory again isn't writing over it: one game hands the rest of a block to its next recording at the driver's used
    bytes, adds the whole block again for the next ones, and still calls recordings further in it. A recording that
    takes no command memory on the driver (calls and compute binds go to its control memory) counts 4 bytes, so that it
@@ -38,6 +40,7 @@
 #include "nx/runtime/arm.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
+#include "nx/runtime/platform/tracy.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -54,6 +57,51 @@
 #define BIND_COST(stage, bytes) ((stage) == NVN_STAGE_COMPUTE ? 0u : (bytes))
 /* the fewest bytes the driver asks the game's callback for when command memory runs out */
 #define NVN_COMMAND_ASK_MIN     0x200u
+/* records and guest bytes a command buffer builds, summed in alloc_rec (rec and CopyCommands both go through it)
+   and plotted at each recording's end: which call builds the most command memory. The counters are indexed by
+   NvnCmdBuf.ctl (1..NVN_CTL_SLOTS), so concurrent recordings, and the records CopyCommands adds at submit time,
+   stay with the command buffer that built them; index 0 is unused. One zone per record would fill the trace, so the
+   per-record zone is gone and these totals carry the cost instead. Command-building runs on the game's threads, so
+   sum atomically, and only while a profiler is attached. */
+typedef struct {
+    _Atomic u64 recs[NVN_CTL_SLOTS + 1];
+    _Atomic u64 bytes[NVN_CTL_SLOTS + 1];
+} NvnRecCount;
+static NvnRecCount g_nvn_rec_count;
+
+/* ---- the game's current NVN phase, per game thread ----
+   The NVN subsystem's one thread-local struct, as g_nvn is its one global. The op strings stay where the NVN entry
+   points wrote them (literals): nothing is copied or owned here. Nothing is stored or formatted without a profiler
+   client. The text of a zone's context stays under 128 bytes. */
+typedef struct {
+    const char* op; /* last high-level NVN operation the game called */
+    u64 id;         /* command buffer or queue address, 0 when the call has none */
+    int phase;      /* NVN_TRACE_NONE or NVN_TRACE_RECORD */
+} NvnTraceCtx;
+static _Thread_local NvnTraceCtx t_nvn;
+
+void nvn_trace_set(const char* op, u64 id, int phase) {
+    if (!snx_tracy_attached()) return;
+    t_nvn.op = op;
+    t_nvn.id = id;
+    t_nvn.phase = phase;
+}
+
+char* nvn_trace_context(char* out, size_t cap) {
+    if (!out || !cap) return out;
+    out[0] = 0;
+    if (!snx_tracy_attached() || !t_nvn.op) return out; /* no formatting without a client */
+    const char* phase = t_nvn.phase == NVN_TRACE_RECORD ? "recording" : "";
+    if (t_nvn.id && phase[0])
+        snprintf(out, cap, "%s cb %llx (%s)", t_nvn.op, (unsigned long long)t_nvn.id, phase);
+    else if (t_nvn.id)
+        snprintf(out, cap, "%s %llx", t_nvn.op, (unsigned long long)t_nvn.id);
+    else if (phase[0])
+        snprintf(out, cap, "%s (%s)", t_nvn.op, phase);
+    else
+        snprintf(out, cap, "%s", t_nvn.op);
+    return out;
+}
 
 /* Runs the guest function fn(a0, a1, a2, a3) on this thread from inside an NVN call, as the driver calls the game's
    callbacks: its return (to the NVN call's own return address, which nothing else returns to) ends the run, and the
@@ -102,8 +150,10 @@ static void put_jump(u64 at, u64 to) {
 
 /* ---- the runtime's memory for the records the game's memory has no room for */
 #define SPILL_SEGMENT (64u << 10)
-/* NvnCmdBuf.piece: the slot of the piece the open recording starts in, with PIECE_MORE once it goes on in another */
+/* NvnCmdBuf.piece: the slot of the piece the open recording starts in, with PIECE_MORE once it goes on in another, or
+   with PIECE_TAIL the slot of the piece a recording that started in the game's memory goes on in, after a JUMP there */
 #define PIECE_MORE    0x80000000u
+#define PIECE_TAIL    0x40000000u
 /* ---- the control memory, counted as the game's driver writes it (one game's driver, NVN 55) */
 static NvnCtl* ctl_of(u64 cb) {
     u32 k = CB(cb)->ctl;
@@ -228,6 +278,10 @@ static u32 spill_cut(u64 cb, u64 anchor, u32 need, u64* at, u32* piece) {
     if (k == st->ns && st->ns == NVN_SPILL_SEGS) k = any;
     if (k == st->ns) {
         u64 size = want > SPILL_SEGMENT / 2 ? (want * 2 + 0xffff) & ~0xffffull : SPILL_SEGMENT, was = st->total;
+        /* rare: no held segment had room, so the runtime allocates another */
+        [[maybe_unused]] char tctx[128];
+        SNX_ZONE_T(z, "nvn cmd spill segment", "need %u, new %llu KiB, seg %u; %s", need,
+                   (unsigned long long)(size >> 10), st->ns, nvn_trace_context(tctx, sizeof tctx));
         if (st->ns == NVN_SPILL_SEGS) {
             spill_census(st);
             fatal("nvn: command records past the game's command memory need more than the %u segments of the "
@@ -550,7 +604,8 @@ static void divert(u64 cb, u32 need) {
     }
     u32 piece;
     o->lent = spill_cut(cb, o->anchor, need + h.size, &at, &piece) + 1;
-    o->piece = o->recording == 2 ? piece : 0; /* the recording starts here */
+    /* the recording starts here, or its records in the game's memory go on here after the JUMP at from */
+    o->piece = o->recording == 2 ? piece : from ? piece | PIECE_TAIL : 0;
     o->cur = at;
     if (h.size) {
         memcpy(GP(at), GP(from), h.size);
@@ -602,7 +657,8 @@ static void move_records(u64 dst, u64 src, u64 bytes) {
 static u64 spill_settle(u64 cb) {
     NvnCmdBuf* o = CB(cb);
     u64 bytes = o->cur - o->begin, a = (o->anchor + 7) & ~7ull, end = o->origin + o->used;
-    if (!o->piece || (o->piece & PIECE_MORE) || !o->lent || o->anchor < o->origin || a > end || bytes > end - a)
+    if (!o->piece || (o->piece & (PIECE_MORE | PIECE_TAIL)) || !o->lent || o->anchor < o->origin || a > end ||
+        bytes > end - a)
         return o->begin;
     move_records(a, o->begin, bytes);
     pm_lock(&g_nvn.cmd.lock);
@@ -625,7 +681,7 @@ static u64 spill_compact(u64 cb) {
     u64 bytes = o->cur - o->begin, at = 0, a = (o->anchor + 7) & ~7ull, end = o->origin + o->used;
     u32 k = small_class(bytes), slot = o->piece;
     int linked = o->anchor >= o->origin && a <= end && end - a >= 16;
-    if (!slot || (slot & PIECE_MORE) || !o->lent || k == NVN_SMALL_CLASSES) return o->begin;
+    if (!slot || (slot & (PIECE_MORE | PIECE_TAIL)) || !o->lent || k == NVN_SMALL_CLASSES) return o->begin;
     pm_lock(&st->lock);
     for (u32 i = st->bucket[NVN_SPILL_BUCKET(o->anchor)]; !linked && i && !at; i = st->p[i].next) {
         NvnSpillPiece* q = &st->p[i];
@@ -662,7 +718,7 @@ static u64 spill_link(u64 cb, u64 h) {
     const NvnCmdBuf* o = CB(cb);
     u64 a = (o->anchor + 7) & ~7ull, end = o->origin + o->used;
     u32 slot = o->piece;
-    if (!slot || (slot & PIECE_MORE) || o->anchor < o->origin || a > end || end - a < 16) return h;
+    if (!slot || (slot & (PIECE_MORE | PIECE_TAIL)) || o->anchor < o->origin || a > end || end - a < 16) return h;
     pm_lock(&st->lock);
     int small = st->p[slot].seg >= NVN_SPILL_SMALL && st->p[slot].at == h;
     if (small) {
@@ -679,6 +735,39 @@ static u64 spill_link(u64 cb, u64 h) {
     }
     pm_unlock(&st->lock);
     return small ? a : h;
+}
+/* A recording that started in the game's memory and went on in one piece of the runtime's memory from a JUMP after its
+   records there (divert) moves that piece's records into a block of the small store, where the JUMP then goes: its
+   piece takes the block, and the segment is cut from the piece's start again. A segment comes back only once all of
+   its pieces do, and each command buffer cuts from segments of its own: one game gives thousands of command buffers a
+   few hundred bytes of command memory each, records one short recording in each and keeps them, and only their last
+   record or two didn't fit the bytes counted, so a segment of 64 KiB stood for each of them and every segment was
+   held within minutes. The JUMP is the last 16 bytes before game_cur, unless the game added memory since (then piece
+   is no longer marked) */
+static void spill_tail(u64 cb) {
+    NvnCmdBuf* o = CB(cb);
+    NvnCmdState* st = &g_nvn.cmd;
+    u32 slot = o->piece & ~PIECE_TAIL, k;
+    u64 jump = o->game_cur - 16, from, at;
+    if (!(o->piece & PIECE_TAIL) || (o->piece & PIECE_MORE) || !o->lent || o->game_cur < 16) return;
+    if (NVN_REC_OP(gr32(jump)) != OP_JUMP) return;
+    from = gr64(jump + 8);
+    const NvnSpillSeg* s = &st->s[o->lent - 1];
+    if (from < s->at || from > o->cur || o->cur > s->at + s->size || o->cur == from) return;
+    if ((k = small_class(o->cur - from)) == NVN_SMALL_CLASSES) return;
+    pm_lock(&st->lock);
+    if ((at = small_take(st, k)) != 0) {
+        NvnSpillPiece* q = &st->p[slot];
+        st->s[q->seg].live--; /* still cb's: spill_end gives it up */
+        q->seg = NVN_SPILL_SMALL + k;
+        q->at = at;
+    }
+    pm_unlock(&st->lock);
+    if (!at) return;
+    move_records(at, from, o->cur - from);
+    put_jump(jump, at);
+    o->cur = from;
+    o->piece = 0;
 }
 /* The pieces whose recording's JUMP is gone (spill_link), or whose command memory is: taken under the lock, the game's
    memory read without it (mem_mapped_run takes mem.c's), and each given back under it again while it is still the same
@@ -736,6 +825,10 @@ static int count(CPU* c, u64 cb, u32 cost) {
     if (o->used + cost > o->game_end - o->origin && o->callback) {
         const NvnCtl* control = ctl_of(cb);
         if (!control || control->command_callback) {
+            /* rare: the game's callback adds memory mid-recording, costing the guest call */
+            [[maybe_unused]] char tctx[128];
+            SNX_ZONE_T(z, "nvn cmd out of memory", "cost %u, cb %llx; %s", cost, (unsigned long long)o->callback,
+                       nvn_trace_context(tctx, sizeof tctx));
             LOG_LIMIT(4, "nvn: command buffer %llx is out of command memory: the game's callback %llx adds more\n",
                       (unsigned long long)cb, (unsigned long long)o->callback);
             guest_call(c, o->callback, cb, NVN_COMMAND_BUFFER_MEMORY_EVENT_OUT_OF_COMMAND_MEMORY,
@@ -768,6 +861,14 @@ static u64 alloc_rec(CPU* c, u64 cb, u32 op, u32 size, u32 cost) {
     at = o->cur;
     o->cur += size;
     put_hdr(at, op, size, cost);
+    /* only a buffer that still owns a control slot has a counter: a stale ctl index must not add to another's */
+    if (snx_tracy_attached() && ctl_of(cb)) {
+        u32 slot = o->ctl;
+        if (slot <= NVN_CTL_SLOTS) {
+            atomic_fetch_add_explicit(&g_nvn_rec_count.recs[slot], 1, memory_order_relaxed);
+            atomic_fetch_add_explicit(&g_nvn_rec_count.bytes[slot], size, memory_order_relaxed);
+        }
+    }
     if (o->recording == 2) { /* the recording's first record is its handle */
         o->begin = at;
         o->recording = 1;
@@ -806,6 +907,9 @@ int nvn_CommandBufferInitialize(CPU* c, u64 cb, u64 d) {
     g_nvn.cmd.ctl[k].grow = 1;
     g_nvn.cmd.ctl[k].command_callback = 1;
     o->ctl = k + 1;
+    /* a slot a finalized command buffer left may still hold counts: start this one from zero */
+    atomic_store_explicit(&g_nvn_rec_count.recs[o->ctl], 0, memory_order_relaxed);
+    atomic_store_explicit(&g_nvn_rec_count.bytes[o->ctl], 0, memory_order_relaxed);
     pm_unlock(&g_nvn.cmd.lock);
     return 1;
 }
@@ -813,7 +917,15 @@ void nvn_CommandBufferFinalize(CPU* c, u64 cb) {
     NvnCtl* t = ctl_of(cb);
     (void)c;
     pm_lock(&g_nvn.cmd.lock);
-    if (t && t->cb == cb) t->cb = 0;
+    if (t && t->cb == cb) {
+        u32 slot = CB(cb)->ctl;
+        t->cb = 0;
+        /* give the profiling counter slot back now, as Initialize takes it from zero: nothing counts it after this */
+        if (slot && slot <= NVN_CTL_SLOTS) {
+            atomic_store_explicit(&g_nvn_rec_count.recs[slot], 0, memory_order_relaxed);
+            atomic_store_explicit(&g_nvn_rec_count.bytes[slot], 0, memory_order_relaxed);
+        }
+    }
     pm_unlock(&g_nvn.cmd.lock);
     CB(cb)->ctl = 0;
     CB(cb)->magic = 0;
@@ -858,9 +970,10 @@ void nvn_CommandBufferAddCommandMemory(CPU* c, u64 cb, u64 pool, i64 offset, u64
     o->game_end = o->origin + size;
     o->used = 0;
     o->seen = 0;
-    if (o->lent)
+    if (o->lent) {
         o->game_cur = (o->origin + 7) & ~7ull;
-    else
+        if (o->piece & PIECE_TAIL) o->piece = 0; /* spill_tail no longer finds its JUMP before game_cur */
+    } else
         o->cur = (o->origin + 7) & ~7ull;
 }
 /* The control memory holds the driver's entries of each recording, which the game sizes by GetControlMemoryUsed and
@@ -966,6 +1079,7 @@ void nvn_CommandBufferMultiDrawMeshTasks3DIndirectCount(CPU* c, u64 cb, u64 ind,
 }
 /* a recording starts with its first command, as in NVN */
 void nvn_CommandBufferBeginRecording(CPU* c, u64 cb) {
+    nvn_trace_set("begin recording", cb, NVN_TRACE_RECORD);
     NvnCmdBuf* o = CB(cb);
     NvnCtl* t = ctl_of(cb);
     if (o->recording) LOG_LIMIT(4, "nvn: command buffer %llx began recording twice\n", (unsigned long long)cb);
@@ -982,10 +1096,23 @@ void nvn_CommandBufferBeginRecording(CPU* c, u64 cb) {
 /* the recording ends with its last record, which takes no bytes more, as the driver's EndRecording writes none; one
    without records is the runtime's one END */
 u64 nvn_CommandBufferEndRecording(CPU* c, u64 cb) {
+    nvn_trace_set("end recording", cb, NVN_TRACE_RECORD);
     NvnCmdBuf* o = CB(cb);
     NvnCtl* t = ctl_of(cb);
     u64 h;
     int no_command = 0;
+    /* what this recording cost to build: records and guest bytes, reset for the next one. The reset stays inside the
+       attached check: with no client the plot goes nowhere, and the exchange must not run for nothing. ctl_of guards
+       the slot, as in alloc_rec: a finalizing buffer's stale index must not exchange another buffer's counters */
+    if (snx_tracy_attached() && ctl_of(cb)) {
+        u32 slot = o->ctl;
+        if (slot <= NVN_CTL_SLOTS) {
+            SNX_PLOT("gpu nvn cmd records",
+                     (double)atomic_exchange_explicit(&g_nvn_rec_count.recs[slot], 0, memory_order_relaxed));
+            SNX_PLOT("gpu nvn cmd bytes",
+                     (double)atomic_exchange_explicit(&g_nvn_rec_count.bytes[slot], 0, memory_order_relaxed));
+        }
+    }
     ctl_flush(c, cb);       /* the range of the last commands */
     ctl_count(c, cb, 8, 0); /* the driver's end mark */
     if (o->recording == 1 && o->last) {
@@ -997,7 +1124,10 @@ u64 nvn_CommandBufferEndRecording(CPU* c, u64 cb) {
         /* bytes of its own, the driver's being control memory: no callback, which the driver wouldn't call */
         if (no_command && o->used + 4 <= o->game_end - o->origin) o->used += 4;
         h = spill_settle(cb);
-        if (o->piece) h = spill_link(cb, spill_compact(cb)); /* it stays in the runtime's memory */
+        if (o->piece & PIECE_TAIL)
+            spill_tail(cb); /* its handle stays in the game's memory */
+        else if (o->piece)
+            h = spill_link(cb, spill_compact(cb)); /* it stays in the runtime's memory */
     } else
         h = empty_recording();
     if (t && t->start && no_command) {
@@ -1030,6 +1160,10 @@ u64 nvn_CommandBufferGetControlMemoryUsed(CPU* c, u64 cb) {
    counts the driver's bytes it counted where it was recorded */
 void nvn_CommandBufferCopyCommands(CPU* c, u64 cb, i32 n, u64 handles) {
     i32 i;
+    nvn_trace_set("copy commands", cb, NVN_TRACE_RECORD);
+    SNX_ZONE_V(z, "nvn cmd copy commands", n > 0 ? (u64)n : 0);
+    [[maybe_unused]] char tctx[128];
+    SNX_ZONE_TEXT(z, "%s", nvn_trace_context(tctx, sizeof tctx));
     for (i = 0; i < n; i++) {
         u64 p = gr64(handles + 8 * (u64)i);
         /* the driver copies the commands into command memory, and a range of them follows (the records' counted
@@ -1062,6 +1196,7 @@ void nvn_CommandBufferCopyCommands(CPU* c, u64 cb, i32 n, u64 handles) {
    callee counts one range (0x18, 0x20 with the block's header): its other entries (compute binds) aren't counted, as
    the runtime's handles of recordings in its own memory are used again, and can't name what a callee holds */
 void nvn_CommandBufferCallCommands(CPU* c, u64 cb, i32 n, u64 handles) {
+    nvn_trace_set("call commands", cb, NVN_TRACE_RECORD);
     NvnCtl* t = ctl_of(cb);
     i32 i;
     ctl_flush(c, cb);
@@ -1153,6 +1288,10 @@ static u64 tex_snap(u64 payload, size_t off, int k, u64 t) {
     u64 s = payload + off + (u64)k * NVN_TEX_SNAP;
     if (!t) return 0;
     if (NVN_OBJ(NvnTexture, t)->magic != NVN_MAGIC('T', 'E', 'X', 0)) {
+        /* rare: no snapshot to take, so the address is read again at submit */
+        [[maybe_unused]] char tctx[128];
+        SNX_ZONE_T(z, "nvn cmd tex snap missing", "%llx; %s", (unsigned long long)t,
+                   nvn_trace_context(tctx, sizeof tctx));
         LOG_LIMIT(4, "nvn: texture %llx isn't a live texture as a command is recorded: read at submit\n",
                   (unsigned long long)t);
         return t;
@@ -1251,12 +1390,15 @@ void nvn_CommandBufferCopyTextureToTexture(CPU* c, u64 cb, u64 s, u64 sv, u64 sr
    copy (below). The input's size is the parameters' subrectangle size, else the network's render size; the output's
    is the network's output size, else the output texture's */
 void nvn_CommandBufferEvaluateDlss(CPU* c, u64 cb, u64 n, u64 p) {
+    nvn_trace_set("evaluate dlss", cb, NVN_TRACE_RECORD);
+    SNX_ZONE(z, "nvn cmd dlss"); /* one of the costliest commands to record: its span is the CPU cost */
     const NvnDlssParameters q = *NVN_OBJ(const NvnDlssParameters, p);
     const NvnDlssNetwork* o = NVN_OBJ(const NvnDlssNetwork, n);
     i32 in_w = q.input_size[0] > 0 ? q.input_size[0] : o->render[0];
     i32 in_h = q.input_size[1] > 0 ? q.input_size[1] : o->render[1];
     i32 out_w = o->output[0], out_h = o->output[1];
     if (!q.input.texture || !q.output.texture) {
+        SNX_ZONE_VALUE(z, 2); /* 2: skipped, no input or output texture */
         LOG_LIMIT(4, "nvn: DLSS evaluation without an input or output texture: nothing copied\n");
         return;
     }
@@ -1314,8 +1456,53 @@ void nvn_CommandBufferEvaluateDlss(CPU* c, u64 cb, u64 n, u64 p) {
     d->sr[d->n_copies] = (NVNcopyRegion){sx0, sy0, 0, sw, sh, 1};
     d->dr[d->n_copies] = (NVNcopyRegion){dx0, dy0, 0, dw, dh, 1};
     d->n_copies++;
+    SNX_ZONE_VALUE(z, 1); /* 1: recorded */
+    [[maybe_unused]] char tctx[128];
+    SNX_ZONE_TEXT(z, "%dx%d to %dx%d, %u copies; %s", in_w, in_h, out_w, out_h, d->n_copies,
+                  nvn_trace_context(tctx, sizeof tctx));
     LOG_LIMIT(4, "nvn: DLSS evaluation of %dx%d at (%d, %d) to %dx%d at (%d, %d)\n", in_w, in_h, q.base[0][0],
               q.base[0][1], out_w, out_h, q.base[4][0], q.base[4][1]);
+}
+/* nvn_cmd.h: a hook module's upscale, recorded as the DLSS evaluation is, its textures snapshotted */
+int nvn_cmd_record_upscale(CPU* c, u64 cb, const NvnUpscaleRequest* r) {
+    const NvnCmdBuf* o = CB(cb);
+    if (o->magic != NVN_MAGIC('C', 'M', 'D', 'B') || !o->recording) {
+        LOG_LIMIT(4, "nvn: a hook module's upscale for %llx, which isn't a command buffer that records: not recorded\n",
+                  (unsigned long long)cb);
+        return 0;
+    }
+    for (int i = NVN_UPSCALE_COLOR; i <= NVN_UPSCALE_OUTPUT; i++)
+        if (!r->tex[i] || NVN_OBJ(const NvnTexture, r->tex[i])->magic != NVN_MAGIC('T', 'E', 'X', 0)) {
+            LOG_LIMIT(4, "nvn: a hook module's upscale whose %s %llx isn't a live texture: not recorded\n",
+                      i == NVN_UPSCALE_COLOR ? "color" : "output", (unsigned long long)r->tex[i]);
+            return 0;
+        }
+    if (!r->render[0] || !r->render[1] || !r->out[0] || !r->out[1]) {
+        LOG_LIMIT(4, "nvn: a hook module's upscale of %ux%u to %ux%u: not recorded\n", r->render[0], r->render[1],
+                  r->out[0], r->out[1]);
+        return 0;
+    }
+    /* no command of the driver's: it takes none of the game's command memory, and never runs the game's memory
+       callback from inside the hook's handler (the record goes in the runtime's memory when the game's has no room) */
+    u64 payload = rec(c, cb, OP_UPSCALE, SNAP_OFF(NvnPUpscale) + NVN_UPSCALE_TEXTURES * NVN_TEX_SNAP, 0);
+    NvnPUpscale* d = (NvnPUpscale*)(void*)GP(payload);
+    for (int i = 0; i < NVN_UPSCALE_TEXTURES; i++) {
+        d->tex[i] = tex_snap(payload, SNAP_OFF(NvnPUpscale), i, r->tex[i]);
+        copy_view(&d->view[i], &d->has_view[i], r->tex[i] ? r->view[i] : 0);
+    }
+    d->reset = r->reset != 0;
+    d->flags = r->flags;
+    memcpy(d->render, r->render, sizeof d->render);
+    memcpy(d->out, r->out, sizeof d->out);
+    memcpy(d->render_max, r->render_max, sizeof d->render_max);
+    memcpy(d->out_base, r->out_base, sizeof d->out_base);
+    memcpy(d->jitter, r->jitter, sizeof d->jitter);
+    memcpy(d->motion_scale, r->motion_scale, sizeof d->motion_scale);
+    memcpy(d->reprojection, r->reprojection, sizeof d->reprojection);
+    d->pre_exposure = r->pre_exposure;
+    LOG_LIMIT(1, "nvn: a hook module recorded an upscale of %ux%u to %ux%u at (%d, %d) (first time)\n", r->render[0],
+              r->render[1], r->out[0], r->out[1], r->out_base[0], r->out_base[1]);
+    return 1;
 }
 /* a multisample resolve of the whole texture, recorded as a copy (nxnative's) */
 static void downsample(CPU* c, u64 cb, u64 s, u64 sv, u64 d, u64 dv) {
@@ -1816,23 +2003,36 @@ void nvn_CommandBufferBindMultisampleState(CPU* c, u64 cb, u64 st) {
 /* the driver writes 20 or 24 bytes for a polygon state and 8 or 16 for a depth-stencil one, by its contents: the fewest */
 void nvn_CommandBufferBindPolygonState(CPU* c, u64 cb, u64 st) { bind_state(c, cb, 4, st, 4, 20); }
 void nvn_CommandBufferBindDepthStencilState(CPU* c, u64 cb, u64 st) { bind_state(c, cb, 5, st, 8, 8); }
+/* The Switch's driver writes a vertex attribute bind as a header and all 16 attributes, 68 bytes, and a stream bind of
+   n streams in 64 + 4n bytes. The Ounce's driver (API 231) writes only what the game binds, each list padded to an even
+   count of words. An attribute bind is a header, the count and the attributes. A stream bind is a header, the count and
+   the strides, then two words and the divisors up to the last stream that has one */
+static u32 even_words(u32 n) { return n + (n & 1); }
 void nvn_CommandBufferBindVertexAttribState(CPU* c, u64 cb, i32 n, u64 st) {
     NvnPBindVAttr* r;
     if (n < 0 || n > 16) {
         LOG_LIMIT(4, "nvn: nvnCommandBufferBindVertexAttribState of %d attributes\n", n);
         return;
     }
-    r = RECN(c, cb, OP_BIND_VATTR, NvnPBindVAttr, st, n, 68); /* the driver writes all 16 attributes */
+    r = RECN(c, cb, OP_BIND_VATTR, NvnPBindVAttr, st, n,
+             g_nvn.loader.api >= 231u << 16 ? 4 * (2 + even_words((u32)n)) : 68);
     r->count = n;
     memcpy(r->st, GP(st), 4 * (size_t)n);
 }
 void nvn_CommandBufferBindVertexStreamState(CPU* c, u64 cb, i32 n, u64 st) {
     NvnPBindVStream* r;
+    u32 cost = (u32)(64 + 4 * n);
     if (n < 0 || n > 16) {
         LOG_LIMIT(4, "nvn: nvnCommandBufferBindVertexStreamState of %d streams\n", n);
         return;
     }
-    r = RECN(c, cb, OP_BIND_VSTREAM, NvnPBindVStream, st, n, (u32)(64 + 4 * n));
+    if (g_nvn.loader.api >= 231u << 16) {
+        u32 divisors = 0; /* one past the last stream with a divisor */
+        for (i32 i = 0; i < n; i++)
+            if (gr32(st + 8 * (u64)i + offsetof(NvnVertexStream, divisor))) divisors = (u32)i + 1;
+        cost = 4 * (4 + even_words((u32)n) + even_words(divisors));
+    }
+    r = RECN(c, cb, OP_BIND_VSTREAM, NvnPBindVStream, st, n, cost);
     r->count = n;
     memcpy(r->st, GP(st), 8 * (size_t)n);
 }

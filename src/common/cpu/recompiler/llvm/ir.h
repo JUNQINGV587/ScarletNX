@@ -139,7 +139,7 @@ typedef struct SnxIrTuning {
     const char* clean;
     void (*builder)(LLVMPassBuilderOptionsRef options);
     void (*machine)(LLVMTargetMachineRef machine);
-    /* every value the three above are made from, as text: what the unit cache keys objects with (unit_cache.c) */
+    /* every value the three above are made from, as text, a line each */
     const char* text;
 } SnxIrTuning;
 
@@ -245,8 +245,11 @@ void ir_flags_logic(SnxIr* ir, LLVMValueRef value, unsigned bits);
 void ir_flags_set_nzcv(SnxIr* ir, LLVMValueRef nzcv);
 LLVMValueRef ir_flags_cond(SnxIr* ir, unsigned cond);
 
-/* Once per process, before any other call; threads may then each own SnxIrs. 0, or -1 with the reason */
+/* Before any other call of the thread's: the first starts LLVM for the process, whichever thread it is, and the others
+   give its answer (threads may then each own SnxIrs). 0, or -1 with the reason */
 int snx_ir_init(char* error, size_t error_size);
+/* whether snx_ir_init started LLVM, which a native back end's work never does */
+int snx_ir_started(void);
 /* Tests': takes every host feature whose name begins with prefix out of what snx_ir_init reads into snx_ir_host and
    of the target machines snx_ir_new and snx_ir_new_jit make, so the host runs as one without them (prefix "avx512":
    an x86-64 with AVX2 and no AVX-512). prefix names a whole family, as "avx512" does: a feature left in that needs
@@ -270,6 +273,9 @@ int snx_ir_fpsr_exact(void);
 /* the settings ir_stats (each code unit's static IR counts in a recompile's log) and ir_dump_pc (hex: the function
    there printed, its IR before and after the promotion), for the SnxIr made after */
 void snx_ir_diagnostics(int stats, const char* dump_pc);
+int snx_ir_stats_on(void); /* the setting ir_stats is on: the recompile reports each unit's IR (LLVM's alone) */
+/* the function ir_dump_pc names, 0 for none: LLVM makes it, whose IR is printed, and the x86-64 back end not */
+SnxU64 snx_ir_dump_pc(void);
 /* Whether the guest's loads and stores are volatile (the setting volatile_memory, off by default): on, LLVM keeps
    each where the guest has it (ir_state.c's ir_rd). Once per process, before any module is made; the caches' keys
    carry it */
@@ -299,7 +305,7 @@ void snx_ir_stale_checks(SnxIr* ir);
 int snx_ir_object(SnxIr* ir, char opt, unsigned char** data, size_t* size, char* error, size_t error_size);
 /* What makes an object of a module besides its IR, LLVM, the target machine's triple, CPU and features, the -O letter
    and the tuning: new_ir's other target machine settings and what snx_ir_module_object does around LLVM's passes. The
-   unit cache's key holds it (unit_cache.c), so a change there that changes the object of the same IR bumps it */
+   JIT cache's key holds it (jit_cache.c), so a change there that changes the object of the same IR bumps it */
 #define SNX_IR_OBJECT_VERSION 5
 /* The same for another module of the SnxIr's context, made with its target and data layout (the A32 executor's
    blocks, common/cpu/arm/exec.c): verified, optimized and compiled with its target machine. The module stays the
@@ -313,8 +319,6 @@ int snx_ir_module_optimize(SnxIr* ir, LLVMModuleRef module, char opt, char* erro
 /* The runtime library (rtlib.c) as a host object file (malloc'd): its bitcode, embedded when the recompiler was
    built, compiled for this machine like the generated code */
 int snx_ir_rtlib_object(char opt, unsigned char** data, size_t* size, char* error, size_t error_size);
-/* The same for a 32-bit module's library (armlib.c: the AArch32 blocks' helpers) */
-int snx_ir_armlib_object(char opt, unsigned char** data, size_t* size, char* error, size_t error_size);
 /* The module's IR as text (LLVMDisposeMessage) */
 char* snx_ir_text(SnxIr* ir);
 

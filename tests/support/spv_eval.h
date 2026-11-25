@@ -30,6 +30,7 @@ typedef struct {
     uint32_t image_size[64][3]; /* what a size query of the sampled image at each binding answers; its levels are 1 */
     uint32_t fetched[64][3];    /* the coordinates of the last OpImageFetch of the image at each binding */
     uint32_t gather[64][4][4];  /* what an OpImageGather of each component of the image at each binding returns */
+    uint32_t element[64];       /* the element of an array of images or samplers at each binding the last access took */
     int killed;                 /* the invocation ended with OpKill or OpTerminateInvocation */
     int helper;                 /* the invocation is a fragment's helper: OpIsHelperInvocationEXT answers true */
     int half_flush;             /* PackHalf2x16 flushes f16 subnormals to a signed zero, as a driver may */
@@ -49,10 +50,12 @@ typedef struct {
     uint32_t array_words[34];
     /* a geometry program: its input arrays' words (up to 6 vertices of a vec4) by location, 32 for Position; and each
        vertex it emits (the first 8), its outputs by location, then 32 for Position and 33 for PrimitiveId, with the
-       counts of OpEmitVertex and OpEndPrimitive. vertex_clip is each emitted vertex's ClipDistance */
+       counts of OpEmitVertex and OpEndPrimitive. vertex_clip is each emitted vertex's ClipDistance, vertex_layer its
+       Layer */
     uint32_t gs_in[33][6 * 4];
     uint32_t vertex[8][34][4];
     uint32_t vertex_clip[8][8];
+    uint32_t vertex_layer[8];
     uint32_t emitted, primitives;
 } SpvEvalEnv;
 /* Runs the module's first entry point: NULL when it returned, else why it stopped (a static string) */

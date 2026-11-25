@@ -95,13 +95,18 @@ typedef struct Renderer {
     /* the 2D engine: 1 when the renderer did the blit on the GPU, 0 to do it in guest memory */
     int (*blit)(const Surf2D* s, const Surf2D* d, int dx, int dy, int dw, int dh, double sx, double sy, double sdx,
                 double sdy);
-    /* A temporal upscale (a Switch 2 game's DLSS evaluation, GpuUpscale): 1 when the renderer wrote the output, 0
-       for the front end's stand-in (a filtered copy). NULL in a renderer without one */
+    /* An upscale (a Switch 2 game's DLSS evaluation, or a hook module's, GpuUpscale): 1 when the renderer wrote the
+       output, 0 for the caller's own fallback (the front end's filtered copy, for a DLSS evaluation and a module's
+       recorded upscale alike). NULL in a renderer without one */
     int (*upscale)(const GpuUpscale* u);
     /* An Ounce's shading rate image (GpuShadingRate) for the draws after it: the id they give in DrawCall.shading_rate,
        0 when they shade each pixel (a renderer or device without it, an image it can't take). A later call can give
        the image other texels, and the draws of an earlier id then shade each pixel. NULL in a renderer without it */
     u32 (*shading_rate)(const GpuShadingRate* r);
+    /* A resolution multiplier asked for (a hook module's, from the internal resolution target): every render target
+       made after it is the game's size times scale. It is taken until the renderer makes its first render target.
+       The multiplier in effect after the call, scale when taken. NULL in a renderer without one */
+    float (*scale_request)(float scale);
     /* NVN copies choose their filter explicitly; source steps can be negative to mirror an axis. */
     int (*blit_filter)(const Surf2D* s, const Surf2D* d, int dx, int dy, int dw, int dh, double sx, double sy,
                        double sdx, double sdy, int linear);
@@ -139,6 +144,10 @@ typedef struct Renderer {
     void (*cs_mem_need)(u64 a, u64 n);
     /* 0 when no pending result or queued release covers [a, a + n): a read needs none of the mem_need hooks */
     int (*mem_pending)(u64 a, u64 n);
+    /* 1 when results of the GPU over the GPU range [a, a + n) are not in guest memory yet: pending results, queued
+       releases, render targets not written back, which a change of the range's mapping lands there first. Any thread.
+       Optional */
+    int (*gpu_holds)(u64 a, u64 n);
     void (*gfx_mem_need)(u64 a, u64 n);
     void (*before_syncwait)(void); /* the stream is about to wait on a syncpoint: flush everything in flight */
     void (*stream_incr)(u32 id);   /* a syncpoint increment in the stream, after everything before it is done */
@@ -146,6 +155,11 @@ typedef struct Renderer {
        happen later, in order with the other releases). data is guest bytes, its numbers little-endian already: the
        front end converted them. NULL: written now, after landing everything */
     void (*release_write)(u64 gva, const void* data, u32 len);
+    /* a 16-byte timestamp report, as release_write, with the time the host GPU reached it at offset 8 in place of the
+       ticks there (top: the time the work reached the top of the pipe). NULL: release_write */
+    void (*release_stamp)(u64 gva, const void* data, int top);
+    /* a timestamp report at guest address cpu gets the GPU's time before a counter read (gpu_release_stamp_sync) */
+    int (*release_stamp_sync)(u64 cpu, int may_wait);
     /* the stream reads or writes [a, a + n): a release still waiting to write there happens first */
     void (*release_need)(u64 a, u64 n);
     /* the stream reads [a, a + n) as it stands after every release before it: 1 when it read guest memory with the
@@ -179,6 +193,10 @@ typedef struct Renderer {
     /* a GPFIFO submission ran to its end or waits (gpu_park): what the guest may look at now goes to the GPU */
     void (*stream_end)(void);
     void (*release_retire)(u32 id); /* finish this syncpoint's queued releases before its id is reused */
+    /* a syncpoint wait's (nvdrv.c syncpt_wait): the queued increments of syncpoint id up to the one that brings it to
+       thresh, with the releases before them, performed on the waiting thread once their GPU work is done, which it
+       waits for only with block. 1 when it performed them */
+    int (*release_wait)(u32 id, u32 thresh, int block);
     void (*report_stall)(void); /* the stall watchdog: what the renderer holds back. Any thread, unlocked */
     /* what the renderer's memory holds, as text for the line of a low memory warning. Any thread, also one that never
        calls Vulkan, unlocked */
@@ -240,6 +258,12 @@ typedef struct Renderer {
        wait for a quiet moment, and before an exit (at_exit), which writes it now. Any thread, while the others still
        run. NULL when the renderer keeps nothing */
     void (*save)(int at_exit);
+    /* how far save(1) has gone, from another thread while it runs, for the screen the game closes on: the bytes of the
+       shaders and pipelines this session made that it packs, those packed so far, and those it wrote once it is done;
+       0 of 0 before it starts. saving_stop ends it at its next step (what it packed by then written, the rest not, the
+       log says both). NULL when the renderer packs nothing as the game closes */
+    void (*saving)(u64* total, u64* packed, u64* kept);
+    void (*saving_stop)(void);
     /* the window given up for a fatal error's screen (log.c's fatal, backend/sdl3.c): the swapchain and the surface go,
        as nothing else can draw in a window something presents to. Called on the failing thread, which never returns to
        its callers, so it keeps no lock. 0 when another thread held the renderer too long. NULL without a window */
@@ -258,7 +282,52 @@ extern const Renderer* g_renderer;
 
 /* shared state (gpu/renderer.c) */
 extern int g_renderer_up; /* the renderer started */
-extern u64 g_draws;
+extern u64 g_draws; /* the draws given to the renderer (gpu_draw), for the counters a report makes up */
+/* the front end's draw and dispatch: what the front end counts and holds back is done here, on its side, and the
+   renderer's call does only the renderer's work */
+void gpu_draw(const DsState* ds, const DrawCall* dc, DrawOwner* o);
+void gpu_clear(const DsState* ds, const DrawClear* c, const DrawOwner* o);
+void gpu_draw_texture(const DsState* ds, const DrawTexture* t);
+void gpu_discard(const DsState* ds, u32 targets);
+/* the front end changed len bytes at off of ds's inline group (DsState.inl), which had the generation before: the
+   next draw record of ds sends those bytes in place of the whole group. A change of more ranges names the first with
+   the old generation and the others with the new one */
+void gpu_ds_inline_changed(const DsState* ds, u64 before, u32 off, u32 len);
+void gpu_dispatch(const DispatchState* d);
+/* the state's copies start over after a state load (gpu.c) */
+void gpu_draw_states_reset(void);
+/* the renderer's calls without a result, queued in their order */
+void gpu_method_barrier(int kind);
+void gpu_stream_incr(u32 id);
+/* on the front end: release_value(id) with the increments still queued for the renderer counted, with no drain */
+u32 gpu_release_value(u32 id);
+void gpu_stream_end(void);
+void gpu_mem_seen(void);
+void gpu_ready(void);
+void gpu_stream_run(int on);
+void gpu_samples_reset(u32 owner);
+void gpu_samples_enable(u32 owner, int on);
+void gpu_predicate_drop(u32 pred);
+/* the renderer's side: 1 when owner's draws are off, 0 when on (with *pred the GPU's predicate, 0 for none), -1 when
+   no render enable of the 3D engine decided it (maxwell/engines.c); and every decision dropped */
+int gpu_render_state(u32 owner, u32* pred);
+/* NVN's SetRenderEnable (modes 2, 3) and SetRenderEnableConditional (0, 1) for owner's draws, decided on the
+   renderer's side as the 3D engine's render enable is (maxwell/engines.c) */
+void gpu_render_enable_nvn(u32 owner, u32 mode, u64 a);
+/* a samples-passed report at a of owner: the renderer's count when counted and it has one, else value, with ticks */
+void gpu_report_samples(u32 owner, u64 a, int counted, u64 value);
+/* a transform feedback control of the owner of ds (renderer.h xfb_control), in its place among the draws */
+void gpu_xfb_control(const DsState* ds, DrawOwner* o, u64 control, u32 what, u32 stride);
+void gpu_render_states_reset(void);
+/* the renderer for any other call of the front end: after every queued record */
+const Renderer* gpu_renderer_now_at(const char* file, int line);
+#define gpu_renderer_now() gpu_renderer_now_at(__FILE__, __LINE__) /* counted by where it is asked (gq_drain_at) */
+/* The shading rate id (Renderer.shading_rate) for the draws after it, from a record in its place in the queue: the
+   renderer's side keeps the id of its last call, and a draw that gives GPU_RATE_LAST in DrawCall.shading_rate takes
+   it there. The draws after the call run after it, so each takes the id the call gave, as the front end would have
+   had it after a drain. 0 with no shading_rate in the renderer */
+#define GPU_RATE_LAST 0xffffffffu
+u32 gpu_shading_rate(const GpuShadingRate* r);
 extern _Atomic int g_cs_any;      /* compute results are pending somewhere */
 extern _Atomic int g_gfx_any;     /* graphics storage-buffer results are pending somewhere */
 extern _Atomic int g_gfx_img_any; /* graphics storage-image results are pending somewhere */

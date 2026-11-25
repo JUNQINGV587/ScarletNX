@@ -42,6 +42,7 @@
    that thread lets go of its lock (own_owed_take), so the next CPU access still asks it for its result. In place, a watch's
    pages each get a shadow when it arms them */
 #include "common/utilities/bits.h"
+#include "common/platform/time.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdatomic.h>
@@ -178,6 +179,7 @@ static void scratch_put(Scratch* s, u8* p) {
 #define STAGE_KEEP ((u64)64 << 20) /* g_own.stage's */
 #define SNAP_KEEP  ((u64)8 << 20)  /* g_own.snap's */
 #define HELD_KEEP  ((u64)1 << 20)  /* g_own.held's, a byte a page */
+#define OWN_READY_NS 20000u          /* a wait for the GPU shorter than this found the result done (g_own.ready) */
 
 /* ---------------------------------------------------------------- the entries, under g_own.lk */
 /* the first entry ending after a */
@@ -446,10 +448,26 @@ static int watched_nl(u64 lo, u64 hi) {
         if (!g_own.ent[i].res) return 1;
     return 0;
 }
+/* the bytes [a, b) of a watch over a GPU's buffer go, and its pages [lo, hi) open where no entry is left: what the
+   producer's hook calls (OwnHooks' open). Cut before that, a fault on one of them would find no entry there and open it
+   (own_fault), before the producer read its bytes */
+typedef struct {
+    u64 a, b, lo, hi;
+} WatchGone;
+static void watch_gone(void* ctx) {
+    const WatchGone* w = (const WatchGone*)ctx;
+    ResList rel = {0};
+    pm_lock(&g_own.lk);
+    cut_nl(w->a, w->b, &rel);
+    pm_unlock(&g_own.lk);
+    let_go(w->lo, w->hi);
+    res_release(&rel);
+}
 /* the watches on [lo, hi) go, one at a time: whole when whole is set, else only their bytes in [lo, hi). Their pages
    open where no entry is left, now, or with keep the caller's landing's let_go opens them: the pages widen [*keep,
    keep[1]). In place, opening a page wakes every thread that waits in a trap, and one on a page the landing fills
-   then can read it half written (plat_trap_fill). Never under a lock of own.c's */
+   then can read it half written (plat_trap_fill). Never under a lock of own.c's. One over a GPU's buffer
+   (own_watch_in_place) opens now, with keep too: no landing is on its pages */
 static void unwatch(u64 lo, u64 hi, int whole, u64* keep) {
     for (u64 c = lo; c < hi;) {
         ResList rel = {0};
@@ -462,13 +480,22 @@ static void unwatch(u64 lo, u64 hi, int whole, u64* keep) {
             return;
         }
         u64 a = g_own.ent[i].lo, b = g_own.ent[i].hi;
+        const int in_place = g_own.ent[i].in_place;
+        const u64 view = g_own.ent[i].pool - a; /* where the guest's byte 0 would be in an in place one's view */
         if (!whole) {
             if (a < c) a = c;
             if (b > hi) b = hi;
         }
+        u64 plo = a & ~(g_own.page - 1), phi = (b + g_own.page - 1) & ~(g_own.page - 1);
+        if (in_place && g_own.hooks.open) {
+            WatchGone w = {a, b, plo, phi};
+            pm_unlock(&g_own.lk);
+            g_own.hooks.open(plo, phi, (const u8*)(uintptr_t)(view + plo), watch_gone, &w);
+            c = b;
+            continue;
+        }
         cut_nl(a, b, &rel); /* the watch's bytes alone: no other entry is on them */
         pm_unlock(&g_own.lk);
-        u64 plo = a & ~(g_own.page - 1), phi = (b + g_own.page - 1) & ~(g_own.page - 1);
         if (!keep)
             let_go(plo, phi);
         else {
@@ -582,7 +609,11 @@ static void land_pages(u64 lo, u64 hi, int by) {
        (in one game's menus a landing held it 7.9 s, waiting for a draw's pipeline, and the GPU thread and the
        game's memory thread with it). Once: an entry published again meanwhile lands under the lock, as before */
     if (real && g_own.hooks.wait) {
+        u64 t0 = plat_ns();
         g_own.hooks.wait(writer);
+        u64 waited = plat_ns() - t0;
+        atomic_fetch_add_explicit(&g_own.wait_ns[by], waited, memory_order_relaxed);
+        if (waited < OWN_READY_NS) atomic_fetch_add_explicit(&g_own.ready[by], 1, memory_order_relaxed);
         if (!region_owned(lo, hi)) return;
         pm_lock(&g_own.lk);
         any = owned_nl(lo, hi);
@@ -673,24 +704,32 @@ static void land_pages(u64 lo, u64 hi, int by) {
     pm_unlock(&g_own.lk);
     atomic_fetch_add_explicit(&g_own.land_bytes, total, memory_order_relaxed);
     SNX_ZONE_TV(z_land, "own land", total, "%u ranges", n);
+    atomic_fetch_add_explicit(&g_own.by_bytes[by], total, memory_order_relaxed);
+    u64 t_copy = plat_ns();
     if (two) {
+        /* With no handle, land_start landed the bytes itself (an early copy had them, or a landing too big for one
+           copy): they are in dst, as they are after land_end. The rest goes on without the lock as well, the pages
+           kept from owners and watches by the inflight entry. Held to the end, the lock kept the trap fill from every
+           draw: on Windows it opens and writes a page at a time, and one game's draws waited 0.8 ms a present */
         void* handle = g_own.hooks.land_start(r, dst, n, by);
-        if (handle) {
-            t_own_window = 1;
-            producer_unlock();
-            t_own_window = 0;
-            let = 1;
-            g_own.hooks.land_end(handle);
-        }
+        t_own_window = 1;
+        producer_unlock();
+        t_own_window = 0;
+        let = 1;
+        if (handle) g_own.hooks.land_end(handle);
     } else
         g_own.hooks.land(r, dst, n, by);
+    u64 t_fill = plat_ns();
+    atomic_fetch_add_explicit(&g_own.copy_ns[by], t_fill - t_copy, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_own.lands, 1, memory_order_relaxed);
     atomic_fetch_add_explicit(&g_own.lands_by[by], 1, memory_order_relaxed);
-    if (!mirror)
+    if (!mirror) {
         for (i = 0; i < n; i++)
             if (plat_trap_fill(GP(r[i].addr), dst[i], r[i].size))
                 fatal("Could not land GPU-owned memory at %llx (%llu bytes)", (unsigned long long)r[i].addr,
                       (unsigned long long)r[i].size);
+        atomic_fetch_add_explicit(&g_own.fill_ns[by], plat_ns() - t_fill, memory_order_relaxed);
+    }
     SNX_ZONE_END(z_land);
     /* the landed pages through the mirror, still trapped: no thread can write them before let_go below. An entry is
        a run of pool pages, so its pages lie in the mirror as they do in guest memory, the edges' CPU bytes too.
@@ -885,9 +924,30 @@ static int arm_new(u64 lo, u64 hi, const u8* held) {
     return 0;
 }
 
+/* The runs of pool pages of [lo, hi) (mem_own_prepare), in buf when there are no more than cap of them, else in
+   memory of their own, which own_runs_free lets go of. NULL when the range can't be owned. A range of more runs than
+   buf holds is owned as one of fewer: it used to land at once instead, its owner's whole range (one game's 2.4 MiB of
+   63 to 83 runs, once a present, under vk_lock) */
+static MemPoolRun* own_runs(u64 lo, u64 hi, MemPoolRun* buf, u32 cap, u32* n) {
+    if (!mem_own_prepare(lo, hi - lo, buf, cap, n)) return buf;
+    if (*n <= cap) return NULL; /* refused for another reason than room */
+    u32 want = *n;
+    MemPoolRun* runs = (MemPoolRun*)malloc(sizeof *runs * want);
+    if (!runs) fatal("Out of memory owning GPU results");
+    /* the caller holds the renderer's lock, as host memory changes do: the runs are the ones counted */
+    if (mem_own_prepare(lo, hi - lo, runs, want, n)) {
+        free(runs);
+        return NULL;
+    }
+    return runs;
+}
+static void own_runs_free(MemPoolRun* runs, const MemPoolRun* buf) {
+    if (runs != buf) free(runs);
+}
+
 int own_begin(u64 addr, u64 size, void* res, u64 res_off) {
     u64 lo = addr & ~(g_own.page - 1), hi, end = addr + size, edge[2];
-    MemPoolRun runs[16];
+    MemPoolRun buf[16];
     ResList rel = {0};
     u8* snap = NULL;
     u32 i, n, nedge = 0;
@@ -895,7 +955,14 @@ int own_begin(u64 addr, u64 size, void* res, u64 res_off) {
     hi = (end + g_own.page - 1) & ~(g_own.page - 1);
     inflight_wait(lo, hi);
     /* the pages in the pool, mapped here only (the caller holds the renderer's lock, as host memory changes do) */
-    if (mem_own_prepare(lo, hi - lo, runs, sizeof runs / sizeof *runs, &n)) return -1;
+    atomic_fetch_add_explicit(&g_own.begins, 1, memory_order_relaxed);
+    MemPoolRun* runs = own_runs(lo, hi, buf, sizeof buf / sizeof *buf, &n);
+    if (!runs) {
+        atomic_fetch_add_explicit(&g_own.refused, 1, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_own.refused_bytes, hi - lo, memory_order_relaxed);
+        return -1;
+    }
+    if (runs != buf) atomic_fetch_add_explicit(&g_own.many_runs, 1, memory_order_relaxed);
     /* in place: an edge page with CPU bytes on it, armed by no owner yet (so readable), keeps a copy of them for
        own_stage. One armed already has its copy from then, or none to keep (the older owners' bytes are the GPU's) */
     if (!g_own.mirror) {
@@ -909,7 +976,10 @@ int own_begin(u64 addr, u64 size, void* res, u64 res_off) {
     while (landing_nl(addr, end) || inflight_nl(lo, hi)) pc_wait(&g_own.cv, &g_own.lk, -1);
     u8* held = scratch_get(&g_own.held, (hi - lo) / g_own.page, HELD_KEEP);
     held_pages_nl(lo, hi, held);
-    Own nw[16]; /* an entry a run of pool pages, so each has one place in the mirror */
+    /* an entry a run of pool pages, so each has one place in the mirror */
+    Own nw_buf[sizeof buf / sizeof *buf];
+    Own* nw = n <= sizeof nw_buf / sizeof *nw_buf ? nw_buf : (Own*)malloc(sizeof *nw * n);
+    if (!nw) fatal("Out of memory owning GPU results");
     for (i = 0; i < n; i++) {
         u64 elo = runs[i].addr > addr ? runs[i].addr : addr;
         u64 ehi = runs[i].addr + runs[i].size < end ? runs[i].addr + runs[i].size : end;
@@ -923,6 +993,8 @@ int own_begin(u64 addr, u64 size, void* res, u64 res_off) {
     }
     own_replace(addr, end, nw, n, &rel);
     pm_unlock(&g_own.lk);
+    if (nw != nw_buf) free(nw);
+    own_runs_free(runs, buf);
     res_release(&rel);
     /* the pages trapped from now on: the CPU's bytes on them stay in the pool, the owned ones are stale there */
     pm_lock(&g_own.trap_lk);
@@ -954,16 +1026,35 @@ u32 own_lookup(u64 addr, u64 size, OwnRange* out, u32 max) {
     return n;
 }
 
-/* the CPU's bytes of [a, b) into dst at a - addr: page by page, a page an owner is on through the mirror (its CPU
-   bytes are in the pool), the others as they are. A page landed meanwhile reads the same through either */
+/* the CPU's bytes of [a, end) of a watch over a GPU buffer's pages (own_watch_in_place), which are no pool pages: read
+   through the buffer's view, into a buffer of this thread's first, as dst can be guest memory and mem.c's lock is held
+   for the read. 1, or 0 when they aren't such pages */
+static int ext_stage(u64 a, u64 end, u8* dst) {
+    for (u64 at = a; at < end;) {
+        u8 part[1024];
+        const u64 n = end - at < sizeof part ? end - at : sizeof part;
+        if (mem_ext_read(at, part, n)) return 0;
+        memcpy(dst + (at - a), part, (size_t)n);
+        at += n;
+    }
+    return 1;
+}
+/* the CPU's bytes of [a, b) into dst at a - addr: a page an owner is on through the mirror (its CPU bytes are in the
+   pool), page by page, and each run of pages no entry is on as it is, with one look under the lock. A page landed
+   meanwhile reads the same through either. A look for each page, in a range of 16 MiB with two small owners that one
+   game's draws bound whole, was most of the renderer thread's locks (17 million in a minute) */
 static void stage_cpu(u64 addr, u64 a, u64 b, u8* dst, const u8* mirror) {
     while (a < b) {
         u64 page = a & ~(g_own.page - 1), end = page + g_own.page, off;
         int owned;
-        if (end > b) end = b;
         pm_lock(&g_own.lk);
-        owned = page_owned_nl(page);
+        u32 i = first_after_nl(page);
+        owned = i < atomic_load_explicit(&g_own.nown, memory_order_relaxed) && g_own.ent[i].lo < end;
+        /* none: no entry before the page of the next one, which starts past this page */
+        if (!owned)
+            end = i < atomic_load_explicit(&g_own.nown, memory_order_relaxed) ? g_own.ent[i].lo & ~(g_own.page - 1) : b;
         pm_unlock(&g_own.lk);
+        if (end > b) end = b;
         if (owned && !mirror) { /* in place: the page's shadow (own_stage landed a page with none first) */
             const u8* sh = NULL;
             /* through a buffer of this thread's: dst is written with no lock of ours held, as a write to it that
@@ -987,7 +1078,7 @@ static void stage_cpu(u64 addr, u64 a, u64 b, u8* dst, const u8* mirror) {
             }
         } else if (owned && !mem_pool_offset(a, &off))
             memcpy(dst + (a - addr), mirror + off, (size_t)(end - a));
-        else
+        else if (!owned || !ext_stage(a, end, dst + (a - addr)))
             memcpy(dst + (a - addr), GP(a), (size_t)(end - a));
         a = end;
     }
@@ -1099,9 +1190,11 @@ int own_hash(u64 addr, u64 size, u64* h) {
     return any;
 }
 
-int own_watch(u64 addr, u64 size) {
+/* own_watch, own_watch_in_place: in place, the pages stay a GPU buffer's (mem_ext_runs) where mem_own_prepare would
+   move them into the pool */
+static int watch(u64 addr, u64 size, int in_place) {
     u64 lo = addr & ~(g_own.page - 1), hi, end = addr + size;
-    MemPoolRun runs[16];
+    MemPoolRun buf[16];
     ResList rel = {0};
     u64* snap_page = NULL;
     u8* snap = NULL;
@@ -1109,7 +1202,9 @@ int own_watch(u64 addr, u64 size) {
     if (!g_own.traps || !size || addr >= AS_SIZE || size > AS_SIZE - addr) return -1;
     hi = (end + g_own.page - 1) & ~(g_own.page - 1);
     inflight_wait(lo, hi);
-    if (mem_own_prepare(lo, hi - lo, runs, sizeof runs / sizeof *runs, &n)) return -1;
+    MemPoolRun* runs = in_place ? (mem_ext_runs(lo, hi - lo, buf, sizeof buf / sizeof *buf, &n) ? NULL : buf)
+                                : own_runs(lo, hi, buf, sizeof buf / sizeof *buf, &n);
+    if (!runs) return -1;
     /* in place: each page armed by no entry yet keeps a copy of its bytes, all of them the CPU's, for own_stage. Read
        without faulting, as own_begin's edges: a page that can't be read is armed already and keeps what it has */
     if (!g_own.mirror) { /* the pages' bytes, then the list of them, in one buffer kept for the next */
@@ -1133,13 +1228,15 @@ int own_watch(u64 addr, u64 size) {
                           : rhi;
             u64 next = gap < rhi ? g_own.ent[j].hi : rhi; /* before the replace moves the entries */
             if (gap > c) {
-                Own w = {.lo = c, .hi = gap, .pool = runs[i].pool + (c - runs[i].addr), .res = NULL};
+                Own w = {
+                    .lo = c, .hi = gap, .pool = runs[i].pool + (c - runs[i].addr), .res = NULL, .in_place = in_place};
                 own_replace(c, gap, &w, 1, &rel);
             }
             c = next;
         }
     }
     pm_unlock(&g_own.lk);
+    own_runs_free(runs, buf);
     res_release(&rel);
     pm_lock(&g_own.trap_lk);
     if (nsnap) shadow_add_nl(snap_page, snap, nsnap);
@@ -1149,6 +1246,8 @@ int own_watch(u64 addr, u64 size) {
     if (snap) scratch_put(&g_own.snap, snap);
     return 0;
 }
+int own_watch(u64 addr, u64 size) { return watch(addr, size, 0); }
+int own_watch_in_place(u64 addr, u64 size) { return watch(addr, size, 1); }
 
 int own_watched(u64 addr, u64 size) {
     u64 c = addr, end = addr + size;
@@ -1265,6 +1364,23 @@ void own_drop(u64 addr, u64 size) {
 u64 own_landings(void) { return atomic_load_explicit(&g_own.lands, memory_order_relaxed); }
 u64 own_faults(void) { return atomic_load_explicit(&g_own.faults, memory_order_relaxed); }
 u64 own_land_bytes(void) { return atomic_load_explicit(&g_own.land_bytes, memory_order_relaxed); }
+void own_begin_stats(u64* begins, u64* refused, u64* refused_bytes, u64* many_runs) {
+    *begins = atomic_load_explicit(&g_own.begins, memory_order_relaxed);
+    *refused = atomic_load_explicit(&g_own.refused, memory_order_relaxed);
+    *refused_bytes = atomic_load_explicit(&g_own.refused_bytes, memory_order_relaxed);
+    *many_runs = atomic_load_explicit(&g_own.many_runs, memory_order_relaxed);
+}
+void own_land_times(u64 bytes[OWN_BY_N], u64 wait_ns[OWN_BY_N], u64 copy_ns[OWN_BY_N], u64 fill_ns[OWN_BY_N]) {
+    for (int i = 0; i < OWN_BY_N; i++) {
+        bytes[i] = atomic_load_explicit(&g_own.by_bytes[i], memory_order_relaxed);
+        wait_ns[i] = atomic_load_explicit(&g_own.wait_ns[i], memory_order_relaxed);
+        copy_ns[i] = atomic_load_explicit(&g_own.copy_ns[i], memory_order_relaxed);
+        fill_ns[i] = atomic_load_explicit(&g_own.fill_ns[i], memory_order_relaxed);
+    }
+}
+void own_land_ready(u64 ready[OWN_BY_N]) {
+    for (int i = 0; i < OWN_BY_N; i++) ready[i] = atomic_load_explicit(&g_own.ready[i], memory_order_relaxed);
+}
 void own_landings_by(u64 by[OWN_BY_N]) {
     for (int i = 0; i < OWN_BY_N; i++) by[i] = atomic_load_explicit(&g_own.lands_by[i], memory_order_relaxed);
 }

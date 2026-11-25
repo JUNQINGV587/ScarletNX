@@ -10,7 +10,17 @@
 # Cross builds run the host's, since the shader is the same for every target.
 
 set(SNX_GLSLANG "" CACHE FILEPATH "glslangValidator to compile shaders with (empty: the pinned release, or PATH)")
-if(NOT SNX_GLSLANG)
+# the suffix of a program of the machine doing the build: CMAKE_HOST_EXECUTABLE_SUFFIX is CMake 3.31's, and the build
+# takes 3.28
+if(CMAKE_HOST_WIN32)
+    set(snx_host_exe ".exe")
+else()
+    set(snx_host_exe "")
+endif()
+# A path this file found is found again at each configure (snx_glslang_found keeps it apart from one the user named):
+# once the pin moves, the release is in another folder, and the old one's glslangValidator is still a file
+if(NOT SNX_GLSLANG OR SNX_GLSLANG STREQUAL "${snx_glslang_found}")
+    unset(snx_glslang_path CACHE)
     set(snx_glslang_host "")
     if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
         set(snx_glslang_host linux-x86_64)
@@ -22,9 +32,9 @@ if(NOT SNX_GLSLANG)
     if(snx_glslang_host)
         AddJsonPackage(NAME glslang-tools-${snx_glslang_host} DOWNLOAD_ONLY FORCE_BUNDLED_PACKAGE ON)
         set(snx_glslang_dir "${glslang-tools-${snx_glslang_host}_SOURCE_DIR}")
-        set(snx_glslang_path "${snx_glslang_dir}/bin/glslangValidator${CMAKE_HOST_EXECUTABLE_SUFFIX}")
+        set(snx_glslang_path "${snx_glslang_dir}/bin/glslangValidator${snx_host_exe}")
         if (NOT EXISTS "${snx_glslang_path}")
-            set(snx_glslang_path "${snx_glslang_dir}/bin/glslang${CMAKE_HOST_EXECUTABLE_SUFFIX}")
+            set(snx_glslang_path "${snx_glslang_dir}/bin/glslang${snx_host_exe}")
         endif()
     else()
         find_program(snx_glslang_path NAMES glslangValidator glslang)
@@ -34,21 +44,23 @@ if(NOT SNX_GLSLANG)
     endif()
     set(SNX_GLSLANG "${snx_glslang_path}" CACHE FILEPATH
         "glslangValidator to compile shaders with (empty: the pinned release, or PATH)" FORCE)
+    set(snx_glslang_found "${snx_glslang_path}" CACHE INTERNAL "the glslangValidator cmake/glsl.cmake found itself")
 endif()
 
 # spirv-opt and spirv-val: SPIRV-Tools' release the build pins, or the ones SNX_SPIRV_OPT and SNX_SPIRV_VAL name
 # (cmake/spirv_tools.cmake)
 include("${CMAKE_CURRENT_LIST_DIR}/spirv_tools.cmake")
 
-# snx_glsl_spirv(target SOURCE file.comp NAME symbol HEADER include/path.h [TARGET vulkan1.x] [DEFINES MACRO[=value]...])
+# snx_glsl_spirv(target SOURCE file.comp NAME symbol HEADER include/path.h [TARGET vulkan1.x] [DEFINES MACRO[=value]...]
+#                [INCLUDES dir...])
 # Compiles SOURCE (its #includes, beside it or from src as a C file's, followed through glslang's depfile) for Vulkan
 # 1.1 (or TARGET) without debug information, optimizes it for speed with spirv-opt -O, validates the result with
 # spirv-val, and puts it into a C file added to target: `const u32 NAME[]` and `const u64 NAME_size` (bytes). HEADER,
 # which the C file includes, declares them: the build writes it too, under generated/include in the build tree (on the
 # include path beside src), one header for every NAME given it. DEFINES are predefined macros, for another build of the
-# same source
+# same source, and INCLUDES folders its #includes are looked for in after its own
 function(snx_glsl_spirv target)
-    cmake_parse_arguments(arg "" "SOURCE;NAME;HEADER;TARGET" "DEFINES" ${ARGN})
+    cmake_parse_arguments(arg "" "SOURCE;NAME;HEADER;TARGET" "DEFINES;INCLUDES" ${ARGN})
     if(NOT arg_TARGET)
         set(arg_TARGET vulkan1.1)
     endif()
@@ -60,6 +72,9 @@ function(snx_glsl_spirv target)
     set(defines "")
     foreach(define IN LISTS arg_DEFINES)
         list(APPEND defines "-D${define}")
+    endforeach()
+    foreach(include IN LISTS arg_INCLUDES)
+        list(APPEND defines "-I${include}")
     endforeach()
     get_filename_component(source "${arg_SOURCE}" ABSOLUTE)
     set(dir "${PROJECT_BINARY_DIR}/generated/spirv")

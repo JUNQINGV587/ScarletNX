@@ -22,6 +22,7 @@
 #include "common/utilities/spirv_emit.h" /* SPV_CAPABILITY_COOPERATIVE_MATRIX_KHR, the scanner's */
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
+#include "nx/runtime/platform/tracy.h"
 #include "common/platform/thread.h" /* plat_thread_note */
 #include "nx/gpu/vk/lookup_ways.h"
 #include "nx/gpu/vk/vk.h"
@@ -124,8 +125,8 @@ u64 g_vk_dispatches, g_vk_cs_batches, g_cs_standins;
 _Atomic u64 g_vk_cs_wait_ns;
 u64 g_vk_cs_open, g_vk_cs_left; /* vk.h */
 /* A program's window: 80 zero bytes in place of a header, then the bytes of its code that cs_read_code reads, and zeros
-   after them. It takes as much code as a graphics program's window (pipeline.c's SH_CODE): an Ounce game has a
-   compute program of 256,160 bytes. In a window of 64 KiB that program had no end, and each of its dispatches was
+   after them. It took as much code as a graphics program's window (pipeline.c's SH_CODE) before that grew for longer
+   fragment programs: an Ounce game has a compute program of 256,160 bytes. In a window of 64 KiB that program had no end, and each of its dispatches was
    skipped as not translated */
 #define CS_CODE   0x80000u
 #define CS_WINDOW (CS_CODE + 80u)
@@ -468,14 +469,26 @@ static void cs_submit(void) {
         VK_OK(vkSignalSemaphore(g_vk.dev, &ss));
     }
 }
-static void cs_wait(u64 value) {
+/* The waits the compute thread makes, each with its own plot. A plot's name carries its one unit: milliseconds per
+   wait, so a reader cannot take one for a total over a present */
+enum { CS_WAIT_PENDING, CS_WAIT_LAND, CS_WAIT_GAME, CS_WAIT_N };
+static const char* const cs_wait_plot[CS_WAIT_N] = {
+    "vk pipe compute wait pending ms per wait",
+    "vk pipe compute wait land ms per wait",
+    "vk pipe compute wait game ms per wait",
+};
+/* why: the short reason from the caller. kind: the wait's plot kind */
+static void cs_wait(u64 value, [[maybe_unused]] const char* why, int kind) {
     u64 t0 = plat_ns();
     SNX_ZONE_C(z, "vk compute wait", 0xb05252);
+    SNX_ZONE_TEXT(z, "kind %u: %s, gate %llu", (unsigned)kind, why, (unsigned long long)value);
     SNX_ZONE_VALUE(z, value);
     gpu_wait_note("a compute batch", value);
     vk_wait_semaphore(g_vk_csem, value);
     gpu_wait_note(NULL, 0);
-    atomic_fetch_add_explicit(&g_vk_cs_wait_ns, plat_ns() - t0, memory_order_relaxed);
+    u64 ns = plat_ns() - t0;
+    atomic_fetch_add_explicit(&g_vk_cs_wait_ns, ns, memory_order_relaxed);
+    SNX_PLOT(cs_wait_plot[kind], (double)ns / 1e6);
 }
 /* the arena's results into guest memory, after its batch is done: of a logged one the bytes its dispatch wrote, each
    of them and no other, its reference to the log dropped then; of another, the bytes that changed */
@@ -521,7 +534,7 @@ static void cs_any_update(void) {
 static void cs_land_oldest(void) {
     CsBatch* b = &g_pend[g_ptail % CS_PENDING];
     int was = g_landing;
-    cs_wait(b->cval);
+    cs_wait(b->cval, "the oldest pending batch has to land", CS_WAIT_PENDING);
     g_landing = 1;
     vk_gpuprof_compute_land(&b->ops);
     cs_write_back(b->ar_mem, b->ar_ptr, b->org, b->out, b->nout);
@@ -617,7 +630,7 @@ static void cs_land(void) {
     if (!g_recording && !g_inflight) return;
     g_landing = 1;
     cs_submit();
-    cs_wait(atomic_load_explicit(&g_cval, memory_order_relaxed));
+    cs_wait(atomic_load_explicit(&g_cval, memory_order_relaxed), "landing the current batch", CS_WAIT_LAND);
     g_inflight = 0;
     vk_gpuprof_compute_land(&g_ops);
     cs_write_back(g_ar_mem, g_ar_ptr, g_org, g_out, g_nout);
@@ -829,7 +842,7 @@ u64 vk_compute_put_aside(void) {
     return gate;
 }
 void vk_compute_wait(u64 value) {
-    if (value) cs_wait(value);
+    if (value) cs_wait(value, "the game asked for a compute result", CS_WAIT_GAME);
 }
 u64 vk_compute_number(void) { return atomic_load_explicit(&g_cval, memory_order_relaxed) + (g_recording ? 1 : 0); }
 void vk_compute_progress(u64* submitted, u64* done) {
@@ -1044,8 +1057,9 @@ static CsPipe* cs_make(const u8* code, u32 blen, u64 key, u32 flow_base, u32 lx,
     u32* spv = vk_translate_spirv(code, CS_WINDOW, ST_CS, &p->si, &nw, read, &p->cbr);
     if (!spv || p->si.unsupported) {
         p->failed = 1;
-        LOG("vulkan: compute %016llx not translated: %s\n", (unsigned long long)key,
-            p->si.first_unsupported[0] ? p->si.first_unsupported : "unsupported feature or shader");
+        LOG("vulkan: compute %016llx not translated: %s%s\n", (unsigned long long)key,
+            p->si.first_unsupported[0] ? p->si.first_unsupported : "unsupported feature or shader",
+            vk_lane_note((char[32]){0}, &p->si));
         return p;
     }
     /* not for a pipeline of an earlier run (vk_cs_pipe_load): one saved before the size was read has 0 in its key */
@@ -1478,7 +1492,9 @@ void vk_dispatch(const DispatchState* d) {
     u64 bimg_at[8] = {0}; /* the buffer images' headers: where, their handles and words 0, for the log */
     u32 bimg_h[8] = {0}, bimg_w0[8] = {0};
     int i;
-    SNX_ZONE(z_dispatch, "dispatch");
+    SNX_ZONE_TV(z_dispatch, "vk: dispatch", (u64)gx * gy * gz * lx * ly * lz,
+                 "grid %ux%ux%u block %ux%ux%u shared %u%s", gx, gy, gz, lx, ly, lz, shm,
+                 d->indirect ? " indirect" : "");
     vk_frame_check();
     vk_own_room();
     if (d->indirect) gx = gy = gz = 1; /* the GPU's: these only say there is a grid */
@@ -1776,8 +1792,10 @@ void vk_dispatch(const DispatchState* d) {
     /* dispatches that read textures run on the graphics queue, after what was recorded before them. Inputs that
        pending compute results overlap land those first, before anything is put in the arena. With unified memory every
        dispatch does: its storage buffers are read and written in place (uma.c), in order with the draws on one queue,
-       with nothing to land, as #690 has it */
-    int gfx = vk_uma() || p->si.ntex > 0 || p->si.nimg > 0, overlap = 0, retries = 0;
+       with nothing to land, as #690 has it. Not where storage is copied under unified memory (a discrete GPU with
+       host imports, vk_uma_storage_copied): there a dispatch's writable storage is a staged result as on the copies'
+       path (buffer.c's copy_writable), and the compute queue's batches run it alongside the draws, as there */
+    int gfx = (vk_uma() && !vk_uma_storage_copied()) || p->si.ntex > 0 || p->si.nimg > 0, overlap = 0, retries = 0;
     /* so does an indirect one: its grid is read where the graphics queue's buffers hold guest memory (vk_buf_get) */
     gfx = gfx || d->indirect != 0;
     /* and one whose storage buffers are in the GPU mirror, which the graphics queue's submits bring up to date and
@@ -1791,11 +1809,6 @@ void vk_dispatch(const DispatchState* d) {
     /* so does one whose storage buffers a draw's pending result covers: on the graphics queue, after that draw, it
        reads the result on the GPU instead of the compute queue waiting for it to land (one game: three a frame) */
     for (i = 0; i < ng && !gfx; i++) gfx = sa[i] && vk_buf_pending(sa[i], ss[i]);
-    /* A graphics-queue dispatch binds like a draw: staged inputs, results pending in staging (buffer.c's GfxOut),
-       landed when the guest needs them or once their submit is done. Landing each one at once took a vk_finish per
-       dispatch, about 9 a frame in one game. Its storage images are published over their guest bytes, GPU-owned
-       (vk_surf_publish), and land at once only where they can't be */
-    int deferred = gfx;
     /* one of storage buffers alone, where the host traps guest memory, keeps them on the GPU (res_bind). On the compute
        queue each landed at the next dispatch that read it: one game's passes update the same buffers dispatch after
        dispatch, and waited for the GPU at nearly every one, about 14 frames a second on any machine */
@@ -1814,8 +1827,22 @@ void vk_dispatch(const DispatchState* d) {
 #endif
         }
     }
+    /* One that isn't kept so runs on the graphics queue too where it reads a buffer on pages where the GPU owns bytes or
+       watches them (memory/own.c, vk_buf_owned). On the compute queue, its read into the arena (gmem_read) copies the
+       CPU's bytes on this thread, through the pool's mirror where a page is trapped, and first lands what the GPU owns.
+       On the graphics queue the buffer cache reads it as it does for a draw, and copies owned bytes from their owner on
+       the GPU. In one game, the CPU reads the compute results every frame, so they aren't resident, and every dispatch
+       reads such a buffer: about 21 MB a present went into the arena that way. A buffer counts as read when a read
+       below would copy it in: the program reads it, or writes it without a log */
+    for (i = 0; i < ng && !gfx && !resident; i++)
+        gfx = sa[i] && (((p->si.gbuf_rmask >> i) & 1) || !(p->si.nmarks && p->si.gbuf_mark[i])) &&
+              vk_buf_owned(sa[i], ss[i]);
+    /* A graphics-queue dispatch binds like a draw: staged inputs, results pending in staging (buffer.c's GfxOut),
+       landed when the guest needs them or once their submit is done. Landing each one at once took a vk_finish per
+       dispatch, about 9 a frame in one game. Its storage images are published over their guest bytes, GPU-owned
+       (vk_surf_publish), and land at once only where they can't be */
+    int deferred = gfx || resident;
     VkOwnRes* made[16] = {0};
-    deferred = deferred || resident;
     /* shared memory in a storage buffer: the one of the queue it records on, before the batch's chains are worked out
        (a bigger buffer for the compute queue lands the batch first) */
     VkDescriptorBufferInfo spill = {0};
@@ -2468,7 +2495,8 @@ rebind:
         cb = g_ccb;
     }
     vkUpdateDescriptorSets(g_vk.dev, nw, w, 0, NULL);
-    if (resident) vk_all_barrier(cb); /* the copies into its buffers, and earlier work on them, before it */
+    if (resident)
+        vk_all_barrier_by(VK_BAR_COMPUTE, cb); /* the copies into its buffers, and earlier work on them, before it */
     /* its queue's shared memory buffer, after the dispatch before that used it */
     if (spill.buffer) {
         VkMemoryBarrier2 smb = {
@@ -2494,9 +2522,9 @@ rebind:
     if (d->indirect && cb0_buf && cb0_range >= 0x20c) {
         /* the grid into bank 0's dispatch size too, on the GPU, after whatever wrote it */
         VkBufferCopy gc = {grid_off, cb0_off + 0x200, 12};
-        vk_all_barrier(cb);
+        vk_all_barrier_by(VK_BAR_COMPUTE, cb);
         rec_CmdCopyBuffer(cb, grid_buf, cb0_buf, 1, &gc);
-        vk_all_barrier(cb);
+        vk_all_barrier_by(VK_BAR_COMPUTE, cb);
     }
     if (mir) { /* after the earlier programs' writes of the mirror, which it may read or write again */
         VkMemoryBarrier2 mmb = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2,
@@ -2564,7 +2592,7 @@ rebind:
         }
     }
     if (resident) {
-        vk_all_barrier(cb); /* its writes before what reads them next */
+        vk_all_barrier_by(VK_BAR_COMPUTE, cb); /* its writes before what reads them next */
         for (int i = 0; i < ng; i++) {
             if (!(((p->si.gbuf_wmask >> i) & 1) && sa[i])) continue;
             if (made[i])
@@ -2616,8 +2644,11 @@ rebind:
            Where guest memory is copied, a dispatch that staged no result for the host waits the same way: its storage
            images are published over their guest bytes, GPU-owned, and a CPU access to them submits what is open
            first (owned.c's own_wait). Submitted each, a scene that fills its compute textures a level a dispatch made
-           129 submissions a present on a discrete GPU, the graphics queue idle 2.4 ms a present between them */
-        if ((vk_uma() || !staged) && !vk_uma_read_soon(p->key)) {
+           129 submissions a present on a discrete GPU, the graphics queue idle 2.4 ms a present between them. Where
+           unified memory stages storage as the copies' path does (vk_uma_storage_copied), a dispatch that staged a
+           result submits as there: held for the next, one game's world submitted on the 1 ms timer, with the GPU idle
+           2.25 ms a present waiting for those commands, and ran at 74 frames a second against 85 */
+        if (((vk_uma() && !vk_uma_storage_copied()) || !staged) && !vk_uma_read_soon(p->key)) {
             g_vk_cs_open = vk_submit_number();
             g_vk_cs_left++;
             return;

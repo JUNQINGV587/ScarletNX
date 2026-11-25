@@ -19,11 +19,13 @@ add_library(snx_ctr_process STATIC runtime/process.c kernel/kernel.c kernel/thre
             services/srv.c services/fs.c services/apt.c services/font.c services/ptm.c services/hid.c services/romfs.c
             services/file.c services/gsp.c services/dsp.c services/cfg.c services/system.c services/am.c services/y2r.c
             services/ldr.c services/cro.c services/swkbd.c services/mii_selector.c services/ir.c services/irrst.c
-            services/mic.c services/cam.c services/csnd.c)
+            services/mic.c services/cam.c services/csnd.c services/soc.c services/ac.c services/frd.c)
 # the system archives' stand-ins (cmake/ctr_system_archives.cmake), which services/fs.c serves through the NCCH archive
 target_sources(snx_ctr_process PRIVATE "${PROJECT_BINARY_DIR}/generated/ctr_system_archives.c")
 target_sources(snx_ctr_process PRIVATE services/uds.c)
 target_link_libraries(snx_ctr_process PUBLIC scarletnx-ldn)
+# soc:U's names, Pretendo's rewrites and NASC's LOGIN (common/online), posted by the HTTPS client
+target_link_libraries(snx_ctr_process PRIVATE snx_online snx_https)
 # the player's input lives beside the presenter, whose window's events it reads
 add_library(snx_ctr_gpu STATIC gpu/present.c input/input.c gpu/transfer.c gpu/y2r.c gpu/vk/y2r.c gpu/vk/device.c gpu/vk/transfer.c
             gpu/vk/vsgen.c gpu/vk/fsgen.c gpu/vk/render.c gpu/pica.c gpu/shader.c gpu/draw.c "${volk_SOURCE_DIR}/volk.c")
@@ -33,6 +35,9 @@ target_include_directories(snx_ctr_gpu PUBLIC "${volk_SOURCE_DIR}")
 include("${PROJECT_SOURCE_DIR}/cmake/decodetree.cmake")
 snx_decodetree(snx_ctr_gpu OUTPUT decode-pica.inc DECODE "${CMAKE_CURRENT_SOURCE_DIR}/gpu/pica.decode"
                OPTIONS --static-decode=decode_pica)
+# and what each instruction computes, which sailgen's GPU mode writes from gpu/sail/pica.sail (cmake/sailgen.cmake)
+include("${PROJECT_SOURCE_DIR}/cmake/sailgen.cmake")
+snx_sailgen_gpu(snx_ctr_gpu pica DIR "${CMAKE_CURRENT_SOURCE_DIR}/gpu/sail")
 # snx_settings_runtime: the vk_ext_* table (g_vk_extension_settings) gpu/vk/device.c reads; a linker that reads each
 # archive once (GNU ld) needs it after snx_ctr_gpu
 target_link_libraries(snx_ctr_gpu PUBLIC snx_ctr_memory scarletnx-common Vulkan::Headers SDL3::SDL3 snx_settings
@@ -41,7 +46,7 @@ target_link_libraries(snx_ctr_gpu PUBLIC snx_ctr_memory scarletnx-common Vulkan:
 set_source_files_properties("${volk_SOURCE_DIR}/volk.c" PROPERTIES COMPILE_OPTIONS "${snx_third_party_flags}")
 # the GPU's compute shaders, compiled at build time (cmake/glsl.cmake)
 include("${PROJECT_SOURCE_DIR}/cmake/glsl.cmake")
-foreach(shader fill display_transfer texture_copy present texture scaled_texture scaled_depth_texture
+foreach(shader fill display_transfer texture_copy present texture scaled_texture scaled_transfer scaled_depth_texture
                color depth y2r)
     snx_glsl_spirv(snx_ctr_gpu SOURCE gpu/vk/shaders/${shader}.comp NAME snx_ctr_${shader}_spv
                    HEADER 3ds/gpu/vk/shaders/${shader}_spv.h)

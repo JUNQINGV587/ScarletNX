@@ -4,8 +4,10 @@
 #include <stdatomic.h>
 #include "common/utilities/bits.h"
 #include "nx/gpu/vk/pending_pages.h"
+#include "nx/gpu/vk/addr_gens.h"
 #include "nx/hle/services/nvdrv.h"
 #include "nx/runtime/platform/log.h"
+#include "nx/runtime/platform/tracy.h"
 #include "common/platform/thread.h" /* PMutex */
 
 /* Changes take g_pend_lk as well as the vk_lock their callers hold: a thread without vk_lock (a change of guest memory
@@ -63,6 +65,8 @@ static void leaf_set(PendLeaf** leaf, u64 p, u32 v) {
     if (!l) {
         if (!v) return;
         if (!(l = leaf[p / LEAF_PAGES] = calloc(1, sizeof *l))) fatal("vulkan: out of memory for pending result pages");
+        static const char k_grown[] = "vk mem pending pages leaf made";
+        SNX_MSG(k_grown, sizeof k_grown - 1);
     }
     group_down(l, i / 64);
     before = l->count[i];
@@ -86,7 +90,11 @@ static void leaves_add(PendLeaf** leaf, u64 first, u64 last, int delta) {
     for (u64 p = first; p <= last;) {
         const u64 li = p / LEAF_PAGES, end = li * LEAF_PAGES + LEAF_PAGES - 1, stop = last < end ? last : end;
         PendLeaf* l = leaf[li];
-        if (!l && !(l = leaf[li] = calloc(1, sizeof *l))) fatal("vulkan: out of memory for pending result pages");
+        if (!l) {
+            if (!(l = leaf[li] = calloc(1, sizeof *l))) fatal("vulkan: out of memory for pending result pages");
+            static const char k_grown[] = "vk mem pending pages leaf made";
+            SNX_MSG(k_grown, sizeof k_grown - 1);
+        }
         i64 pages = 0;
         for (u32 i = (u32)(p % LEAF_PAGES), e = (u32)(stop % LEAF_PAGES); i <= e;) {
             const u32 g = i / 64;
@@ -166,10 +174,19 @@ static void count_pages(PendPages* t, u64 first, u64 last, int delta) {
 typedef struct {
     PendPages* t;
     int delta;
+    int any; /* g_pend_any counts it too: the GPU pages' generations move (addr_gens.h) */
 } AliasAdd;
 static void alias_add(void* ctx, u64 gva, u64 n) {
     const AliasAdd* a = ctx;
     for (PendPages* t = a->t; t; t = t->also) leaves_add(t->gpu, gva >> 12, (gva + n - 1) >> 12, a->delta);
+    /* after the counts: a reader whose sum holds this bump finds the result at the GPU pages (pend_hit) */
+    if (a->any) addr_gens_bump(ADDR_GENS_GPU, gva, n);
+}
+/* whether g_pend_any counts what t counts */
+static int counts_any(const PendPages* t) {
+    for (; t; t = t->also)
+        if (t == &g_pend_any) return 1;
+    return 0;
 }
 /* the guest pages [first, last] gain or lose a result, and so does every GPU page showing one of them: the aliases are
    found here, once for a result, so that pend_hit, asked far more often, needs no translation */
@@ -187,6 +204,9 @@ static int add_pages(void* table, u64 first, u64 last, int delta) {
         }
     }
     if (any && delta && g_pending_pages.any_watch) g_pending_pages.any_watch(first, last);
+    a.any = delta && counts_any(table);
+    /* guest pages past the table: no GPU page shows them here, so every range's generation moves */
+    if (a.any && last >= TABLE_PAGES) addr_gens_bump_all(ADDR_GENS_GPU);
     if (first >= TABLE_PAGES) return 0; /* the overflow answers for them */
     if (last >= TABLE_PAGES) last = TABLE_PAGES - 1;
     a.t = table;
@@ -315,6 +335,8 @@ void pend_remap(u64 gva, u64 size) {
             gmmu_pieces(first << 12, (last - first + 1) << 12, remap_piece, t);
         }
     }
+    /* what the pages show changed, and their counts with it: after the counts, as alias_add bumps */
+    for (i = 0; i < n; i++) addr_gens_bump(ADDR_GENS_GPU, r[2 * i] << 12, (r[2 * i + 1] - r[2 * i] + 1) << 12);
     pend_unlock();
 }
 void pend_add_pages(PendPages* t, u64 first, u64 last, int delta) {

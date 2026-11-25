@@ -7,7 +7,8 @@
    hooks_off names keep their slots. A versioned hook takes the slot of a function whose module's SDK label holds
    its version, and none in a module with no label; one declared a32 for some versions is in the table for any and
    in a 32-bit program's for those, and in a game of another SDK its function keeps its own code, which
-   hook_missed_text says with the SDK. The two tables: a symbol declared again for a 32-bit program
+   hook_missed_text says with the SDK, and hook_unread_text with the SDK it was read in, the functions of each family
+   and what a player can do. The two tables: a symbol declared again for a 32-bit program
    alone has each program's handler in its table, and one only a 32-bit program has is in no other. And a handler
    that hands its call back: the function's own block, the one its slot held, runs until the call's return address,
    and the adapter still returns there; and one that calls another function of the game, with its four words in r0
@@ -54,6 +55,7 @@ static const struct {
                {"now", 0x1040},
                {"save_j", 0x1050},
                {"ranged", 0x1080},
+               {"ranged_too", 0x1090},
                {"save_j", 0x2011 /* in the module with no SDK label */},
                {"answer", 0x3000 /* in no module */},
                {"answer", 0x100001000ull /* outside a 32-bit game's addresses */}};
@@ -78,10 +80,18 @@ SnxArmBlock arm_block(u32 addr, int thumb) {
     const _Atomic SnxArmBlock* slot = arm_slot(addr, thumb);
     return slot ? *slot : NULL;
 }
-static SnxArmCPU a;
+/* the game's thread as the runtime holds it (KThread): the CPU a handler is given and its 32-bit registers in one
+   object, each found from the other by its place, as arm.c finds them. An adapter takes the registers through a
+   restrict pointer, so a handler's way to them has to start at that pointer: registers of their own, apart from the
+   CPU, are another object to the compiler, whose writes it may move past the adapter's reads */
+typedef struct {
+    CPU cpu;
+    SnxArmCPU arm;
+} Thread32;
+static Thread32 thread;
 static unsigned runs;
 static u32 called[6]; /* a guest call's r0 to r3, its function and its state */
-SnxArmCPU* arm_cpu(CPU* c) { return (void)c, &a; }
+SnxArmCPU* arm_cpu(CPU* c) { return &((Thread32*)(void*)((char*)c - offsetof(Thread32, cpu)))->arm; }
 void arm_run(SnxArmCPU* c, SnxArmBlock first, u32 stop_at) {
     runs++;
     if (first) {
@@ -110,9 +120,8 @@ Hle g_hle;
 HleHost g_host;
 Settings g_settings;
 const SnxRoutes* g_routes;
-static CPU cpu32;
 static u8 mem32[0x100];
-CPU* hook_a32_cpu(SnxArmCPU* arm) { return (void)arm, &cpu32; }
+CPU* hook_a32_cpu(SnxArmCPU* arm) { return &((Thread32*)(void*)((char*)arm - offsetof(Thread32, arm)))->cpu; }
 void logf_(int lvl, const char* fmt, ...) { (void)lvl, (void)fmt; }
 /* hook.c takes its invalidation lock only when a hooked function's code changed */
 void pm_lock(PMutex* m) { (void)m; }
@@ -160,8 +169,8 @@ int main(void) {
        a 32-bit program alone in that program's */
     int answer = entry(&hook32_table, "answer", 0), thumb = entry(&hook32_table, "thumb_answer", 0);
     int now = entry(&hook32_table, "now", 0), off = entry(&hook32_table, "off_answer", 0);
-    char text[400];
-    assert(HOOK_COUNT == 8 && HOOK32_COUNT == 9);
+    char text[640];
+    assert(HOOK_COUNT == 9 && HOOK32_COUNT == 10);
     assert(answer >= 0 && thumb >= 0 && now >= 0 && off >= 0);
     assert(entry(&hook_table, "answer", 0) >= 0 && entry(&hook_table, "wide", 0) >= 0);
     assert(entry(&hook32_table, "wide", 0) == -1 && entry(&hook_table, "save_j", 0) == -1);
@@ -197,61 +206,67 @@ int main(void) {
     assert(a32_slots[20] == hook32_fn[entry(&hook32_table, "save_j", 0x10203)]);
     assert(a32_slots[20] != hook32_fn[entry(&hook32_table, "save_j", 0x20000)]);
     assert(a32_slots[32] == hook32_fn[entry(&hook32_table, "ranged", 0x10203)]);
+    assert(a32_slots[36] == hook32_fn[entry(&hook32_table, "ranged_too", 0x10203)]);
     for (unsigned i = 1; i < 0x40; i++) assert(i == 16 || thumb_slots[i] == own_block);
     /* what was left for a version: the one symbol in the module with no label, by its name, module and versions */
     hook_missed_text(text, sizeof text);
     assert(!strncmp(text, "1 of the SDK functions", 22) && strstr(text, "in this 32-bit game"));
     assert(strstr(text, "the first is save_j in main, of version unknown, declared for sdk < 2.0.0; sdk >= 2.0.0"));
+    /* every declaration holds for the module with the label, and the other module's SDK is not known to be another */
+    hook_unread_text(text, sizeof text);
+    assert(!*text);
 
     /* the adapter: r0 and r1 to the handler, its answer in r0, back to lr */
-    cpu32.mem = mem32;
-    a.mem = mem32;
-    a.mem_size = sizeof mem32;
-    a.r[0] = 7, a.r[1] = 1, a.r[14] = 0x3000;
-    a32_slots[0](&a);
-    assert(seen[0] == 7 && seen[1] == 1 && a.r[0] == 0x1234 && a.r[15] == 0x3000);
-    a.r[0] = 0x40, a.r[14] = 0x3001; /* back into Thumb code */
-    thumb_slots[0](&a);
-    assert(mem32[0x40] == 0x5a && a.r[15] == 0x3000 && (a.cpsr & SNX_ARM_T));
+    thread.cpu.mem = mem32;
+    thread.arm.mem = mem32;
+    thread.arm.mem_size = sizeof mem32;
+    thread.arm.r[0] = 7, thread.arm.r[1] = 1, thread.arm.r[14] = 0x3000;
+    a32_slots[0](&thread.arm);
+    assert(seen[0] == 7 && seen[1] == 1 && thread.arm.r[0] == 0x1234 && thread.arm.r[15] == 0x3000);
+    thread.arm.r[0] = 0x40, thread.arm.r[14] = 0x3001; /* back into Thumb code */
+    thumb_slots[0](&thread.arm);
+    assert(mem32[0x40] == 0x5a && thread.arm.r[15] == 0x3000 && (thread.arm.cpsr & SNX_ARM_T));
     /* the 32-bit program's own declaration: the result through the pointer in r0, r1 untouched */
-    a.cpsr = 0;
-    a.r[0] = 0x80, a.r[1] = 0xdead, a.r[14] = 0x3000;
-    a32_slots[16](&a);
-    assert(!memcmp(mem32 + 0x80, "\x88\x77\x66\x55\x44\x33\x22\x11", 8) && a.r[1] == 0xdead && a.r[15] == 0x3000);
+    thread.arm.cpsr = 0;
+    thread.arm.r[0] = 0x80, thread.arm.r[1] = 0xdead, thread.arm.r[14] = 0x3000;
+    a32_slots[16](&thread.arm);
+    assert(!memcmp(mem32 + 0x80, "\x88\x77\x66\x55\x44\x33\x22\x11", 8) && thread.arm.r[1] == 0xdead &&
+           thread.arm.r[15] == 0x3000);
     /* its versioned hook's adapters: each passes its version's layout, the size_t from r1 */
     mem32[0x28] = 0x11, mem32[0x30] = 0x22;
-    a.r[0] = 0x20, a.r[1] = 0xfffffff0u, a.r[14] = 0x3000;
-    hook32_fn[entry(&hook32_table, "save_j", 0x10000)](&a);
-    assert(a.r[0] == 0x11 && seen[0] == 0xc && seen[1] == 0xfffffff0u);
-    a.r[0] = 0x20, a.r[1] = 4;
-    hook32_fn[entry(&hook32_table, "save_j", 0x20000)](&a);
-    assert(a.r[0] == 0x22 && seen[0] == 0x14 && seen[1] == 4);
+    thread.arm.r[0] = 0x20, thread.arm.r[1] = 0xfffffff0u, thread.arm.r[14] = 0x3000;
+    hook32_fn[entry(&hook32_table, "save_j", 0x10000)](&thread.arm);
+    assert(thread.arm.r[0] == 0x11 && seen[0] == 0xc && seen[1] == 0xfffffff0u);
+    thread.arm.r[0] = 0x20, thread.arm.r[1] = 4;
+    hook32_fn[entry(&hook32_table, "save_j", 0x20000)](&thread.arm);
+    assert(thread.arm.r[0] == 0x22 && seen[0] == 0x14 && seen[1] == 4);
 
     /* a handler that hands the call back: the block the function's slot held runs with the call's registers until
        the call's lr, an A32 function's and a Thumb one's each its own, and the adapter returns to that lr though the
        function's code changed r14 */
     assert(a32_slots[24] == hook32_fn[entry(&hook32_table, "own", 0)] && thumb_slots[16] == a32_slots[24]);
-    a.cpsr = 0;
-    a.r[0] = 5, a.r[14] = 0x3000, a.r[15] = 0x1060;
-    a32_slots[24](&a);
-    assert(runs == 1 && a.r[0] == 0x46 && a.r[15] == 0x3000 && !(a.cpsr & SNX_ARM_T));
-    a.cpsr = SNX_ARM_T;
-    a.r[0] = 5, a.r[14] = 0x3001, a.r[15] = 0x2020;
-    thumb_slots[16](&a);
-    assert(runs == 2 && a.r[0] == 0x86 && a.r[15] == 0x3000 && (a.cpsr & SNX_ARM_T));
-    a.r[0] = 4, a.r[14] = 0x3001; /* a call the handler answers itself: the function's code doesn't run */
-    thumb_slots[16](&a);
-    assert(runs == 2 && a.r[0] == 0);
+    thread.arm.cpsr = 0;
+    thread.arm.r[0] = 5, thread.arm.r[14] = 0x3000, thread.arm.r[15] = 0x1060;
+    a32_slots[24](&thread.arm);
+    assert(runs == 1 && thread.arm.r[0] == 0x46 && thread.arm.r[15] == 0x3000 && !(thread.arm.cpsr & SNX_ARM_T));
+    thread.arm.cpsr = SNX_ARM_T;
+    thread.arm.r[0] = 5, thread.arm.r[14] = 0x3001, thread.arm.r[15] = 0x2020;
+    thumb_slots[16](&thread.arm);
+    assert(runs == 2 && thread.arm.r[0] == 0x86 && thread.arm.r[15] == 0x3000 && (thread.arm.cpsr & SNX_ARM_T));
+    thread.arm.r[0] = 4,
+    thread.arm.r[14] = 0x3001; /* a call the handler answers itself: the function's code doesn't run */
+    thumb_slots[16](&thread.arm);
+    assert(runs == 2 && thread.arm.r[0] == 0);
 
     /* a handler that calls a Thumb function of the game from an A32 one's hook: the words in r0 to r3, the function
        in r15 in its state, run until the handler's lr; then the thread is at the hooked function again, in its
        state, with that lr */
-    a.cpsr = 0;
-    a.r[0] = 0x2041, a.r[14] = 0x3000, a.r[15] = 0x1070;
-    a32_slots[28](&a);
+    thread.arm.cpsr = 0;
+    thread.arm.r[0] = 0x2041, thread.arm.r[14] = 0x3000, thread.arm.r[15] = 0x1070;
+    a32_slots[28](&thread.arm);
     assert(runs == 4 && called[0] == 11 && called[1] == 12 && called[2] == 13 && called[3] == 14);
     assert(called[4] == 0x2040 && called[5] == SNX_ARM_T);
-    assert(a.r[0] == 0xc0 && a.r[15] == 0x3000 && !(a.cpsr & SNX_ARM_T));
+    assert(thread.arm.r[0] == 0xc0 && thread.arm.r[15] == 0x3000 && !(thread.arm.cpsr & SNX_ARM_T));
 
     /* a game of another SDK, 3.0.1: the function declared a32 for versions under 2.0.0 keeps its own code there,
        the versioned one takes its later layout and the unversioned ones their hooks, and the text names the
@@ -260,13 +275,23 @@ int main(void) {
     memset(&g_host.hook, 0, sizeof g_host.hook);
     strcpy((char*)guest + 0x1810, "SDK MW+Vendor+VendorSdk_nnSdk-3_0_1-Release");
     hook_install();
-    assert(a32_slots[32] == own_block && a32_slots[0] == hook32_fn[answer]);
+    assert(a32_slots[32] == own_block && a32_slots[36] == own_block && a32_slots[0] == hook32_fn[answer]);
     assert(a32_slots[20] == hook32_fn[entry(&hook32_table, "save_j", 0x20000)]);
     hook_missed_text(text, sizeof text);
-    assert(!strncmp(text, "2 of the SDK functions", 22));
+    assert(!strncmp(text, "3 of the SDK functions", 22));
     assert(strstr(text, "the first is ranged in sdk, of version 3.0.1, declared for sdk < 2.0.0"));
     hook_missed_text(text, 30); /* cut to the buffer */
-    assert(strlen(text) == 29 && !strncmp(text, "2 of the SDK functions", 22));
+    assert(strlen(text) == 29 && !strncmp(text, "3 of the SDK functions", 22));
+    /* why, in the words the stop says it in: the SDK, where it is, the SDK read, the functions left out by family and
+       what to do; the 32-bit declarations hold for the SDK read, so a game of that SDK or an older one says nothing */
+    hook_unread_text(text, sizeof text);
+    assert(!strcmp(
+        text, "This 32-bit game's SDK is 3.0.1 (module sdk) and the runtime's declarations for a 32-bit game were "
+              "read in SDK 0.12.16 alone, so 2 of its SDK functions run their own code (marked 1, second 1), which "
+              "needs services the runtime answers only natively. A 64-bit update of the game, if it has one, "
+              "plays; for this version, an SDK of 3.0.1 has to be read (issue #2242)"));
+    hook_unread_text(text, 30); /* cut to the buffer */
+    assert(strlen(text) == 29 && !strncmp(text, "This 32-bit game's SDK is 3.0", 29));
 
     /* hooks=0 takes nothing, and leaves nothing to say */
     for (unsigned i = 0; i < 0x40; i++) a32_slots[i] = thumb_slots[i] = own_block;
@@ -274,6 +299,8 @@ int main(void) {
     hook_install();
     assert(a32_slots[0] == own_block && thumb_slots[0] == own_block);
     hook_missed_text(text, sizeof text);
+    assert(!*text);
+    hook_unread_text(text, sizeof text);
     assert(!*text);
     puts("hook_install_a32: passed");
     return 0;

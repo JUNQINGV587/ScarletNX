@@ -10,6 +10,8 @@
 #include "nx/loader/module.h"
 #include "nx/loader/module_llvm.h"
 #include "nx/loader/codegen_view.h"
+#include "nx/loader/hook_libs.h"
+#include "nx/loader/hook_routes.h"
 #include "nx/loader/ounce.h"
 #include "nx/runtime/nce/nce_host.h"
 #include "nx/runtime/nce/nce_patch.h"
@@ -17,6 +19,7 @@
 #include <android/api-level.h>
 #endif
 #include "common/cpu/recompiler/llvm/ir.h"
+#include "common/cpu/recompiler/x64/x64_cache.h"
 
 /* the triple of the iOS app's code: Darwin's calling convention and the generic AArch64 CPU, in the object format the
    JIT loader reads (recompiler/llvm/ir.c's host_triple). The version only names the ABI */
@@ -38,9 +41,45 @@ const IniOpt* snx_recompile_setting(const char* key) {
     if (!o) o = ini_find(g_llvm_ini, key);
     return o ? o : ini_find(g_recompile_game_ini, key);
 }
+/* the recompile's settings off their default that change the code it makes (settings.txt's perf), which the game
+   names over its picture as it starts: owned, "" for none. opt is the made line's own field */
+static char* made_off(void) {
+    size_t made = ini_perf_keys(g_recompile_ini, "opt", NULL, 0), llvm = ini_perf_keys(g_llvm_ini, NULL, NULL, 0);
+    char* off = (char*)snx_alloc(made + llvm + 2);
+    ini_perf_keys(g_recompile_ini, "opt", off, made + 1);
+    if (made && llvm) off[made++] = ',';
+    ini_perf_keys(g_llvm_ini, NULL, off + made, llvm + 1);
+    return off;
+}
+/* a line of the hook module libraries' (hook_libs.h) */
+static void say_hook_libs(const char* line) { printf("scarletnx: %s\n", line); }
+/* where the hook module libraries' CPU hooks were routed in the program: each one's key in each module whose ID it
+   matched, or that it matched none, so a recompile says what a later run's hooks will find */
+static void say_hook_routes(const SnxProgram* p) {
+    for (size_t i = 0; i < snx_hook_route_build_count(); ++i) {
+        int matched = 0;
+        for (size_t m = 0; m < p->module_count; ++m) {
+            SnxU64 offset;
+            char key[96];
+            if (!snx_hook_route_build_at(i, p->modules[m].build_id, &offset) ||
+                !snx_hook_build_key(p->modules[m].build_id, offset, key, sizeof key))
+                continue;
+            matched = 1;
+            printf("scarletnx: hook module CPU hook %s %s in %s\n", key,
+                   snx_hook_route_listed(key) ? "routed" : "NOT routed (its offset isn't in the module's code)",
+                   p->modules[m].name ? p->modules[m].name : "a module");
+        }
+        SnxU64 offset = 0;
+        const char* build = snx_hook_route_build_entry(i, &offset);
+        if (!matched)
+            printf("scarletnx: hook module CPU hook of build %s at %llx: no module of this program has that build, "
+                   "not routed\n",
+                   build, (unsigned long long)offset);
+    }
+}
 static void usage(void) {
     puts("Usage: scarletnx -r INPUT [NAME] [OPTIONS]\n"
-         "  INPUT                  Game/ExeFS folder, .nro, or an XCI or NSP dump (read in place)\n"
+         "  INPUT                  Game/ExeFS folder, .nro, or an XCI, NSP, XCZ or NSZ dump (read in place)\n"
          "  --name NAME            Output name (default: the title ID, else the NPDM's or input name)\n"
          "  --outdir DIR           Where the game's folder goes (default: recompiled/)\n"
          "  --layout FILE          Put the code of these functions first, in this order (hex PCs, one per line):\n"
@@ -49,7 +88,7 @@ static void usage(void) {
          "  --title-keys FILE      title.keys for a dump, found the same way (optional)\n"
          "  --program N            Only program N of a dump's application of several (default: every one)");
     puts("  --KEY=VALUE            A recompile setting, KEY its key with a - for each _: --opt, --llvm-batch,\n"
-         "                         --aot-threads, --unit-cache-gb, --llvm-pass-<pass>=0 (scarletnx\n"
+         "                         --aot-threads, --unit-cache-ceil-mb, --llvm-pass-<pass>=0 (scarletnx\n"
          "                         --settings=recompile lists the keys). The key as written, the older\n"
          "                         spelling, is still read, and said once");
     puts("  --target auto|linux|win64  The host only: modules are built for the machine that builds them\n"
@@ -459,8 +498,6 @@ static int copy_data(const SnxProgram* p, const char* dir, int quiet, int tmpfs)
     free(ex);
     return rc;
 }
-/* the played mods' patches (common/utilities/patches.h) written over each NSO module of program they are made for,
-   every one said: 0, else nonzero with the patch that could not be applied said */
 /* NCE (the setting nce, on an AArch64 Linux host): the game's code runs natively on the host's CPU, so the module
    holds no code made ahead of time (as --jit-only). The analysis finds here the words that the runtime patches
    (nce_patch.h), with the FDEs and the symbols of the modules. Each module then moves up to leave pools for the stubs
@@ -522,6 +559,8 @@ static int nce_prepare(SnxProgram* p, const char* base, int quiet) {
     return r;
 }
 
+/* the played mods' patches (common/utilities/patches.h) written over each NSO module of program they are made for,
+   every one said: 0, else nonzero with the patch that could not be applied said */
 static int patch_modules(SnxProgram* program, const char* mods, const char* own, const char* off, int quiet) {
     char error[1024], **patches;
     size_t count = snx_mods_patches_of(mods, own, off, &patches), i, j;
@@ -666,6 +705,7 @@ static int make_program(const MakeArgs* a, int index) {
     }
     if (patch_modules(&program, mods, own_mods, mods_off, compile.quiet))
         goto done; /* before any code is made from them */
+    say_hook_routes(&program);
     base = snx_path_join(folder, game);
     /* Invalidate the completion stamp before touching an existing game's data
        or module. Failed recompilation must never leave a trusted checkpoint. */
@@ -805,7 +845,7 @@ static int make_program(const MakeArgs* a, int index) {
     gen.nro_end = nros.end;
     code = ios ? snx_format("%s_code.snxobj", base) : snx_format("%s_code.%s", base, compile.target_win ? "dll" : "so");
     {
-        char *kept = keep_c ? snx_format("%s_build", base) : NULL, *units = NULL;
+        char* kept = keep_c ? snx_format("%s_build", base) : NULL;
         llvm.output = code;
         llvm.triple = ios ? SNX_IOS_TRIPLE : NULL;
         llvm.opt = compile.opt[0];
@@ -814,6 +854,7 @@ static int make_program(const MakeArgs* a, int index) {
         snx_ir_volatile_memory(g_settings.volatile_load_stores);
         snx_ir_abi_contract(g_settings.abi_contract);
         snx_ir_diagnostics(g_settings.ir_stats, g_settings.ir_dump_pc);
+        snx_x64_cache_ceiling((SnxU64)g_settings.unit_cache_ceiling * 1000000ull);
         old_branch_profile();
         snx_ir_branch_profile(g_settings.ir_branch_profile);
         llvm.tuning = snx_llvm_tuning(llvm.opt, error, sizeof error);
@@ -830,24 +871,30 @@ static int make_program(const MakeArgs* a, int index) {
         if (layout && !snx_is_file(layout)) {
             snx_error("--layout %s: no such file", layout);
             free(kept);
-            free(units);
             goto done;
         }
         if (layout) llvm.layout = read_addresses(layout, 1, &llvm.layout_count);
-        {
-            /* the user's cache folder, or a portable copy's: every game's recompile shares it */
+        { /* units/ of the cache folder, where an older version kept the code units: never read now, said with its room */
             char* folder = snx_menu_dir(paths->repo, SNX_USER_CACHE);
-            units = folder ? snx_path_join(folder, "units") : NULL;
-            free(folder);
-            if (!units) {
-                snx_error(
-                    "unit cache: HOME is not set (APPDATA on Windows), so there is no cache folder: the game is not "
-                    "recompiled");
-                free(kept);
-                goto done;
+            char* units = folder ? snx_path_join(folder, "units") : NULL;
+            if (units && snx_is_dir(units) && !compile.quiet) {
+                char** names = NULL;
+                size_t count = 0;
+                SnxU64 bytes = 0;
+                if (!snx_list_dir(units, &names, &count)) {
+                    for (size_t n = 0; n < count; ++n) {
+                        char* path = snx_path_join(units, names[n]);
+                        bytes += snx_file_size(path);
+                        free(path);
+                    }
+                    snx_free_strings(names, count);
+                }
+                printf("unit cache: %s holds %.1f MB of an older version's code units, which nothing reads now: "
+                       "deleting it frees that room\n",
+                       units, (double)bytes / 1e6);
             }
-            llvm.unit_cache = units;
-            llvm.unit_cache_limit = (SnxU64)g_settings.unit_cache_limit * 1000000000ull;
+            free(units);
+            free(folder);
         }
         i = kept && (snx_is_link(kept) || snx_mkdirs(kept));
         if (i) snx_error("cannot save the generated code in %s", kept);
@@ -861,7 +908,6 @@ static int make_program(const MakeArgs* a, int index) {
             free(folder);
         }
         free(kept);
-        free(units);
         if (i) goto done;
     }
     if (ios) { /* the iOS app is the runtime: only the code is made here */
@@ -888,11 +934,13 @@ static int make_program(const MakeArgs* a, int index) {
         /* what the launcher says the game was made with: the AArch64 analysis's instructions of the modules' code (a
            32-bit game's blocks are counted otherwise: 0, unknown) */
         SnxGameMade made = {compile.opt[0], !gen.interp_only, found, 0};
-        char *stamp = snx_format("%s.abi", base), *version = snx_game_stamp(mods_stamp), *line, *text;
+        char *stamp = snx_format("%s.abi", base), *version = snx_game_stamp(mods_stamp), *line, *text, *off;
         size_t m;
         for (m = 0; program.npdm.is64 && m < program.module_count; ++m) made.code += program.modules[m].text_size / 4;
         if (made.found > made.code) made.found = made.code;
-        line = snx_game_made_line(&made);
+        off = made_off();
+        line = snx_game_made_line(&made, off);
+        free(off);
         text = snx_format("%s%s", version, line);
         i = snx_write_file(stamp, text, strlen(text));
         free(text);
@@ -1091,6 +1139,13 @@ int snx_recompile_game(int argc, char** argv, const SnxPaths* paths) {
         return snx_error("--target %s: modules are built for this host only (%s)", target,
                          host_win ? "win64" : "linux");
     gen.abi = snx_game_abi();
+    /* the CPU hooks of the hook module libraries (hle/hook/snx_hook_module.h): their keys join the route list before
+       the game's modules are read, so each function they hook is a seed called through its dispatch slot */
+    {
+        char* folder = snx_hook_libs_folder(g_settings.hook_modules_folder);
+        if (folder) snx_hook_libs_route(folder, say_hook_libs);
+        free(folder);
+    }
     /* a dump, read in place, else an ExeFS folder or an NRO. An update's dump is its own program; a DLC has none */
     dump = snx_is_file(input) && snx_is_dump(input);
     key_paths = *paths;

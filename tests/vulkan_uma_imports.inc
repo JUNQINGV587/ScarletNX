@@ -386,7 +386,9 @@ static int check_uma_constants(void) {
 /* Where uma_copies copies constant buffers (vk_uma_imports_dear), their bytes are copied straight from guest memory
    into staging (render.c's cb_get), as on a GPU with memory of its own: the draw reads the 1.0 there. A draw that
    writes the page in place, recorded and not yet run, keeps the next lookup off that copy, whose bytes would be from
-   before the write: the constant buffer goes through the buffer cache, after the write, and the draw reads its 0.0 */
+   before the write: the constant buffer goes through the buffer cache, after the write, and the draw reads its 0.0.
+   On a discrete GPU with host imports (vk_uma_storage_copied) the write is a pending result of the copies' path
+   instead (buffer.c's copy_writable), with the same order */
 #define UMA_CD  (HEAP_BASE + 0x4c00000)
 #define UMA_GCD 0x4f5000000ull
 static int check_uma_constants_copied(void) {
@@ -408,11 +410,12 @@ static int check_uma_constants_copied(void) {
     const int copied = after.cb[VK_CB_COPIED] > before.cb[VK_CB_COPIED];
     /* the shader's write of zeros over c[0][0x600..0x6ff], in place and pending */
     vk_lock();
+    const int staged = vk_uma_storage_copied();
     CHECK(vk_buf_copy_writable(UMA_GCD + 0x600, 256, &w, &wo, 1));
-    const int inplace = !vk_buf_pending(UMA_GCD + 0x600, 256);
+    const int inplace = staged || !vk_buf_pending(UMA_GCD + 0x600, 256); /* staged: pending once committed, below */
     CHECK(!owned_test_fill(w, wo, 256, 0));
     vk_buf_writable_commit();
-    const int pending = vk_uma_pending(UMA_GCD + 0x644, 4);
+    const int pending = staged ? vk_buf_pending(UMA_GCD + 0x644, 4) : vk_uma_pending(UMA_GCD + 0x644, 4);
     vk_unlock();
     vk_draw_counts(&before);
     CHECK(!mesh_pixel(channel, UMA_CB_TARGET, 0, red));
@@ -506,6 +509,11 @@ static int check_uma_atlas_pending(void) {
     }
     const int was = g_settings.guest_buffers_copied;
     g_settings.guest_buffers_copied = 2; /* the atlas: in place is check_uma_alias_in_place's */
+    if (vk_uma_storage_copied()) { /* a discrete GPU with host imports: there the earlier write isn't in place */
+        g_settings.guest_buffers_copied = was;
+        printf("skip: storage written by draws is kept in the GPU's memory on this device (vk_uma_storage_copied)\n");
+        return 0;
+    }
     CHECK(mem_map(UMA_AT, 0x200000, MS_NORMAL, PERM_RW) == 0);
     gmmu_map(UMA_GAT, UMA_AT, 0x200000);
     memset(GP(UMA_AT), 0x31, 0x1000);
@@ -716,44 +724,84 @@ static int check_uma_publish(void) {
     return 0;
 }
 
-/* A host without traps has nothing to own a publish with: the span over memory no import held fell through to
-   own_land's readback, which waits for the queue to drain before the CPU needs a byte of it. The publish now asks bind
-   for the import, which makes it, so the copy is recorded on the GPU like the one over an import and the CPU's read
-   waits in vk_uma_mem_need. Nothing is GPU-owned and nothing lands */
-#define UMA_T  (HEAP_BASE + 0x3e00000) /* no import over it, and no trap to own it with */
-#define UMA_GT 0x4e6000000ull
-static int check_uma_publish_notraps(void) {
-    const u64 src = 0x4e7000000ull, src_cpu = HEAP_BASE + 0x730000; /* in the first heap mapping */
-    u8 bytes[256];
-    if (vk_uma() && !own_traps()) {
-        CHECK(mem_map(UMA_T, 0x200000, MS_NORMAL, PERM_RW) == 0);
-        gmmu_map(UMA_GT, UMA_T, 0x200000);
-        gmmu_map(src, src_cpu, 0x10000);
-        memset(GP(UMA_T), 0xa0, 0x1000);
-        memset(GP(src_cpu), 0xa2, 0x1000);
-        u64 adds = vk_uma_writes(), waits = vk_uma_out_waits();
-        CHECK(!uma_dma(UMA_GT + 0x100, src + 0x100));
-        int owned = own_lookup(UMA_T + 0x100, 256, NULL, 0) != 0;
-        u32 imported = vk_uma_imports(UMA_T, 0x200000);
-        u64 added = vk_uma_writes() - adds, waited = vk_uma_out_waits() - waits;
-        CHECK(!gmem_read(UMA_GT + 0x100, bytes, sizeof bytes));
-        for (u32 i = 0; i < 256; i++) CHECK(bytes[i] == 0xa2);
-        vk_lock();
-        vk_finish();
-        vk_unlock();
-        CHECK(GP(UMA_T)[0x100] == 0xa2 && GP(UMA_T)[0x1ff] == 0xa2 && GP(UMA_T)[0x200] == 0xa0);
-        CHECK(mem_unmap(UMA_T, 0x200000) == 0);
-        if (!imported || owned || !added || waited)
-            fprintf(stderr, "publish without traps: imports %u, owned %d, %llu in-place writes, %llu waits\n",
-                    imported, owned, (unsigned long long)added, (unsigned long long)waited);
-        CHECK(imported && !owned && added && !waited);
-        printf("no traps: a publish over memory no import held makes its import and copies there on the GPU (%u "
-               "imports, %llu in-place writes, %llu waits)\n",
-               imported, (unsigned long long)added, (unsigned long long)waited);
+/* A video picture over memory an import holds is copied there on the GPU (vk_uma_publish), neither owned nor trapped:
+   the picture is in guest memory when its write returns, as the caller steps a syncpoint then that the guest reads it
+   after (host1x.c's run_job, native_video.c's codec_output). The wait for it lets go of vk_lock: the submission waits
+   for a semaphore that another thread signals once it held the lock after the submission was made, or after 5 s without
+   it, so the wait cannot end first. Before, the decoder's thread held the lock through it, and the recording of the
+   frame waited for each picture of a video */
+#define UMA_NV  (HEAP_BASE + 0x4600000)
+#define UMA_GNV 0x4e8000000ull
+static struct {
+    _Atomic int got, done;
+    _Atomic u64 before; /* the submission before the picture's */
+    VkSemaphore gate;
+} g_nv;
+static void uma_nvdec_thread(void* p) {
+    (void)p;
+    const u64 end = plat_ns() + 5000000000ull;
+    while (plat_ns() < end && !atomic_load_explicit(&g_nv.got, memory_order_relaxed)) {
+        if (vk_trylock()) {
+            if (vk_last_submit() > atomic_load_explicit(&g_nv.before, memory_order_relaxed))
+                atomic_store_explicit(&g_nv.got, 1, memory_order_release);
+            vk_unlock();
+        }
+        plat_sleep_ns(100000);
+    }
+    VkSemaphoreSignalInfo signal = {
+        .sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO, .semaphore = g_nv.gate, .value = 1};
+    VK_OK(vkSignalSemaphore(g_vk.dev, &signal));
+    atomic_store_explicit(&g_nv.done, 1, memory_order_release);
+}
+static int check_uma_nvdec(void) {
+    enum { W = 64, H = 32, P = 256 };
+    static u8 y[W * H], u[W / 2 * (H / 2)], v[W / 2 * (H / 2)];
+    VkSemaphoreTypeCreateInfo type = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO,
+                                      .semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE};
+    VkSemaphoreCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, .pNext = &type};
+    VkBuffer b;
+    u64 o;
+    if (!vk_uma()) {
+        printf("skip: guest memory is copied on this device (vk_memory)\n");
         return 0;
     }
-    printf("skip: %s\n", !vk_uma() ? "guest memory is copied on this device (vk_memory)"
-                                   : "traps: a publish owns the span (check_uma_publish)");
+    CHECK(mem_map(UMA_NV, 0x200000, MS_NORMAL, PERM_RW) == 0);
+    gmmu_map(UMA_GNV, UMA_NV, 0x200000);
+    memset(GP(UMA_NV), 0x11, 0x10000);
+    for (u32 i = 0; i < W * H; i++) y[i] = (u8)(i * 7 + 3);
+    for (u32 i = 0; i < sizeof u; i++) u[i] = (u8)(i * 3 + 1), v[i] = (u8)(i * 5 + 2);
+    CHECK(VK_OK(vkCreateSemaphore(g_vk.dev, &ci, NULL, &g_nv.gate)));
+    vk_lock();
+    CHECK(vk_buf_get_input(UMA_GNV, 0x10000, 4, &b, &o)); /* a draw reads it in place: an import holds it */
+    int held = vk_uma_held(UMA_NV, 0x10000);
+    vk_finish();
+    vk_submit_after(g_nv.gate, 1, 2); /* the next submission, the picture's, waits for the gate */
+    atomic_store_explicit(&g_nv.before, vk_last_submit(), memory_order_relaxed);
+    vk_unlock();
+    CHECK(!plat_thread(uma_nvdec_thread, NULL, 1u << 16));
+    NvdecPic p = {{y, u, v}, {W, W / 2, W / 2}, W, H, UMA_NV, UMA_NV + 0x4000, P * H, P * (H / 2), P, P, H, 0};
+    p.pitch_linear = 1;
+    CHECK(g_renderer->nvdec_write(&p));
+    int there = 1; /* as a guest load sees it */
+    for (u32 j = 0; j < H && there; j++) there = !memcmp(GP(UMA_NV) + j * P, y + j * W, W);
+    for (u32 j = 0; j < H / 2 && there; j++)
+        for (u32 i = 0; i < W / 2 && there; i++)
+            there = GP(UMA_NV + 0x4000)[j * P + 2 * i] == u[j * (W / 2) + i] &&
+                    GP(UMA_NV + 0x4000)[j * P + 2 * i + 1] == v[j * (W / 2) + i];
+    int owned = own_lookup(UMA_NV, P * H, NULL, 0) != 0;
+    while (!atomic_load_explicit(&g_nv.done, memory_order_acquire)) plat_sleep_ns(1000000);
+    vk_lock();
+    vk_finish();
+    vk_unlock();
+    vkDestroySemaphore(g_vk.dev, g_nv.gate, NULL);
+    CHECK(mem_unmap(UMA_NV, 0x200000) == 0);
+    const int got = atomic_load_explicit(&g_nv.got, memory_order_acquire);
+    if (!held || owned || !there || !got)
+        fprintf(stderr,
+                "a video picture in place: held %d, owned %d, %s guest memory when its write returned, vk_lock %s\n",
+                held, owned, there ? "in" : "not in", got ? "let go during its wait" : "not let go in 5 s of its wait");
+    CHECK(held && !owned && there && got);
+    printf("in place: a video picture is in guest memory when its write returns, vk_lock let go during its wait\n");
     return 0;
 }
 
@@ -1359,40 +1407,55 @@ static int check_uma_placed_view(void) {
    imports, so it copies where 0 would move, and 2 only moves, on a driver that imports and under auto as well; neither
    puts guest memory in place where vk_memory copies */
 static int check_uma_way(void) {
-    CHECK(vk_uma_way(0, 0, VK_MEM_UMA, 0, 1, 0, 0) == VK_UMA_WITH_NONE);
-    CHECK(vk_uma_way(2, 0, VK_MEM_UMA, 0, 1, 0, 0) == VK_UMA_WITH_AHB);
-    CHECK(vk_uma_way(0, 0, VK_MEM_UMA, 1, 1, 0, 0) == VK_UMA_WITH_HOST &&
-          vk_uma_way(2, 0, VK_MEM_UMA, 1, 1, 0, 0) == VK_UMA_WITH_HOST);
-    CHECK(vk_uma_way(0, 0, VK_MEM_REBAR, 1, 1, 0, 0) == VK_UMA_WITH_NONE &&
-          vk_uma_way(2, 0, VK_MEM_REBAR, 1, 0, 0, 0) == VK_UMA_WITH_HOST);
-    CHECK(vk_uma_way(1, 0, VK_MEM_UMA, 1, 1, 0, 0) == VK_UMA_WITH_NONE &&
-          vk_uma_way(2, 0, VK_MEM_UMA, 0, 0, 0, 0) == VK_UMA_WITH_NONE);
+    CHECK(vk_uma_way(0, 0, VK_MEM_UMA, 0, 1, 0, 0, 0) == VK_UMA_WITH_NONE);
+    CHECK(vk_uma_way(2, 0, VK_MEM_UMA, 0, 1, 0, 0, 0) == VK_UMA_WITH_AHB);
+    CHECK(vk_uma_way(0, 0, VK_MEM_UMA, 1, 1, 0, 0, 0) == VK_UMA_WITH_HOST &&
+          vk_uma_way(2, 0, VK_MEM_UMA, 1, 1, 0, 0, 0) == VK_UMA_WITH_HOST);
+    CHECK(vk_uma_way(0, 0, VK_MEM_REBAR, 1, 1, 0, 0, 0) == VK_UMA_WITH_NONE &&
+          vk_uma_way(2, 0, VK_MEM_REBAR, 1, 0, 0, 0, 0) == VK_UMA_WITH_HOST);
+    CHECK(vk_uma_way(1, 0, VK_MEM_UMA, 1, 1, 0, 0, 0) == VK_UMA_WITH_NONE &&
+          vk_uma_way(2, 0, VK_MEM_UMA, 0, 0, 0, 0, 0) == VK_UMA_WITH_NONE);
     /* imported only */
-    CHECK(vk_uma_way(2, 1, VK_MEM_UMA, 1, 1, 0, 0) == VK_UMA_WITH_HOST &&
-          vk_uma_way(0, 1, VK_MEM_UMA, 1, 1, 0, 0) == VK_UMA_WITH_HOST);
-    CHECK(vk_uma_way(2, 1, VK_MEM_UMA, 0, 1, 0, 0) == VK_UMA_WITH_NONE);
+    CHECK(vk_uma_way(2, 1, VK_MEM_UMA, 1, 1, 0, 0, 0) == VK_UMA_WITH_HOST &&
+          vk_uma_way(0, 1, VK_MEM_UMA, 1, 1, 0, 0, 0) == VK_UMA_WITH_HOST);
+    CHECK(vk_uma_way(2, 1, VK_MEM_UMA, 0, 1, 0, 0, 0) == VK_UMA_WITH_NONE);
     /* moved only */
-    CHECK(vk_uma_way(2, 2, VK_MEM_UMA, 1, 1, 0, 0) == VK_UMA_WITH_AHB &&
-          vk_uma_way(0, 2, VK_MEM_UMA, 1, 1, 0, 0) == VK_UMA_WITH_AHB);
-    CHECK(vk_uma_way(0, 2, VK_MEM_UMA, 0, 1, 0, 0) == VK_UMA_WITH_AHB &&
-          vk_uma_way(2, 2, VK_MEM_REBAR, 1, 1, 0, 0) == VK_UMA_WITH_AHB);
-    CHECK(vk_uma_way(2, 2, VK_MEM_UMA, 1, 0, 0, 0) == VK_UMA_WITH_NONE);
+    CHECK(vk_uma_way(2, 2, VK_MEM_UMA, 1, 1, 0, 0, 0) == VK_UMA_WITH_AHB &&
+          vk_uma_way(0, 2, VK_MEM_UMA, 1, 1, 0, 0, 0) == VK_UMA_WITH_AHB);
+    CHECK(vk_uma_way(0, 2, VK_MEM_UMA, 0, 1, 0, 0, 0) == VK_UMA_WITH_AHB &&
+          vk_uma_way(2, 2, VK_MEM_REBAR, 1, 1, 0, 0, 0) == VK_UMA_WITH_AHB);
+    CHECK(vk_uma_way(2, 2, VK_MEM_UMA, 1, 0, 0, 0, 0) == VK_UMA_WITH_NONE);
+    /* Windows' discrete GPU where the mirror can be (host_discrete): auto imports there, as vk_memory=2 does; moved only
+       and copied are as before, and without the mirror auto copies */
+    CHECK(vk_uma_way(0, 0, VK_MEM_REBAR, 1, 0, 0, 0, 1) == VK_UMA_WITH_HOST &&
+          vk_uma_way(0, 1, VK_MEM_REBAR, 1, 0, 0, 0, 1) == VK_UMA_WITH_HOST);
+    CHECK(vk_uma_way(0, 0, VK_MEM_REBAR, 0, 0, 0, 0, 1) == VK_UMA_WITH_NONE &&
+          vk_uma_way(1, 0, VK_MEM_REBAR, 1, 0, 0, 0, 1) == VK_UMA_WITH_NONE &&
+          vk_uma_way(0, 2, VK_MEM_REBAR, 1, 0, 0, 0, 1) == VK_UMA_WITH_NONE &&
+          vk_uma_way(0, 0, VK_MEM_REBAR, 1, 0, 0, 0, 0) == VK_UMA_WITH_NONE);
     /* Linux's dma-bufs of memfds (udmabuf): auto moves into them where imports are dear (amdgpu), else imports as before;
        imported only never moves, moved only takes them where there are no AHardwareBuffers */
-    CHECK(vk_uma_way(0, 0, VK_MEM_UMA, 1, 0, 1, 1) == VK_UMA_WITH_DMABUF &&
-          vk_uma_way(2, 0, VK_MEM_UMA, 1, 0, 1, 1) == VK_UMA_WITH_DMABUF);
-    CHECK(vk_uma_way(0, 0, VK_MEM_UMA, 1, 0, 1, 0) == VK_UMA_WITH_HOST &&
-          vk_uma_way(0, 0, VK_MEM_UMA, 1, 0, 0, 1) == VK_UMA_WITH_HOST);
-    CHECK(vk_uma_way(0, 1, VK_MEM_UMA, 1, 0, 1, 1) == VK_UMA_WITH_HOST &&
-          vk_uma_way(0, 1, VK_MEM_UMA, 0, 0, 1, 1) == VK_UMA_WITH_NONE);
-    CHECK(vk_uma_way(0, 2, VK_MEM_UMA, 1, 0, 1, 0) == VK_UMA_WITH_DMABUF &&
-          vk_uma_way(0, 2, VK_MEM_UMA, 1, 1, 1, 1) == VK_UMA_WITH_AHB);
-    CHECK(vk_uma_way(0, 0, VK_MEM_REBAR, 1, 0, 1, 1) == VK_UMA_WITH_NONE &&
-          vk_uma_way(1, 0, VK_MEM_UMA, 1, 0, 1, 1) == VK_UMA_WITH_NONE);
+    CHECK(vk_uma_way(0, 0, VK_MEM_UMA, 1, 0, 1, 1, 0) == VK_UMA_WITH_DMABUF &&
+          vk_uma_way(2, 0, VK_MEM_UMA, 1, 0, 1, 1, 0) == VK_UMA_WITH_DMABUF);
+    CHECK(vk_uma_way(0, 0, VK_MEM_UMA, 1, 0, 1, 0, 0) == VK_UMA_WITH_HOST &&
+          vk_uma_way(0, 0, VK_MEM_UMA, 1, 0, 0, 1, 0) == VK_UMA_WITH_HOST);
+    CHECK(vk_uma_way(0, 1, VK_MEM_UMA, 1, 0, 1, 1, 0) == VK_UMA_WITH_HOST &&
+          vk_uma_way(0, 1, VK_MEM_UMA, 0, 0, 1, 1, 0) == VK_UMA_WITH_NONE);
+    CHECK(vk_uma_way(0, 2, VK_MEM_UMA, 1, 0, 1, 0, 0) == VK_UMA_WITH_DMABUF &&
+          vk_uma_way(0, 2, VK_MEM_UMA, 1, 1, 1, 1, 0) == VK_UMA_WITH_AHB);
+    CHECK(vk_uma_way(1, 0, VK_MEM_UMA, 1, 0, 1, 1, 0) == VK_UMA_WITH_NONE);
+    /* a discrete GPU: auto moves into dma-bufs where host imports are dear, and copies where they are not, where it has
+       no udmabuf, or where uma_memory imports only; never a host pointer, which amdgpu takes again at each submission */
+    CHECK(vk_uma_way(0, 0, VK_MEM_REBAR, 1, 0, 1, 1, 0) == VK_UMA_WITH_DMABUF &&
+          vk_uma_way(0, 0, VK_MEM_SMALL_BAR, 1, 0, 1, 1, 0) == VK_UMA_WITH_DMABUF &&
+          vk_uma_way(0, 2, VK_MEM_REBAR, 1, 0, 1, 1, 0) == VK_UMA_WITH_DMABUF);
+    CHECK(vk_uma_way(0, 0, VK_MEM_REBAR, 1, 0, 1, 0, 0) == VK_UMA_WITH_NONE &&
+          vk_uma_way(0, 0, VK_MEM_REBAR, 1, 0, 0, 1, 0) == VK_UMA_WITH_NONE &&
+          vk_uma_way(0, 1, VK_MEM_REBAR, 1, 0, 1, 1, 0) == VK_UMA_WITH_NONE);
     /* vk_memory's copy stays a copy */
-    CHECK(vk_uma_way(1, 1, VK_MEM_UMA, 1, 1, 0, 0) == VK_UMA_WITH_NONE &&
-          vk_uma_way(1, 2, VK_MEM_UMA, 1, 1, 0, 0) == VK_UMA_WITH_NONE &&
-          vk_uma_way(0, 2, VK_MEM_REBAR, 1, 1, 0, 0) == VK_UMA_WITH_NONE);
+    CHECK(vk_uma_way(1, 1, VK_MEM_UMA, 1, 1, 0, 0, 0) == VK_UMA_WITH_NONE &&
+          vk_uma_way(1, 2, VK_MEM_UMA, 1, 1, 0, 0, 0) == VK_UMA_WITH_NONE &&
+          vk_uma_way(0, 2, VK_MEM_REBAR, 1, 1, 0, 0, 0) == VK_UMA_WITH_NONE);
     printf("in place: auto copies where only AHardwareBuffers would take guest memory; vk_memory=2 moves it there; "
            "uma_memory=1 only imports, uma_memory=2 only moves\n");
     return 0;
@@ -1454,6 +1517,15 @@ static int uma_in_buffer(const u8* p) {
 #endif
 }
 static u8 uma_fill(u64 i) { return (u8)(i * 7 + 3); }
+/* a draw's start whose frame check submits what was recorded (vk_submit_every at 1). A region's reads recorded
+   after the last frame check keep it until a later submission is done, which settles them (uma.c's last_read): the
+   checks below free a region at the present after its readers, so their reads are submitted at the draw before */
+static void uma_draw_submits(void) {
+    const int every = g_settings.submit_every;
+    g_settings.submit_every = 1;
+    vk_frame_check();
+    g_settings.submit_every = every;
+}
 static int check_uma_migrate(void) {
     const u64 window = 0x200000;
     VkBuffer b, b2, rb;
@@ -1482,11 +1554,29 @@ static int check_uma_migrate(void) {
     CHECK(vk_uma_migrate(way));
     u8* result = vk_readback_buffer(768, &rb);
     CHECK(result);
+    /* the fill taken by write tracking, in an epoch of its own: from here a page reads as written only by a write */
+    int watched = 0;
+    u32 quiet = 0;
+    if (way == 2) {
+        vk_unlock();
+        g_renderer->mem_may_have_changed();
+        vk_lock();
+        watched = vk_written_since(g, 4 * window, 0) >= 0;
+        quiet = vk_ww_now();
+    }
     /* the first window moves, with its bytes; a range beside it is in the same region */
     CHECK(vk_uma_get(UMA_GM + 0x1000, 256, 1, &b, &off) && off == 0x1000);
     CHECK(vk_uma_imports(UMA_M, 4 * window) == 1 && vk_uma_imports(UMA_M + window, 3 * window) == 0);
     CHECK(uma_in_buffer(g) == 1 && uma_in_buffer(g + window) == 0);
     CHECK(vk_uma_get(UMA_GM + 0x100000, 256, 1, &b2, &off2) && b2 == b && off2 == 0x100000);
+    /* a region made is no write: marked written whole by the move, a render target drawn there before, its pixels not
+       yet in memory, read as older than memory, and a texture over it loaded memory's bytes */
+    if (watched) {
+        vk_unlock();
+        g_renderer->mem_may_have_changed();
+        vk_lock();
+        CHECK(vk_written_since(g + 0x4000, 0x4000, quiet) == 0);
+    }
     /* a dma-buf region's pages are watched for writes as the rest of guest memory (the driver leaves the CPU's page
        table alone): quiet, then a CPU write found. A host-memory region's aren't (vk_written_since -1) */
     if (way == 2 && vk_written_since(g + 0x4000, 0x4000, 0) >= 0) {
@@ -1509,7 +1599,7 @@ static int check_uma_migrate(void) {
     CHECK(uma_in_buffer(g + window) == 1 && uma_in_buffer(g + 2 * window) == 0);
     uma_read(b2, off2, rb, 256);
     uma_read(b2, 0x1000, rb, 512);
-    vk_frame_check(); /* a draw begins: the copies are all recorded */
+    uma_draw_submits(); /* a draw begins: the copies are all recorded, and its frame check submits them */
     u64 recorded = vk_submit_number();
     vk_unlock();
     /* the second window unmapped while the copies are only recorded: nothing waits, nothing is submitted */
@@ -1526,13 +1616,20 @@ static int check_uma_migrate(void) {
     CHECK(uma_in_buffer(g) == 0 && g[0x1000] == 0x5a && g[0x40] == uma_fill(0x40));
     vk_uma_frame();
     CHECK(vk_uma_imports(UMA_M, 4 * window) == 0);
+    /* nor is a region gone, or moved on into a bigger one: a page of the first window that no one wrote */
+    if (watched) {
+        vk_unlock();
+        g_renderer->mem_may_have_changed();
+        vk_lock();
+        CHECK(vk_written_since(g + 0x8000, 0x1000, quiet) == 0);
+    }
     /* a range of a region the GPU owns next (a result published over it): nothing waits for the copy recorded before,
        which reads the bytes from before, and the region goes, its other pages back with their bytes */
     if (own_traps()) {
         const u64 at = 2 * window + 0x100;
         CHECK(vk_uma_get(UMA_GM + at, 256, 1, &b, &off) && uma_in_buffer(g + 2 * window) == 1);
         uma_read(b, off, rb, 0);
-        vk_frame_check();
+        uma_draw_submits();
         VkOwnRes* owner = uma_owner(256, 0x42);
         CHECK(owner);
         vk_own_publish_owned(UMA_M + at, 256, owner, 0);
@@ -1713,6 +1810,91 @@ static int check_uma_region_merge(void) {
     CHECK(regions && merged);
     printf("in place, the migrate way: a region that takes over another lands the writes in place pending there "
            "first\n");
+    return 0;
+}
+/* A region goes whole when any page of it is trapped or changes, its other pages moving back with the bytes its buffer
+   holds then: the writes in place pending anywhere in it land first, not only those over the pages that change. A
+   game's cube of render targets lay over the edge of two regions: at a release each target a region held was
+   published there in place, the one over the edge was trapped, both regions went before the submit ran, and the
+   cube loaded the bytes from before its targets from memory */
+#define UMA_RT  (HEAP_BASE + 0x26800000)
+#define UMA_GRT 0x4fa000000ull
+static int check_uma_region_trap(void) {
+    const u64 window = 0x200000;
+    VkBuffer b;
+    u64 bo;
+#if defined(__ANDROID__)
+    printf("skip: the migrate way runs here as the device chose it (vk_memory), not from this check\n");
+    return 0;
+#endif
+    if (!vk_uma()) {
+        printf("skip: guest memory is copied on this device (vk_memory)\n");
+        return 0;
+    }
+    const int way = uma_imports_shared() ? 1 : vk_uma_can_dmabuf() ? 2 : 0;
+    if (!way) {
+        printf("skip: the driver imports no buffer's pages as host memory or as a dma-buf, which the migrate way "
+               "needs here\n");
+        return 0;
+    }
+    CHECK(mem_map(UMA_RT, 3 * window, MS_NORMAL, PERM_RW) == 0);
+    gmmu_map(UMA_GRT, UMA_RT, 3 * window);
+    u8* g = GP(UMA_RT);
+    memset(g, 0x91, 0x1000);
+    memset(g + window - 0x1000, 0x91, 0x4000);
+    memset(g + 2 * window, 0x91, 0x4000);
+    vk_lock();
+    CHECK(vk_uma_migrate(way));
+    /* a region of each of two windows, and an engine's result published in place in each, pending */
+    CHECK(vk_buf_get_input(UMA_GRT + 0x100, 256, 4, &b, &bo));
+    CHECK(vk_buf_get_input(UMA_GRT + window + 0x2100, 256, 4, &b, &bo));
+    int regions = vk_uma_imports(UMA_RT, 2 * window) == 2 && uma_in_buffer(g) == 1 && uma_in_buffer(g + window) == 1;
+    VkOwnRes *first = uma_owner(256, 0x96), *second = uma_owner(256, 0x97), *edge = uma_owner(256, 0x42);
+    CHECK(first && second && edge);
+    vk_own_publish(UMA_RT + 0x100, 256, first, 0);
+    vk_own_publish(UMA_RT + window + 0x2100, 256, second, 0);
+    int pending = vk_uma_pending_cpu(UMA_RT + 0x100, 256) && vk_uma_pending_cpu(UMA_RT + window + 0x2100, 256);
+    /* a result over the edge between them, which no one region holds: GPU-owned, a trap on a page of each. What asks
+       about the regions next (a release's next target) lets them go, before the submit */
+    vk_own_publish(UMA_RT + window - 0x80, 256, edge, 0);
+    int gone = !own_traps() || (!vk_uma_held(UMA_RT + 0x100, 256) && !vk_uma_held(UMA_RT + window + 0x2100, 256));
+    vk_finish();
+    vk_unlock();
+    CHECK(!uma_landed(UMA_RT + window - 0x80, 256, 0x42));
+    CHECK(g[0x100] == 0x96 && g[0x1ff] == 0x96 && g[0xff] == 0x91 && g[0x200] == 0x91);
+    CHECK(g[window + 0x2100] == 0x97 && g[window + 0x21ff] == 0x97 && g[window + 0x20ff] == 0x91);
+    vk_own_res_unref(first);
+    vk_own_res_unref(second);
+    vk_own_res_unref(edge);
+    /* a result pending in a third window's region, another page of which a view then takes (mem_alias_begin moves it
+       into the pool) */
+    u8* g3 = g + 2 * window;
+    vk_lock();
+    CHECK(vk_buf_get_input(UMA_GRT + 2 * window + 0x100, 256, 4, &b, &bo));
+    int region3 = vk_uma_imports(UMA_RT + 2 * window, window) == 1 && uma_in_buffer(g3) == 1;
+    VkOwnRes* third = uma_owner(256, 0x98);
+    CHECK(third);
+    vk_own_publish(UMA_RT + 2 * window + 0x100, 256, third, 0);
+    int pending3 = vk_uma_pending_cpu(UMA_RT + 2 * window + 0x100, 256);
+    vk_unlock();
+    CHECK(mem_alias_begin(UMA_RT + 2 * window + 0x3000, 0x1000) == 0);
+    CHECK(g3[0x100] == 0x98 && g3[0x1ff] == 0x98 && g3[0xff] == 0x91 && g3[0x200] == 0x91);
+    mem_alias_end(UMA_RT + 2 * window + 0x3000, 0x1000);
+    vk_own_res_unref(third);
+    vk_lock();
+    CHECK(vk_uma_migrate(0));
+    vk_finish();
+    vk_unlock();
+    CHECK(g[0x100] == 0x96 && g[window + 0x2100] == 0x97 && g3[0x100] == 0x98);
+    CHECK(mem_unmap(UMA_RT, 3 * window) == 0);
+    if (!regions || !pending || !gone || !region3 || !pending3)
+        fprintf(stderr,
+                "region trap: two regions %d with a result pending in each %d, gone at the trap %d, a third %d with "
+                "one %d\n",
+                regions, pending, gone, region3, pending3);
+    CHECK(regions && pending && gone && region3 && pending3);
+    printf("in place, the migrate way: a trap or a view on a page of a region lands the writes in place pending in "
+           "the rest of it first\n");
     return 0;
 }
 

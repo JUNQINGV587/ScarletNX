@@ -61,11 +61,19 @@ typedef struct {
     void (*claim)(u64 lo, u64 hi);
     /* A landing in two steps, so that the producer's lock is let go while the GPU copies. Optional, both or neither.
        land_start does what land does up to the wait for the copy, with the producer's lock held and none of own.c's,
-       and gives a handle. NULL: it landed the ranges itself, as land does (a copy too big for one step). land_end(handle)
+       and gives a handle. NULL: it landed the ranges itself, as land does (an early copy had them, or a copy too big
+       for one step), and the landing goes on with the producer's lock let go, as after land_end. land_end(handle)
        waits for the copy and puts the bytes in dst[], with no lock held. It never takes the producer's lock, because
        a thread that holds that lock can wait for this landing's marks */
     void* (*land_start)(const OwnRange* r, u8* const* dst, u32 n, int by);
     void (*land_end)(void* handle);
+    /* a watch over the host pages [lo, hi) of a GPU's buffer (own_watch_in_place) goes with no landing: the producer has
+       it go, by go(ctx), once, before it returns. The pages then read as written to plat_ww_scan, and nothing wrote
+       them: the producer tells what a woken thread writes from that by their bytes, which it reads through bytes (lo's
+       place in the buffer's view, never trapped) before go, while no thread can write them. Called with no lock of
+       own.c's, on any thread, with the producer's lock or mem.c's held or not. Optional: without it the watch goes, and
+       its pages read as written */
+    void (*open)(u64 lo, u64 hi, const u8* bytes, void (*go)(void* ctx), void* ctx);
 } OwnHooks;
 
 /* 0 when the host can trap guest memory (plat_trap_init): own_begin can work from then on. -1: producers land their
@@ -83,6 +91,10 @@ int own_begin(u64 addr, u64 size, void* res, u64 res_off);
    lock before it touched a watched page drops the watch and goes on with the CPU's bytes: it cannot wait for a publish.
    The watch's bytes are owed then (own_owed_take). 0, or -1 as own_begin. The caller holds the producer's lock */
 int own_watch(u64 addr, u64 size);
+/* own_watch over the pages of a GPU's buffer that guest memory moved into (mem_migrate), trapped where they are: a
+   dma-buf of them keeps the same pages for the GPU, and the CPU's bytes read through the buffer's view (mem_ext_read).
+   -1 when [addr, addr + size)'s pages are not all such pages */
+int own_watch_in_place(u64 addr, u64 size);
 /* Watched bytes whose watch a thread that held the producer's lock dropped with no publish: the producer watches them
    again before that thread lets go of its lock, so the next CPU access still asks it for its result. 1, with one
    owed span in [*addr, *addr + *size) taken from the list, or 0 when none is owed */
@@ -127,16 +139,24 @@ u64 own_landings(void);
    that faulted on an owned page, or a write of it */
 enum { OWN_BY_RUNTIME, OWN_BY_READ, OWN_BY_WRITE, OWN_BY_N };
 void own_landings_by(u64 by[OWN_BY_N]);
+/* for the statistics, by what asked: the bytes landed, and the nanoseconds of the wait for the GPU, of the producer's
+   copy and of the copy into the trapped pages (own.c's g_own.by_bytes and the rest) */
+/* own_begin's calls so far, the refusals of mem_own_prepare, their bytes, and those of more than 16 runs */
+void own_begin_stats(u64* begins, u64* refused, u64* refused_bytes, u64* many_runs);
+void own_land_times(u64 bytes[OWN_BY_N], u64 wait_ns[OWN_BY_N], u64 copy_ns[OWN_BY_N], u64 fill_ns[OWN_BY_N]);
+/* by what asked: the landings whose result the GPU had done when they began (g_own.ready) */
+void own_land_ready(u64 ready[OWN_BY_N]);
 int own_traps(void);
 u64 own_faults(void);
 u64 own_land_bytes(void);
 /* own.c's state. Other files read only nown (own_any) */
 typedef struct {
     u64 lo, hi;  /* guest bytes */
-    u64 pool;    /* the pool offset of lo */
+    u64 pool;    /* the pool offset of lo; with in_place, lo's address in the view of the buffer */
     void* res;   /* the producer's copy, lo at res_off: NULL for a watch (own_watch) */
     u64 res_off;
     int landing; /* being landed by some thread: the others wait */
+    int in_place; /* a watch over a GPU's buffer (own_watch_in_place) */
 } Own;
 /* The CPU's bytes of a trapped page, where there is no mirror to read them through: its bytes as they were when it was
    first armed with CPU bytes on it (an owner's edge page, or a watch's page). While the page is armed no CPU write can
@@ -164,6 +184,16 @@ typedef struct {
     _Atomic u64 faults; /* atomic: the faults that landed */
     char own_pad_faults[64];
     _Atomic u64 land_bytes; /* atomic: the bytes landed */
+    /* atomic: for the statistics, by what asked (OWN_BY_*), the bytes landed and the nanoseconds of the parts of a
+       landing: the wait for the GPU's work on the entries (OwnHooks' wait), the producer's copy (land, or land_start
+       to land_end), the copy of the bytes into the trapped pages (no mirror) */
+    _Atomic u64 by_bytes[OWN_BY_N], wait_ns[OWN_BY_N], copy_ns[OWN_BY_N], fill_ns[OWN_BY_N];
+    /* atomic: for the statistics, by what asked, the landings whose wait for the GPU took under OWN_READY_NS: the
+       GPU had done the result already, so a lander that ran when it was done would have come first */
+    _Atomic u64 ready[OWN_BY_N];
+    /* atomic: for the statistics, own_begin's calls, those that mem_own_prepare refused and their bytes, and the ones
+       of more runs of pool pages than own_begin keeps room for (own_runs) */
+    _Atomic u64 begins, refused, refused_bytes, many_runs;
     PMutex lk;  /* the entries' lock */
     /* arming pages and the check that lets them go, one at a time: a page let go just as an entry lands on it stays
        trapped (taken before lk) */

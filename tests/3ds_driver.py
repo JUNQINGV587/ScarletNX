@@ -67,6 +67,11 @@ def main():
     run(['--board-info', '--ctr-screen-layout=4', '--ctr-top-resolution=2', '--ctr-bottom-resolution=2'], 0,
         'Old 3DS\nARM11 cores: 2')
     run(['--model', 'new', '--board-info'], 0, 'New 3DS\nARM11 cores: 4')
+    # the Settings' Console (ctr_model): a console under --model, auto the game's own choice, another word refused
+    run(['--ctr-model=new', '--board-info'], 0, 'New 3DS\nARM11 cores: 4')
+    run(['--ctr-model=new', '--model', 'old', '--board-info'], 0, 'Old 3DS\nARM11 cores: 2')
+    run(['--ctr-model=auto', '--board-info'], 0, 'Old 3DS\nARM11 cores: 2')
+    run(['--ctr-model=other', '--board-info'], 2, 'scarletnx-3ds: ctr_model=other is not auto, old or new')
     run(['--board-info', 'game.cia'], 2, 'Usage:')
     run(['--backend=gcc'], 2, 'unknown setting: --backend=gcc')  # --key=value is the 3DS tables'
     # and the Switch's the 3DS takes too (vk_memory), never another of the Switch's Debug table
@@ -89,11 +94,6 @@ def main():
         ['--board-info', '--ctr-screen-layout=4', '--ctr-top-resolution=2', '--vk-ext-shader-object=off'],
         0,
         'Old 3DS',
-    )
-    run(
-        ['--board-info', '--aot-threads=many'],
-        2,
-        'scarletnx-3ds: aot_threads=many is not a whole number from 0 to 1024',
     )
     run(
         ['--board-info', '--gamepad-deadzone=95'],
@@ -124,11 +124,6 @@ def main():
     # the Controllers table's A and B and dead zone, read as the Switch's (a dead zone past 90 is 90, said), never
     # its vibration, which the 3DS has none of
     run(['--board-info', '--gamepad-swap-ab=1', '--gamepad-deadzone=30'], 0, 'Old 3DS')
-    run(
-        ['--board-info', '--gamepad-deadzone=95'],
-        0,
-        'settings: gamepad_deadzone=95 is not a whole number from 0 to 90: it keeps 90',
-    )
     run(['--board-info', '--gamepad-rumble=50'], 2, 'unknown setting: --gamepad-rumble=50')
     # and its button map, which the 3DS input reads itself: a map it cannot read keeps the one before, a control sent
     # to a button the 3DS lacks sends nothing, each said with the value

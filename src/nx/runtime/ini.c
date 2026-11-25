@@ -3,6 +3,7 @@
 /* the .ini's settings tables (ini.h): finding a key, reading a value into its variable, and writing it back */
 #include "nx/runtime/ini.h"
 #include "common/utilities/common.h" /* SNX_IOS */
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -154,6 +155,28 @@ void ini_format(const IniOpt* o, char* out, size_t n) {
         snprintf(out, n, "%s", (const char*)o->var);
 }
 
+int ini_at_default(const IniOpt* o) {
+    if (o->type == INI_TEXT) return !strcmp((const char*)o->var, o->def ? o->def : "");
+    if (!o->def) return atomic_load_explicit((_Atomic const int*)o->var, memory_order_relaxed) == INT_MIN;
+    double def = strtod(o->def, NULL);
+    if (o->type == INI_INT) return atomic_load_explicit((_Atomic const int*)o->var, memory_order_relaxed) == (int)def;
+    return atomic_load_explicit((_Atomic const float*)o->var, memory_order_relaxed) == (float)def;
+}
+
+size_t ini_perf_keys(const IniOpt* table, const char* skip, char* out, size_t n) {
+    size_t at = 0;
+    if (n) out[0] = 0;
+    for (; table->key; ++table) {
+        size_t len = strlen(table->key);
+        if (!(table->flags & INI_PERF) || ini_at_default(table) || (skip && !strcmp(table->key, skip))) continue;
+        if (at && at < n) snprintf(out + at, n - at, ",");
+        at += at ? 1 : 0;
+        if (at < n) snprintf(out + at, n - at, "%s", table->key);
+        at += len;
+    }
+    return at;
+}
+
 int ini_changed(const IniOpt* table, int flags, char* out, size_t n) {
     size_t at = 0;
     int count = 0;
@@ -161,23 +184,11 @@ int ini_changed(const IniOpt* table, int flags, char* out, size_t n) {
     for (; table->key; ++table) {
         char value[64];
         const char* shown = value;
-        int same;
-        if (!table->def) continue;
-        if (table->type == INI_TEXT) {
+        if (!table->def || ini_at_default(table)) continue;
+        if (table->type == INI_TEXT)
             shown = (const char*)table->var;
-            same = !strcmp(shown, table->def);
-        } else {
-            double def = strtod(table->def, NULL);
-            if (table->type == INI_INT)
-                same = atomic_load_explicit((_Atomic const int*)table->var, memory_order_relaxed) == (int)def;
-            else {
-                float f;
-                f = atomic_load_explicit((_Atomic const float*)table->var, memory_order_relaxed);
-                same = f == (float)def;
-            }
+        else
             ini_format(table, value, sizeof value);
-        }
-        if (same) continue;
         if (at < n) {
             if (table->type == INI_TEXT && (flags & INI_CHANGED_NO_TEXT))
                 at += (size_t)snprintf(out + at, n - at, "%s%s", count ? ", " : "", table->key);
@@ -214,8 +225,34 @@ void ini_word(const IniOpt* o, int v, char* out, size_t n) {
     }
     snprintf(out, n, "%d", v); /* no word for it */
 }
+double ini_float_step(double v, double lo, double hi, int dir) {
+    double unit = hi - lo > 2 ? 0.25 : 0.05, at = v / unit, grid = (double)(long long)(at + (at < 0 ? -0.5 : 0.5));
+    double to;
+    if (at - grid < 1e-9 && grid - at < 1e-9) /* on the grid: the next point of it */
+        to = (grid + (dir < 0 ? -1 : 1)) * unit;
+    else /* between two points: the one that way */
+        to = (dir < 0 ? (double)(long long)(at - (at < 0 ? 1 : 0)) : (double)(long long)(at + (at < 0 ? 0 : 1))) * unit;
+    return to < lo ? lo : to > hi ? hi : to;
+}
+/* the i-th of o's steps (settings.txt's steps), into *v: 1, 0 past the last */
+static int step_at(const IniOpt* o, int i, int* v) {
+    const char* c = o->steps;
+    while (c && i-- > 0 && (c = strchr(c, '|')) != NULL) ++c;
+    if (!c || !*c) return 0;
+    *v = atoi(c);
+    return 1;
+}
 int ini_step(const IniOpt* o, int v, int dir) {
     int step = step_of(o), count;
+    if (o->steps) { /* the next listed value either way, stopping at the ends; from one between two, its neighbour */
+        int i, at, prev = (int)o->lo;
+        for (i = 0; step_at(o, i, &at); ++i) {
+            if (dir > 0 && at > v) return at;
+            if (dir < 0 && at >= v) return i ? prev : at;
+            prev = at;
+        }
+        return dir < 0 ? prev : (i ? prev : v);
+    }
     if (!o->words || strchr(o->words, '#') || (o->flags & INI_SLIDER)) {
         double n = (double)v + (double)dir * step;
         return n < o->lo ? (int)o->lo : n > o->hi ? (int)o->hi : (int)n;
@@ -248,11 +285,25 @@ static void list_help(Listing* l, const char* help) {
 static void list_values(Listing* l, const IniOpt* o) {
     int step = o->step > 0 ? o->step : 1, v, first = 1;
     char word[64];
+    if (o->flags & INI_BOXES) { /* its items, as they are */
+        put(l, "%s", o->words ? o->words : "");
+        return;
+    }
     if (o->type == INI_TEXT && o->words) { /* value=word already */
         put(l, "%s", o->words);
         return;
     }
     if (o->type != INI_INT) return;
+    if (o->steps) { /* the values listed, each with its word */
+        for (int i = 0; step_at(o, i, &v); ++i) {
+            if (o->words)
+                ini_word(o, v, word, sizeof word);
+            else
+                snprintf(word, sizeof word, "%d", v);
+            put(l, "%s%d=%s", i ? "|" : "", v, word);
+        }
+        return;
+    }
     /* typed: a number of no words, or more than the menus step through */
     if (!o->words && (o->lo < 0 || (o->hi - o->lo) / step + 1 > 16)) return;
     if (o->words && strchr(o->words, '#') && (o->hi - o->lo) / step + 1 > 128) return;
@@ -275,13 +326,17 @@ const char* ini_only_words(int flags) {
         case INI_ONLY_ANDROID: return SNX_TR_NOOP("Android only");
         case INI_ONLY_LINUX: return SNX_TR_NOOP("Linux and Android only");
         case INI_ONLY_ARM64_LINUX: return SNX_TR_NOOP("arm64 Linux and Android only");
+        case INI_ONLY_NONE: return SNX_TR_NOOP("Not offered");
+        case INI_ONLY_APPLE: return SNX_TR_NOOP("macOS and iOS only");
         default: return NULL;
     }
 }
 /* whether this system is one of those only names */
 static int only_here(int only) {
 #if defined(__APPLE__) && !defined(SNX_IOS)
-    return only == INI_ONLY_MACOS;
+    return only == INI_ONLY_MACOS || only == INI_ONLY_APPLE;
+#elif defined(__APPLE__)
+    return only == INI_ONLY_APPLE;
 #elif defined(_WIN32)
     return only == INI_ONLY_WINDOWS;
 #elif defined(__linux__)
@@ -309,6 +364,19 @@ static const char* repeated_help(const IniOpt* table, const IniOpt* o) {
     }
     return "";
 }
+/* a row's marks (ini.h's INI_SLIDER, INI_OPEN, INI_BOXES, INI_PATH), a space between two, into out; empty for none */
+static void list_marks(const IniOpt* o, char* out, size_t size) {
+    const char* path = (o->flags & INI_PATH) == INI_PATH_FOLDER ? "folder"
+                       : (o->flags & INI_PATH) == INI_PATH_FILE ? "file"
+                       : (o->flags & INI_PATH) == INI_PATH_SAVE ? "save"
+                                                                : NULL;
+    const char* marks[] = {o->flags & INI_SLIDER ? "slider" : NULL, (o->flags & INI_OPEN) || o->steps ? "open" : NULL,
+                           o->flags & INI_BOXES ? "boxes" : NULL, path};
+    size_t n = 0;
+    out[0] = 0;
+    for (size_t i = 0; i < sizeof marks / sizeof *marks; ++i)
+        if (marks[i] && n < size) n += (size_t)snprintf(out + n, size - n, "%s%s", n ? " " : "", marks[i]);
+}
 size_t ini_list_text(const IniSection* sections, int count, char* out, size_t size) {
     static const char* const types[] = {"int", "float", "text"};
     Listing l;
@@ -319,7 +387,7 @@ size_t ini_list_text(const IniSection* sections, int count, char* out, size_t si
     l.at = 0;
     if (size) out[0] = 0;
     for (s = 0; s < count; s++)
-        for (t = 0; t < 3 && sections[s].table[t]; t++) {
+        for (t = 0; t < INI_SECTION_TABLES && sections[s].table[t]; t++) {
             const IniOpt* o;
             for (o = sections[s].table[t]; o->key; o++) {
                 if (o->help)
@@ -337,9 +405,11 @@ size_t ini_list_text(const IniSection* sections, int count, char* out, size_t si
                 put(&l, "\t%s\t", o->name ? o->name : "");
                 list_values(&l, o);
                 put(&l, "\t%s", ini_only(o) ? ini_only(o) : "");
-                if (o->flags & (INI_NEEDS_BUILD | INI_SLIDER))
+                char marks[64];
+                list_marks(o, marks, sizeof marks);
+                if ((o->flags & INI_NEEDS_BUILD) || marks[0])
                     put(&l, "\t%s", o->flags & INI_NEEDS_BUILD ? "needs-build" : "");
-                if (o->flags & INI_SLIDER) put(&l, "\tslider");
+                if (marks[0]) put(&l, "\t%s", marks);
                 put(&l, "\n");
             }
         }
@@ -357,6 +427,7 @@ static const struct {
                       {"game_dynamic_resolution", "went with the OpenGL renderer"},
                       {"low_priority_shader_compiler", "went with the OpenGL renderer"},
                       {"forced_vsync", "now vsync"},
+                      {"tracy_perf_map", "now perf_map"},
                       {"smooth_recording", "the F7 recorder went with the OpenGL renderer"},
                       {"recording_fps", "the F7 recorder went with the OpenGL renderer"},
                       {"lsfg", "LSFG went with the OpenGL renderer"},
@@ -379,9 +450,16 @@ static const struct {
                       {"user", "now user_uid, the uid of the user it named"},
                       {"memory_fit", "now memory_fit_mode, whose 0 is Auto (memory_fit's 1) and 1 Off"},
                       {"astc_bc", "now astc_mode, whose 0 is Auto (astc_bc's 1), 1 Exact (RGBA8) and 2 BC7"},
+                      {"write_tracking_hot",
+                       "now write_tracking_hot_pages, whose 2 is Auto (write_tracking_hot's 0, its "
+                       "default) and 1 On"},
+                      {"emulated_cores", "now emulated_cores_mode, of the same 0 (Off) and 1 (On) and 2, Auto, which "
+                                         "the 1 a .ini wrote, its default, is"},
                       {"controls_opacity", "the on-screen controls are opaque"},
                       {"controls_alpha", "the on-screen controls are opaque"},
                       {"controls_skin", "the on-screen controls are white shapes, with no skin"},
+                      {"unit_cache_gb", "the code units are held in memory now, up to unit_cache_ceil_mb: "
+                                        "units/ of the cache folder is not read, and deleting it frees its room"},
                       {"vk_descriptors", "now vk_descriptors_mode, of the same values: the default a .ini wrote, 0 and "
                                          "later 3, is its Automatic"},
                       {"nvn_direct", "the runtime always runs the game's NVN calls"},
@@ -402,6 +480,11 @@ static const struct {
                                      "vk_ext_mesh_shader=off skips them"},
                       {"hmma_astat", "went with hmma_mode, which takes its default, 0 (Auto)"},
                       {"gl_layer", "the GL layer always takes a 64-bit game's own GL driver; a 32-bit game keeps it"},
+                      {"compress_shader_cache", "the shader cache is always packed, when the game closes"},
+                      {"bc7_cache_gb", "the BC7 cache has no file to bound: it holds the levels used most in "
+                                       "memory, up to an eighth of the machine's"},
+                      {"dlss_render_size", "now internal_resolution, of the same values"},
+                      {"dlss_upscaler", "now render_upscaler, whose 3 (None) is dlss_upscaler's 0 (a filtered copy)"},
                       {NULL, NULL}};
 const char* ini_deprecated(const char* k) {
     int i;
@@ -411,7 +494,11 @@ const char* ini_deprecated(const char* k) {
 }
 static const struct {
     const char *key, *now;
-} INI_RENAMED[] = {{"vk_descriptors", "vk_descriptors_mode"}, {NULL, NULL}};
+} INI_RENAMED[] = {{"vk_descriptors", "vk_descriptors_mode"},
+                   {"emulated_cores", "emulated_cores_mode"},
+                   {"tracy_perf_map", "perf_map"},
+                   {"dlss_render_size", "internal_resolution"},
+                   {NULL, NULL}};
 const char* ini_renamed(const char* k) {
     int i;
     for (i = 0; INI_RENAMED[i].key; i++)

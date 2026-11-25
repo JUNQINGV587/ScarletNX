@@ -117,9 +117,9 @@ the game's image read from that image.
 - The code generator, LLVM (`src/common/cpu/recompiler/llvm/`, a required dependency), builds LLVM IR with the
   LLVM-C API: `ir_int.c`, `ir_ldst.c` and `ir_vec*.c`, ported from QEMU's `translate-a64.c`, and
   `ir_sail.c`, the integer data-processing ops, the hints, the barriers, the branch operands, the general-purpose
-  registers' loads and stores, the scalar floating point and the SIMD integer ops of one element per lane
-  `tools/sailgen` generates from the Arm architecture's Sail (`src/common/cpu/aarch64/sail/`), emit each op of the
-  generated decoder, `ir_codegen.c` the functions of `codegen.c`,
+  registers' loads and stores, the scalar floating point and the SIMD integer ops of one element per lane, the
+  pairwise ones and those across lanes `tools/sailgen` generates from the Arm architecture's Sail
+  (`src/common/cpu/aarch64/sail/`), emit each op of the generated decoder, `ir_codegen.c` the functions of `codegen.c`,
   and `src/nx/loader/module_llvm.c` the chunks and `SnxModule` of `module.c`. It links the objects itself (`link_elf.c`,
   `link_coff.c`, `link_macho.c`) with `rtlib.c`, the helpers compiled when the recompiler is built, into a module
   with no imports, for the host it runs on: x86-64 (ELF or COFF), AArch64 (ELF, COFF on Windows, or on macOS and iOS a Mach-O dylib
@@ -256,11 +256,8 @@ The module's `snx_routes()` table (`SnxRoutes`, with its own `SNX_ROUTES_VERSION
 ([Hooks](../platforms/nx/hooks.md#how-a-call-reaches-a-hook)). A module without it sends the calls to every function it exports through
 their slots, which every hook also works with.
 
-A bump costs little. The recompile it starts takes each code unit's object from the unit cache
-(`src/nx/loader/unit_cache.c`), which keys it on the unit's IR, not on `SNX_ABI`: a bump that leaves the IR alone
-reuses every unit, and one that changes it (a field moved) compiles them again, as it must. For a game of 255 units
-that recompile takes 24 to 28 s, against 740 s with an empty cache. `SNX_IR_OBJECT_VERSION` (`ir.h`) rises when
-`snx_ir_module_object` makes another object from the same IR.
+A bump costs a recompile, which the x86-64 back end makes in seconds where it is built. `SNX_IR_OBJECT_VERSION`
+(`ir.h`) rises when `snx_ir_module_object` makes another object from the same IR.
 
 `ctest -R module_contract` (`tests/module_contract.c`) holds the contract's layout as it was at the last bump: each
 field's offset and size, the structs' sizes and the numbers above. A change to any of them fails it, naming the field,
@@ -401,10 +398,11 @@ with `PAGEMAP_SCAN` on Linux 6.7 and later, and the reservation's write watch on
 (macOS, FreeBSD, Android, older Linux; `write_tracking=1` on any Linux) protects the pages a scan reported and takes the
 first write to each in the fault handler, which opens the page again. A system call can't fault into the handler, so
 the runtime opens what the kernel will write before the call (`plat_ww_open`, next to `own_acquire`). With
-`write_tracking_hot=1` a page the scans find written twice in a row stays writable and reads as written at each scan,
-for 32 scans, without its fault. A cache takes a page reported so as one more check of its bytes, but a render
-target's write-back keeps memory's bytes on the pages written since its baseline: each baseline protects the
-target's hot pages again first, at every address of them (`vk_ww_cool`, after the writes so far were taken in).
+`write_tracking_hot_pages` at `1`, or `2` (Auto, the default) a page the scans find written twice in a row stays
+writable and reads as written at each scan, for 32 scans, without its fault. A cache takes a page reported so as one
+more check of its bytes, but a render target's write-back keeps memory's bytes on the pages written since its
+baseline: each baseline protects the target's hot pages again first, at every address of them (`vk_ww_cool`, after the
+writes so far were taken in).
 
 `Renderer.save`: optional pipeline-cache persistence every 300 frontend ticks (~5s) + exit, concurrent with execution.
 Exit skips renderer teardown and guest-thread joins.

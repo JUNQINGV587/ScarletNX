@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright 2026 the ScarletNX contributors
 # what the backends share: function discovery over NX images, chunk labels, progress lines, the entry table
-add_library(snx_nx_module STATIC ../../loader/module.c ../../loader/codegen_view.c ../../loader/hook_routes.c
+add_library(snx_nx_module STATIC ../../loader/module.c ../../loader/codegen_view.c ../../loader/hook_routes.c ../../loader/hook_libs.c
                                   ../nce/nce_patch.c)
 set_target_properties(snx_nx_module PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
 target_compile_options(snx_nx_module PRIVATE -pedantic-errors -Wall -Wextra -Werror=missing-prototypes)
@@ -23,29 +23,20 @@ target_link_libraries(snx_driver PUBLIC scarletnx-common snx_setup snx_nx_module
 if(WIN32)
     target_link_libraries(snx_driver PUBLIC advapi32)
 endif()
-if(APPLE)
-    # setup.c's weak snx_menu_language, the menu's (src/gui): ld64 refuses an undefined symbol, weak or not, unless
-    # told it is resolved at run time
-    target_link_options(snx_driver INTERFACE "LINKER:-U,_snx_menu_language")
-endif()
 if(NOT SNX_TOOLS_ONLY)
     target_compile_definitions(snx_driver PRIVATE SNX_WITH_RUNTIME)
 endif()
 include("${PROJECT_SOURCE_DIR}/cmake/llvm.cmake")
 add_subdirectory("${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler/llvm" llvm-backend)
 # the NX game module through the LLVM backend; GNU C23 for the LLVM-C headers, the driver itself stays ISO C23
-add_library(snx_driver_llvm STATIC ../../loader/module_llvm.c ../../loader/module_variants.c ../../loader/module_arm.c
-                                   ../../loader/unit_cache.c llvm_tuning.c disasm.c "${SNX_SETTINGS_LLVM}")
+add_library(snx_driver_llvm STATIC ../../loader/module_llvm.c ../../loader/module_x64.c ../../loader/module_variants.c ../../loader/module_arm.c
+                                   llvm_tuning.c disasm.c "${SNX_SETTINGS_LLVM}")
 set_target_properties(snx_driver_llvm PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS ON)
 target_compile_options(snx_driver_llvm PRIVATE -Wall -Wextra -Werror=missing-prototypes)
-# OpenSSL: the unit cache's SHA-256 (unit_cache.c)
-target_link_libraries(snx_driver_llvm PUBLIC snx_llvm snx_arm_llvm snx_nx_module snx_settings OpenSSL::Crypto)
-# LLVM's revision in the unit cache's key, where its headers name one
-include("${PROJECT_SOURCE_DIR}/cmake/llvm_revision.cmake")
-snx_llvm_revision(snx_llvm_revision "${SNX_LLVM_INCLUDE_DIR}")
-if(snx_llvm_revision)
-    target_compile_definitions(snx_driver_llvm PRIVATE "SNX_LLVM_REVISION=\"${snx_llvm_revision}\"")
-endif()
+target_link_libraries(snx_driver_llvm PUBLIC snx_llvm snx_arm_llvm snx_nx_module snx_settings)
+# the A64 Sail's encoders: the arm64 host's descriptor functions (module_x64.c)
+include("${PROJECT_SOURCE_DIR}/cmake/sailgen.cmake")
+snx_sailgen_a64_encoders(snx_driver_llvm)
 # scarletnx --mcp's disassembler (disasm.c), where LLVM has its AArch64 target (cmake/llvm.cmake)
 if(SNX_LLVM_A64_DISASM)
     target_compile_definitions(snx_driver_llvm PRIVATE SNX_A64_DISASM)

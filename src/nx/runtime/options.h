@@ -18,6 +18,10 @@
    run has --launcher-picks=1. Before ini_open; v is kept, not copied */
 void ini_override(const char* k, const char* v);
 const char* ini_overridden(const char* k); /* k's value for this run, NULL when nothing gave one */
+/* 1 when the player gave k a value: the command line, the launcher's pick for every game, the game's pick, or a value in
+   the .ini other than the default (the file holds every key, at its default where nobody set it). 0: k has its
+   default, which the runtime can then choose for the platform. After ini_open */
+int ini_given(const char* k);
 /* deprecated_env.c: the environment variables an older version read for settings the .ini has now
    (docs/user/deprecations.md). ini_open makes each one set this run's value for its setting as ini_override does, unless
    the command line or a variable before it gives that key; then says each, with the value in effect */
@@ -58,6 +62,9 @@ void ini_list(const IniSection* sections, int count);
 /* 1 for a key of the file or an unattended-run option (platform/unattended.h): the driver passes only those on to a
    game (driver.h) */
 int snx_setting_known(const char* key);
+/* key's value as the .ini would write it, into out (size bytes with its NUL): 1, or 0 for a key no setting has, or a
+   value that doesn't fit */
+int snx_setting_text(const char* key, char* out, size_t size);
 /* reads path and the game's picks beside it, applies them with the overrides, writes the .ini back with its help, and
    watches both: ini_poll reloads either when it changes and saves what the game's menu set */
 void ini_open(const char* path);
@@ -68,6 +75,23 @@ int options_debug(int flags, char* out, size_t n);
 /* the Display, Graphics, Audio and Performance settings not at their default, each "key=value (default D)" between
    ", ": how many. The log's header says them, and a reload that changes them says them again */
 int options_settings(char* out, size_t n);
+/* key's default (Auto) gives this kind of program (kind: its words, "an Ounce program") value, one of the two others of
+   its three words: where key is at its default, said in the log with how to run it with the third and named over the
+   game's first frame as this kind of game's (options_perf_notice). The setting keeps its default, and the caller runs
+   with value (the kernel's kernel_emulated_cores). Another value in effect stays, and the log says whose it is beside
+   the one the default gives this kind. Only a setting read when the game starts (settings.txt's startup), which no
+   reload changes. After ini_open: 1 when the default gives value, 0 when another value is in effect, -1 for another key
+   or a value that is not one of the two (said, with the value in effect) */
+int options_kind_value(const char* key, const char* value, const char* kind);
+/* The settings off their default that change how fast the game runs where nothing on the screen shows it (settings.txt's
+   perf, ini.h's INI_PERF), as ini_open took them, handed to the notice over the game's first frame
+   (overlay_settings_notice), keys alone between ", ": the game's own (its picks, its .ini) apart from the launcher's for
+   every game and this run's command line's. A value no file nor command line gave, one the runtime gives this kind of
+   program (options_kind_value), is neither: the notice's third list, "key Word" each. And with the launcher's, how
+   the game at base (<folder>/<name>) was made, its .abi's made line: opt where its code was made ahead of time at
+   another level than opt's default, and the recompile's other perf settings off their default it lists
+   (snx_game_made_off). How many keys in all */
+int options_perf_notice(const char* base);
 /* memory_fit's value old as memory_fit_mode's (0 Auto, 1 Off): 1 is 0; 0 is 1 where memory_fit's default was 1 (ios),
    else -1, memory_fit_mode's default, as 0 was then memory_fit's own, which every game's .ini had written; -2 for
    any other value */
@@ -80,6 +104,22 @@ int options_astc_bc_old(const char* old);
    which are -1, vk_descriptors_mode's default, as 0 was vk_descriptors's own until 3 was, and every game's .ini had
    written its default; -2 for a value that is not a whole number from 0 to 3 */
 int options_vk_descriptors_old(const char* old, int given);
+/* write_tracking_hot's value old as write_tracking_hot_pages's (0 Off, 1 On, 2 Auto): 1 is 1; 0 is -1 from the .ini
+   (given 0), write_tracking_hot_pages's default, as 0 was write_tracking_hot's own, which every .ini had written, and 0
+   from the command line (given 1), a choice of that run; -2 for any other value */
+int options_write_tracking_hot_old(const char* old, int given);
+/* emulated_cores's value old as emulated_cores_mode's (0 Off, 1 On, 2 Auto): 0 is 0; 1 is -1 from the .ini (given 0),
+   emulated_cores_mode's default, as 1 was emulated_cores's own, which every .ini had written, and 1 from the command
+   line or the launcher (given 1), a choice; -2 for any other value */
+int options_emulated_cores_old(const char* old, int given);
+/* dlss_render_size's value as internal_resolution's, whose values are the same (0 the game's to 5 ultra performance).
+   The command line's (given 1) is as it is. The .ini's (given 0) is as it is but 0, which is -1, internal_resolution's
+   default too, as 0 was dlss_render_size's own, which every game's .ini had written. A value that is not a whole
+   number from 0 to 5 is -2 */
+int options_dlss_render_size_old(const char* old, int given);
+/* dlss_upscaler's value as render_upscaler's. 0 (a filtered copy of each DLSS evaluation) is 3 (None). 1 (the
+   upscaler, its default, which every game's .ini had written) is -1, render_upscaler as it is. Any other is -2 */
+int options_dlss_upscaler_old(const char* old, int given);
 /* the path ini_open read, "" before it */
 const char* ini_file(void);
 /* about once a second, from the main loop. final: at exit, where an edit still being saved is left for the next start

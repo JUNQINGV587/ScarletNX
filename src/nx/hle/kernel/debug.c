@@ -353,7 +353,9 @@ static const char* word_at(u64 a, char* s, size_t n) {
 static const char* thread_state(const KThread* t, char* s, size_t n) {
     char v1[24], v2[24];
     if (t->state == 0) return "not started";
-    switch (t->woken ? 0 : t->wait_kind) {
+    switch (t->woken                                                 ? 0
+            : atomic_load_explicit(&t->arb_in, memory_order_relaxed) ? 4 /* an address wait (sync.c) */
+                                                                     : t->wait_kind) {
         case 1:
             if (t->wait_tid)
                 snprintf(s, n, "waiting on %s (thread %lu)", t->wait_name[0] ? t->wait_name : "objects",
@@ -491,7 +493,7 @@ u64 kernel_thread_name(u32 ix, char* out, int n) {
 /* each emulated core: its holder, with the holder's poll flag and how long it held the core, and its waiters. Read
    without core_lk, as the threads are */
 static void dump_cores(void) {
-    if (!g_settings.emulated_cores) return;
+    if (!kernel_emulated_cores()) return;
     u64 now = plat_ns();
     for (int k = 0; k < NCORES; k++) {
         u32 h = atomic_load_explicit(&g_hle.thread.core_owner[k], memory_order_relaxed);

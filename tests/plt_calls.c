@@ -9,7 +9,8 @@
    entered as a function, through a pointer, reads its slot and goes where it says. Two's stub, a stub of a function
    a hook names and every stub of a recompile with --hook-direct-calls must call through the table. The call is made
    where the BL or B is (the IR of the calling function calls the three functions itself), and goes to the stub's own
-   function once the guest has changed the stub's code.
+   function once the guest has changed the stub's code. The function whose IR is printed is LLVM's; built again
+   without the print, every function is the x86-64 back end's where it is built, and runs the same.
      plt_calls SCARLETNX DATA */
 #include "common/utilities/common.h"
 #include "common/cpu/aarch64/cpu.h"
@@ -105,14 +106,16 @@ enum {
     OTHER = 0x80,
     OWN_ADD = 0x100,
     MAIN_TWO = 0x120,
+    LEAF = 0x140,
     STUB = 0x200, /* the first of four, 16 bytes each: of ext_add, own_add, two and ext_tail */
     EXT_ADD = 0x40,
     SDK_TWO = 0x60,
     EXT_TAIL = 0x80
 };
-/* The main module: game_main (CALLER) calls the stubs of ext_add, own_add and two and ends in a branch to
-   ext_tail's, which another function (OTHER, never run) calls too and a symbol names (tail_stub), so that the branch
-   leaves game_main; own_add copies x16 to x22 and adds 0x20 to x0, and its two adds 0x200. ext: the name ext_add
+/* The main module: game_main (CALLER) calls the stubs of ext_add, own_add and two, and leaf (a loop of X9 and X10),
+   reads x16 in a loop (so a back end keeps it in a host register) and ends in a branch to ext_tail's, a CBNZ where x23
+   is not zero or a B, which another function (OTHER, never run) calls too and a symbol names (tail_stub), so that the
+   branch leaves game_main; own_add copies x16 to x22 and adds 0x20 to x0, and its two adds 0x200. ext: the name ext_add
    goes by */
 static void main_image(unsigned char* image, const char* ext) {
     const Symbol symbols[6] = {{"game_main", CALLER}, {"own_add", OWN_ADD},    {"two", MAIN_TWO}, {ext, 0},
@@ -126,10 +129,22 @@ static void main_image(unsigned char* image, const char* ext) {
     put32(image, CALLER + 4, 0x94000000 | rel(CALLER + 4, STUB));               /* bl ext_add's stub */
     put32(image, CALLER + 8, 0x94000000 | rel(CALLER + 8, STUB + 16));          /* bl own_add's */
     put32(image, CALLER + 12, 0x94000000 | rel(CALLER + 12, STUB + 32));        /* bl two's */
-    put32(image, CALLER + 16, 0xAA1303FE);                                      /* mov x30, x19 */
-    put32(image, CALLER + 20, 0x14000000 | rel(CALLER + 20, STUB + 48));        /* b ext_tail's */
+    put32(image, CALLER + 16, 0x94000000 | rel(CALLER + 16, LEAF));             /* bl leaf */
+    put32(image, CALLER + 20, 0xAA1303FE);                                      /* mov x30, x19 */
+    put32(image, CALLER + 24, 0xD280004A);                                      /* mov x10, #2 */
+    put32(image, CALLER + 28, 0x8B100209);                                      /* add x9, x16, x16 */
+    put32(image, CALLER + 32, 0xD100054A);                                      /* sub x10, x10, #1 */
+    put32(image, CALLER + 36, 0xB5FFFFCA);                                      /* cbnz x10, -8 */
+    put32(image, CALLER + 40, 0xB5000017 | rel(CALLER + 40, STUB + 48) << 5);   /* cbnz x23, ext_tail's */
+    put32(image, CALLER + 44, 0x14000000 | rel(CALLER + 44, STUB + 48));        /* b ext_tail's */
     put32(image, OTHER, 0x94000000 | rel(OTHER, STUB + 48));                    /* bl ext_tail's */
     put32(image, OTHER + 4, 0xD65F03C0);                                        /* ret */
+    put32(image, LEAF, 0xD2800009);                                             /* mov x9, #0 */
+    put32(image, LEAF + 4, 0xD280006A);                                         /* mov x10, #3 */
+    put32(image, LEAF + 8, 0x8B0A0129);                                         /* add x9, x9, x10 */
+    put32(image, LEAF + 12, 0xF100054A);                                        /* subs x10, x10, #1 */
+    put32(image, LEAF + 16, 0x54FFFFC1);                                        /* b.ne -8 */
+    put32(image, LEAF + 20, 0xD65F03C0);                                        /* ret */
     put32(image, OWN_ADD, 0xAA1003F6);                                          /* mov x22, x16 */
     put32(image, OWN_ADD + 4, 0x91008000), put32(image, OWN_ADD + 8, 0xD65F03C0); /* add x0, x0, #0x20; ret */
     put32(image, MAIN_TWO, 0x91080000), put32(image, MAIN_TWO + 4, 0xD65F03C0); /* add x0, x0, #0x200; ret */
@@ -264,6 +279,7 @@ static void module_runs(const char* path, const unsigned char* main_bytes, const
             c.disp[(b + EXT_TAIL - m->code_lo) / 4] = override_add;
         }
         c.x[30] = 0x1000;
+        c.x[23] = step == 1; /* the tail call a CBNZ's */
         missed = 0;
         entry(&c, a + CALLER);
         if (!step)
@@ -370,6 +386,29 @@ static void module_runs(const char* path, const unsigned char* main_bytes, const
             check(c.pc == a + STUB && !c.x[0] && c.x[30] == a + CALLER + 8 && !missed,
                   "a call of a stub whose code changed leaves for the stub's address");
         }
+        /* leaf, its own code changed, keeps X9 and X10 in host registers it loads nothing into: entered, it leaves for
+           its address, the state as it was */
+        {
+            GuestFn leaf = NULL;
+            u32 fn = m->nfns;
+            for (i = 0; i < m->nentries; ++i)
+                if (m->entry_addr[i] == a + LEAF) leaf = m->entry_fn[i];
+            for (i = 0; i < m->nfns; ++i)
+                if (m->fn_lo[i] == a + LEAF) fn = i;
+            check(leaf && fn < m->nfns, "leaf is a function of the module");
+            c.x[30] = 0x1000;
+            if (leaf) leaf(&c, a + LEAF);
+            check(c.pc == 0x1000 && c.x[9] == 6 && !c.x[10], "leaf runs");
+            c.x[9] = 0x1122334455667788ull;
+            c.x[10] = 0x99aabbccddeeff00ull;
+            if (leaf && fn < m->nfns) {
+                m->stale[fn] = 1;
+                leaf(&c, a + LEAF);
+                m->stale[fn] = 0;
+                check(c.pc == a + LEAF && c.x[9] == 0x1122334455667788ull && c.x[10] == 0x99aabbccddeeff00ull,
+                      "a function entered after its code changed leaves the state as it was");
+            }
+        }
         free(c.disp);
     }
     free(memory);
@@ -402,9 +441,10 @@ int main(int argc, char** argv) {
         hooked = candidate;
     }
     check(hooked && strlen(hooked) < 100 && snx_hook_routed(hooked), "the route list names a symbol");
-    /* 0: as it is. 1: ext_add by a name a hook names. 2: with every call through its dispatch slot */
-    for (pass = 0; pass < 3; ++pass) {
-        const char* ext = pass == 1 && hooked ? hooked : "ext_add";
+    /* 0: as it is, printing the calling function's IR. 1: as it is. 2: ext_add by a name a hook names. 3: with every
+       call through its dispatch slot */
+    for (pass = 0; pass < 4; ++pass) {
+        const char* ext = pass == 2 && hooked ? hooked : "ext_add";
         main_image(main_bytes, ext);
         sdk_image(sdk_bytes, ext);
         path = snx_path_join(exefs, "main");
@@ -422,17 +462,17 @@ int main(int argc, char** argv) {
         args[k++] = "--outdir";
         args[k++] = out;
         args[k++] = "--nce=0"; /* code made ahead of time, which an NCE recompile has none of */
-        if (pass == 2) args[k++] = "--hook-direct-calls";
+        if (pass == 3) args[k++] = "--hook-direct-calls";
         if (!pass) args[k++] = dump; /* the IR of the function that calls through the stubs, in the output */
         args[k] = NULL;
         if (run_cli(args, root, &text)) {
             fprintf(stderr, "%s\n", text ? text : "");
             check(0, "the game recompiles");
         }
-        if (pass < 2 && (!text || !strstr(text, bound_line)))
+        if (pass < 3 && (!text || !strstr(text, bound_line)))
             fprintf(stderr, "wanted: %s in:\n%s\n", bound_line, text ? text : "");
-        check(text && (pass == 2 ? !strstr(text, "PLT: ") : strstr(text, bound_line) != NULL),
-              pass == 2 ? "nothing is bound when every call goes through its dispatch slot"
+        check(text && (pass == 3 ? !strstr(text, "PLT: ") : strstr(text, bound_line) != NULL),
+              pass == 3 ? "nothing is bound when every call goes through its dispatch slot"
                         : "the recompile says how many calls through the PLT it made direct");
         if (!pass) { /* the call is made where the BL or B is, not in the stub's function */
             const SnxU64 a = SNX_CODE_BASE, b = SNX_CODE_BASE + 0x4000;
@@ -444,9 +484,13 @@ int main(int argc, char** argv) {
             /* its last branch too, which keeps the call of the stub for a slot that holds another address */
             check(ir_calls(text, a + STUB + 48), "the branch to a stub is run in the stub's place");
         }
+        if (text && strstr(text, "x86-64 back end: ") && pass < 2)
+            check(pass ? !strstr(text, ", LLVM the rest") : strstr(text, ", LLVM the rest") != NULL,
+                  pass ? "the x86-64 back end makes every function, the calling one too"
+                       : "the function whose IR is printed is LLVM's");
         free(text);
         text = NULL;
-        module_runs(module, main_bytes, sdk_bytes, pass == 2 ? TABLE : pass ? ROUTED : BOUND);
+        module_runs(module, main_bytes, sdk_bytes, pass == 3 ? TABLE : pass == 2 ? ROUTED : BOUND);
     }
     check(!snx_remove_tree(root), "fixture cleanup");
     free(module);

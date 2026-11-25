@@ -187,21 +187,48 @@ typedef struct {
     u64 addr;
 } Surf2D;
 
-/* A temporal upscale: the frame's color at the render size with its depth and motion vectors, onto the output at out
-   from out_base. jitter: the camera's offset in render pixels (the picture moved by +jitter). motion_scale brings a
-   motion vector to pixels of the motion vectors' size: render pixels, or output pixels for vectors at the output's
-   size (DLSS without flag 2). flags: the DLSS network's builder flags, taken as NGX's feature bits (1 HDR, 2 motion
-   vectors at the render size, 4 motion vectors that include the jitter, 8 inverted depth, 0x40 auto exposure).
-   render_max: the largest render size a dynamic resolution may give (the network's), 0 when not known */
+/* An upscale (renderer.h's upscale, docs/layers/gpu/upscalers.md): the frame's color at the render size, with its depth
+   and motion vectors where has_depth and has_motion say so, onto the output at out from out_base. jitter: the camera's
+   offset in render pixels (the picture moved by +jitter). motion_scale brings a motion vector to pixels of the motion
+   vectors' size: render pixels, or output pixels for vectors at the output's size (DLSS without flag 2). flags: below,
+   the low ones a DLSS network's builder flags taken as NGX's feature bits. render_max: the largest render size a dynamic
+   resolution may give (the network's), 0 when not known. near_plane, far_plane and fov_y (radians): the camera, 0 when
+   not known. The renderer picks the upscaler from the settings among those the caller accepts (flags) */
 typedef struct {
     Surf2D color, depth, motion, exposure, reactive, output;
-    int has_exposure, has_reactive;
+    int has_depth, has_motion, has_exposure, has_reactive;
     u32 render[2], out[2], render_max[2];
     i32 out_base[2];
     f32 jitter[2], motion_scale[2], pre_exposure;
+    f32 near_plane, far_plane, fov_y;
     int reset;
     u32 flags;
+    const char** ran; /* where the renderer writes the name of the upscaler that ran, NULL for nowhere */
+    /* with GPU_UPSCALE_REPROJECTED_MOTION: this frame's render pixel (x, y as -1 to 1, y down, depth as stored) to
+       the frame before's, row-major (hle/hook/snx_hook_module.h's SnxHookRecordedUpscale) */
+    f32 reprojection[16];
 } GpuUpscale;
+enum {
+    /* NGX's feature bits, as a DLSS network's builder flags give them */
+    GPU_UPSCALE_HDR = 1,
+    GPU_UPSCALE_RENDER_MOTION = 2,   /* motion vectors at the render size */
+    GPU_UPSCALE_JITTERED_MOTION = 4, /* motion vectors that include the jitter */
+    GPU_UPSCALE_INVERTED_DEPTH = 8,
+    GPU_UPSCALE_AUTO_EXPOSURE = 0x40,
+    /* the runtime's own: motion vectors made from depth and the reprojection matrix (a hook module's, without motion
+       vectors of its own) */
+    GPU_UPSCALE_REPROJECTED_MOTION = 0x100,
+    /* the runtime's own: the runtime jitters the scene's draws (those into the depth given) and the upscaler gets it */
+    GPU_UPSCALE_RUNTIME_JITTER = 0x200,
+    /* the runtime's own: GPU_UPSCALE_HDR says the color's range (else its format does: a float format is HDR) */
+    GPU_UPSCALE_RANGE_GIVEN = 1u << 16,
+    /* a hook module's upscale (docs/platforms/nx/hooks.md), not a DLSS evaluation, which runs no upscaler with the
+       render_upscaler setting at None */
+    GPU_UPSCALE_MODULE = 1u << 17,
+    /* the kinds of upscaler the caller takes besides a temporal one, which every caller takes */
+    GPU_UPSCALE_SPATIAL_OK = 1u << 18,
+    GPU_UPSCALE_COPY_OK = 1u << 19,
+};
 
 /* An Ounce's shading rate image, for the draws after its bind (NVN's BindShadingRateImage): its texture header (tic,
    a TIC entry's words as host numbers, which the renderer looks up as a draw's texture) and its GPU address (addr, 0
@@ -307,6 +334,11 @@ typedef struct {
     GpuDmaSide src, dst;
     const u8* snap;
     u64 snap_id;
+    /* the texture the front end copies into, when it names one (NVN's buffer-to-texture copy): its first byte, and the
+       level and layer of it that dst is. tex 0: none named, and a texture at dst.addr is taken as its level 0 of
+       layer 0 (vk_tex_dma_rows) */
+    u64 tex;
+    u32 tex_level, tex_layer;
 } GpuDmaOp;
 /* A 2D engine blit (maxwell/fermi2d.c) the renderer does on the GPU: each destination pixel of columns x0 to x1 - 1
    and rows y0 to y1 - 1 the source pixel at column scol[x - x0] and row srow[y - y0] (nearest sampled, the tables
@@ -380,11 +412,42 @@ u64 bl_offset(u32 x_bytes, u32 y, u32 z, u32 width_bytes, u32 height, u32 bh_log
    I2M_UPLOAD_REGS, so regs[base + UPLOAD_EXEC] is the launch), and its data words (ProcessData) */
 void i2m_launch(GpuChannel* ch, u32* regs, int base);
 void i2m_data(GpuChannel* ch, u32 v);
+/* For the statistics: the writes that the command stream makes into guest memory, by kind (an inline-to-memory
+   launch to a pitch linear or a block linear destination, NVN's uniform buffer update). Each counts its bytes, and the
+   landings of GPU-owned memory that came while it wrote (any thread's: a write over an owned or pending range lands
+   it first) with their bytes and nanoseconds */
+enum { GPU_INLINE_LINEAR, GPU_INLINE_BLOCK, GPU_INLINE_UB, GPU_INLINE_N };
+typedef struct {
+    _Atomic u64 n, bytes, forced, forced_bytes, forced_ns;
+} GpuInlineStat;
+extern GpuInlineStat g_gpu_inline[GPU_INLINE_N];
+typedef struct {
+    u64 lands, land_bytes, t0;
+} GpuInlineMark;
+GpuInlineMark gpu_inline_begin(void);
+/* For the statistics: NVN's render enable records by how they were decided (nvn_draw.c render_enable): a fixed mode,
+   a predicate the renderer knew, a predicate left to the GPU, the CPU's reads of the counts. Then the nanoseconds of
+   those reads */
+enum { GPU_RCOND_FIXED, GPU_RCOND_KNOWN, GPU_RCOND_GPU, GPU_RCOND_CPU, GPU_RCOND_N };
+extern _Atomic u64 g_gpu_rcond[GPU_RCOND_N], g_gpu_rcond_cpu_ns;
+void gpu_inline_end(int kind, u64 bytes, GpuInlineMark m);
 u32 gpu_color_bpp(u32 format); /* bytes per pixel of a color format (render targets and 2D surfaces share them) */
 void gpu_signal_point(void);   /* the GPU is about to do something the game can observe */
 /* a semaphore or report payload the game can poll: it happens once everything before it in the stream is done. data is
    the bytes as guest memory gets them, so its numbers are little-endian already */
 void gpu_release_write(u64 gva, const void* data, u32 len);
+/* a 16-byte timestamp report (NVN's timestamp counter): as gpu_release_write, with the time the host GPU reached it
+   in place of the ticks at offset 8 where the renderer can time it (renderer.h release_stamp). top: TIMESTAMP_TOP */
+void gpu_release_stamp(u64 gva, const void* data, int top);
+/* a timestamp report at guest address cpu gets the GPU's time before the game reads it. may_wait 0: it does what needs
+   no wait, and returns 1 when the report still waits for its submission. may_wait 1: it waits for that submission, so
+   the caller leaves the guest core first. Returns 0 when nothing is left to do */
+int gpu_release_stamp_sync(u64 cpu, int may_wait);
+/* a release of 16 bytes: the 8 at data, then the GPU's timestamp (gpu_ticks), read where the renderer's side performs
+   the release, in its place among the draws. With gpu_split the front end is ahead of them: read as it queued the
+   release, the two timestamps a game puts around a frame's draws were the front end's few milliseconds apart whatever
+   the draws took, and a game that sizes its picture by that time drew at its largest */
+void gpu_release_write_stamped(u64 gva, const void* data);
 
 /* the engines' methods (engines.c, compute.c, fermi2d.c, dma.c): m is the method, last marks a batch's last word */
 void maxwell3d_method(GpuChannel* ch, u32 m, u32 v, int last);
@@ -430,6 +493,9 @@ void gpu_mem_remapped(u64 gva, u64 size);
 void gpu_mem_written_cpu(u64 cpu, u64 size);
 /* fn(cpu, n) for each run of guest memory that a GPU-side write above changes (gpu/vk/uma.c's hazard count) */
 void gpu_set_write_watch(void (*fn)(u64 cpu, u64 n));
+/* fn(gva, n) for each run of GPU addresses a GPU-side write above stamps (its own range and the other GPU addresses of
+   its guest memory), once the write's generation is published: gpu_mem_dirty_since sees it before fn is called */
+void gpu_set_gva_watch(void (*fn)(u64 gva, u64 n));
 u64 gpu_mem_generation(void);   /* the last generation fully published */
 /* [gva, gva + size) watched from now: a GPU-side write on a page of its 2 MiB granules moves
    gpu_mem_granules_generation. 0 where it can't be (gpu_page_check=1, or past the GPU's addresses) */
@@ -480,6 +546,9 @@ void gpu_submit(const void* entries, u32 n, u32 channel, u32 incs, u32 wait_id, 
 /* calls fn(arg) on the GPU thread in order with the other calls, once the jobs queued before it on channels
    chans[0..nchans) (n at most 4) are done. Other channels' jobs, queued before or after it, don't hold it back */
 void gpu_call(void (*fn)(void*), void* arg, const u32* chans, u32 nchans);
+/* the same, for a call that reads none of the front end's state (a present): it runs on the renderer's side in its
+   place in the queue (gpu_queue.c), and the GPU thread goes on without a wait */
+void gpu_call_renderer(void (*fn)(void*), void* arg, const u32* chans, u32 nchans);
 /* Cooperative calls return 0 while waiting and 1 when complete. A lane's calls stay ordered; other lanes and
    ordinary calls can run while it waits. The callback owns its resume cursor. Lane is in [0,63]. */
 void gpu_call_poll(int (*fn)(void*), void* arg, u32 lane);
@@ -495,6 +564,7 @@ void gpu_verify_channel_free(GpuChannel* ch);
 void gpu_verify_word(GpuChannel* ch, u32 w);
 void gpu_channel_close(u32 channel);  /* nvdrv closed the channel: a new one with the same id starts from reset */
 void gpu_release_retire(u32 channel); /* complete pending syncpoint releases before nvdrv reuses its id */
+int gpu_release_wait(u32 id, u32 thresh, int block); /* the renderer's release_wait, 0 without one */
 /* the channel's stream waits for the u32 at GPU address addr (a syncpoint's id for the syncpoint kinds) to equal val,
    or reach it (geq), before its next method. Met already, nothing waits. Otherwise the method that asked returns and
    the stream stops after it (a macro after the method too, mme_resume), and the GPU thread goes on with other
@@ -519,6 +589,10 @@ void gpu_poll_stats(GpuPollStats* s);
 /* the GPU thread's wall time outside its wait for work so far, in ns: replay, setup and recording, the waits inside
    them (locks, fences) included */
 u64 gpu_thread_busy_ns(void);
+/* the guest time at which the work the GPU thread runs became ready: its queueing, or the end of a wait it was held
+   for, 0 before any. A console's GPU starts work then or when the work before it ends, whichever is later, and report
+   timestamps place the host GPU's work so (vk/stamp.c). Any thread */
+u64 gpu_ready_ns(void);
 /* the CPU signals what a GPU stream may wait for (an NVN event, a syncpoint increment through nvhost-ctrl): what it
    wrote before is for the work after the wait to see (renderer.h mem_may_have_changed). Before the signal, any thread */
 void gpu_cpu_signal(void);

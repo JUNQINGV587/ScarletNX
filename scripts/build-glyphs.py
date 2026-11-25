@@ -3,14 +3,14 @@
 # Copyright 2026 the ScarletNX contributors
 """The letters the menu draws past its VGA font's (CP437): GNU Unifont's glyphs.
 
---from UNIFONT.hex keeps of a Unifont .hex (unifont-<version>.hex or unifont_all-<version>.hex, gunzipped or not) its
-8x16 glyphs of U+00A0 to U+024F that CP437 has not, in src/gui/unifont-latin.hex; every glyph of TITLE_RANGES, the
-CJK and Hangul blocks game titles are written in, whatever the languages show, in src/gui/unifont-titles.hex; and its
-16x16 glyphs of the other characters the menu's languages show (the names and translations of po/*.po and
-tests/po/*.po), two columns wide, in src/gui/unifont-wide.hex. --check fails when those files are not what --from
-keeps: their code points, widths and order, and with --from their glyphs too, compared with that .hex. --out FILE
-writes the C source of the Latin and the wide glyphs, for src/gui/latin.h (each fitted to the VGA font, fit) and
-src/gui/wide.h; --titles-out FILE that of the titles' glyphs, for src/gui/titles.h.
+Every glyph comes from the Unifont .hex --from names (unifont-<version>.hex or unifont_all-<version>.hex, gunzipped or
+not; the build's, which cmake/dependencies.cmake downloads): its 8x16 glyphs of U+00A0 to U+024F that CP437 has not,
+the Latin letters; its 16x16 glyphs of the characters the menu's languages show past those and the titles' blocks (the
+names and translations of po/*.po and tests/po/*.po), two columns wide; and every glyph of TITLE_RANGES, the CJK and
+Hangul blocks game titles are written in, whatever the languages show. A glyph the .hex lacks, or has at another
+width, stops it, named. --out FILE writes the C source of the Latin and the wide glyphs, for src/gui/latin.h (each
+fitted to the VGA font, fit) and src/gui/wide.h; --titles-out FILE that of the titles' glyphs, for src/gui/titles.h;
+--check only reads the .hex for them all.
 """
 
 import argparse
@@ -21,9 +21,6 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-KEPT = 'src/gui/unifont-latin.hex'
-WIDE_KEPT = 'src/gui/unifont-wide.hex'
-TITLES_KEPT = 'src/gui/unifont-titles.hex'
 LANGUAGES = ('po', 'tests/po')  # the menu's, and the tests' own
 FONT = 'src/common/utilities/font.c'  # gui_codepage: what CP437 draws, which stays its own
 RANGES = [(0x00A0, 0x024F)]  # Latin-1 Supplement, Latin Extended-A and B
@@ -57,6 +54,13 @@ def wanted(root):
     return [cp for first, last in RANGES for cp in range(first, last + 1) if cp not in cp437 and cp not in LEFT_OUT]
 
 
+def read_unifont(path):
+    """a Unifont .hex's glyphs, gunzipped or not"""
+    opener = gzip.open if path.suffix == '.gz' else open
+    with opener(path, 'rt', encoding='ascii') as f:
+        return read_hex(f, path)
+
+
 def read_hex(lines, where):
     """a .hex's glyphs, {code point: bitmap as hex}"""
     glyphs = {}
@@ -71,15 +75,14 @@ def read_hex(lines, where):
     return glyphs
 
 
-def kept_lines(glyphs, points, where):
-    lines = []
+def latin_of(glyphs, points, where):
+    """the 8x16 glyphs of points, the Latin letters, {code point: bitmap as hex}"""
     for cp in points:
         if cp not in glyphs:
-            raise SystemExit(f'{where}: no glyph for U+{cp:04X}')
+            raise SystemExit(f'{where}: no glyph for U+{cp:04X}, a Latin letter')
         if len(glyphs[cp]) != 32:
             raise SystemExit(f'{where}: U+{cp:04X} is not 8x16 in it: add it to LEFT_OUT, or draw it otherwise')
-        lines.append(f'{cp:04X}:{glyphs[cp]}\n')
-    return ''.join(lines)
+    return {cp: glyphs[cp] for cp in points}
 
 
 def shown(root):
@@ -117,24 +120,22 @@ def wide_wanted(root):
     return sorted(cp for cp in shown(root) if cp not in cp437 and not any(cp in r for r in latin) and not in_titles(cp))
 
 
-def wide_lines(glyphs, points, where):
-    lines = []
+def wide_of(glyphs, points, where):
+    """the 16x16 glyphs of points, the wide letters, {code point: bitmap as hex}"""
     for cp in points:
         if cp not in glyphs:
             raise SystemExit(f'{where}: no glyph for U+{cp:04X}, which a language shows')
         if len(glyphs[cp]) != 64:
             raise SystemExit(f'{where}: U+{cp:04X} is 8x16 in it, not 16x16: its block goes in RANGES, as Latin does')
-        lines.append(f'{cp:04X}:{glyphs[cp]}\n')
-    return ''.join(lines)
+    return {cp: glyphs[cp] for cp in points}
 
 
-def titles_lines(glyphs, where):
-    lines = []
+def titles_of(glyphs, where):
+    """the glyphs of every code point of TITLE_RANGES, {code point: bitmap as hex}"""
     for cp in titles_wanted():
         if cp not in glyphs:
             raise SystemExit(f'{where}: no glyph for U+{cp:04X}, which TITLE_RANGES keep')
-        lines.append(f'{cp:04X}:{glyphs[cp]}\n')
-    return ''.join(lines)
+    return {cp: glyphs[cp] for cp in titles_wanted()}
 
 
 RAISE = 2  # Unifont's baseline is row 13, the VGA font's row 11
@@ -163,12 +164,13 @@ def fit(rows):
     return bytes(rows + [0] * (16 - len(rows)))
 
 
-def c_text(glyphs, wide):
+def c_text(glyphs, wide, name):
+    """the C of the Latin and the wide glyphs, name's"""
     points, wide_points = sorted(glyphs), sorted(wide)
     out = [
-        f'/* Generated by scripts/build-glyphs.py from {KEPT} and {WIDE_KEPT}: GNU',
-        '   Unifont, GPL-2.0-or-later with the font embedding exception, or OFL-1.1 (src/gui/FONT-NOTICE.txt), the',
-        '   Latin letters fitted to the VGA font. Do not edit. */',
+        f'/* Generated by scripts/build-glyphs.py from {name}: GNU Unifont, GPL-2.0-or-later with the font',
+        '   embedding exception, or OFL-1.1 (src/gui/FONT-NOTICE.txt), the Latin letters fitted to the VGA',
+        '   font. Do not edit. */',
         '#include "gui/latin.h"',
         '#include "gui/wide.h"',
         f'const int gui_latin_count = {len(points)};',
@@ -199,9 +201,9 @@ def c_text(glyphs, wide):
     return '\n'.join(out) + '\n'
 
 
-def titles_c_text(titles):
-    """the C of the titles' glyphs: their runs, each the code points of one width in a row, then the 8x16 glyphs and
-    the 16x16 ones, each in order"""
+def titles_c_text(titles, name):
+    """the C of the titles' glyphs, name's: their runs, each the code points of one width in a row, then the 8x16
+    glyphs and the 16x16 ones, each in order"""
     narrow = [cp for cp in sorted(titles) if len(titles[cp]) == 32]
     wide = [cp for cp in sorted(titles) if len(titles[cp]) == 64]
     runs, at = [], {False: 0, True: 0}
@@ -213,7 +215,7 @@ def titles_c_text(titles):
             runs.append([cp, cp, is_wide, at[is_wide]])
         at[is_wide] += 1
     out = [
-        f'/* Generated by scripts/build-glyphs.py from {TITLES_KEPT}: GNU Unifont, GPL-2.0-or-later with the font',
+        f'/* Generated by scripts/build-glyphs.py from {name}: GNU Unifont, GPL-2.0-or-later with the font',
         '   embedding exception, or OFL-1.1 (src/gui/FONT-NOTICE.txt), unaltered. Do not edit. */',
         '#include "gui/titles.h"',
         f'const int gui_title_run_count = {len(runs)};',
@@ -241,89 +243,26 @@ def titles_c_text(titles):
     return '\n'.join(out) + '\n'
 
 
-def check_kept(root, kept, wide_kept, titles_kept):
-    """the kept files' code points, widths and order, as --from writes them; SystemExit says the first that is not"""
-    glyphs = read_hex(kept.read_text().splitlines(), KEPT)
-    wide = read_hex(wide_kept.read_text().splitlines(), WIDE_KEPT)
-    titles = read_hex(titles_kept.read_text().splitlines(), TITLES_KEPT)
-    if kept.read_text().replace('\r\n', '\n') != kept_lines(glyphs, wanted(root), KEPT):
-        raise SystemExit(f'{KEPT} is not the glyphs of {RANGES} CP437 lacks, in order: run build-glyphs.py --from')
-    points = wide_wanted(root)
-    extra = sorted(set(wide) - set(points))
-    if extra:
-        held = f'{TITLES_KEPT} holds' if in_titles(extra[0]) else 'no language shows'
-        raise SystemExit(f'{WIDE_KEPT}: U+{extra[0]:04X} is in it, which {held}: run build-glyphs.py --from')
-    in_order(wide_kept, WIDE_KEPT, wide_lines(wide, points, WIDE_KEPT), points)
-    points = titles_wanted()
-    in_order(titles_kept, TITLES_KEPT, titles_lines(titles, TITLES_KEPT), points)
-
-
-def in_order(path, name, text, points):
-    """path's lines are text's, a line a glyph of points"""
-    have = path.read_text().replace('\r\n', '\n').splitlines()
-    want = text.splitlines()
-    for number, (line, cp) in enumerate(zip(have + [''] * len(want), points), 1):
-        if line != want[number - 1]:
-            raise SystemExit(
-                f'{name}:{number}: {line[:7]!r} where the line of U+{cp:04X} goes, the glyphs in order and a'
-                ' line each: run build-glyphs.py --from'
-            )
-    if len(have) != len(want):
-        raise SystemExit(f'{name}: {len(have)} lines, not the {len(want)} of its glyphs: run build-glyphs.py --from')
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--root', type=Path, default=ROOT, help="the checkout (default: this script's)")
-    parser.add_argument(
-        '--from',
-        dest='unifont',
-        type=Path,
-        help=f'a Unifont .hex, whose glyphs go in {KEPT}, {TITLES_KEPT} and {WIDE_KEPT}',
-    )
-    parser.add_argument(
-        '--check',
-        action='store_true',
-        help=f'fail when {KEPT}, {TITLES_KEPT} or {WIDE_KEPT} is not what --from keeps (with --from: its glyphs too)',
-    )
+    parser.add_argument('--from', dest='unifont', type=Path, required=True, help='the Unifont .hex of every glyph')
     parser.add_argument('--out', type=Path, help='the C source of the Latin and the wide glyphs')
     parser.add_argument('--titles-out', type=Path, help="the C source of the titles' glyphs")
-    args = parser.parse_args()
-    kept, wide_kept, titles_kept = (
-        args.root / KEPT,
-        args.root / WIDE_KEPT,
-        args.root / TITLES_KEPT,
+    parser.add_argument(
+        '--check', action='store_true', help='fail when the .hex lacks a glyph, or has one at another width'
     )
-    if args.unifont:
-        opener = gzip.open if args.unifont.suffix == '.gz' else open
-        with opener(args.unifont, 'rt', encoding='ascii') as f:
-            glyphs = read_hex(f, args.unifont)
-        texts = {
-            kept: kept_lines(glyphs, wanted(args.root), args.unifont),
-            wide_kept: wide_lines(glyphs, wide_wanted(args.root), args.unifont),
-            titles_kept: titles_lines(glyphs, args.unifont),
-        }
-        for path, text in texts.items():
-            if not args.check:
-                path.write_text(text)
-            elif path.read_text().replace('\r\n', '\n') != text:
-                name = path.relative_to(args.root).as_posix()
-                raise SystemExit(f'{name} is not what {args.unifont.name} gives: run build-glyphs.py --from')
-        return 0
-    if args.check:
-        check_kept(args.root, kept, wide_kept, titles_kept)
-        return 0
-    if not args.out and not args.titles_out:
-        parser.error('--from, --check, --out or --titles-out')
+    args = parser.parse_args()
+    if args.check == bool(args.out or args.titles_out):
+        parser.error('--out and --titles-out write the C, and --check writes nothing: one or the other')
+    unifont = read_unifont(args.unifont)
+    latin = latin_of(unifont, wanted(args.root), args.unifont)
+    wide = wide_of(unifont, wide_wanted(args.root), args.unifont)
+    titles = titles_of(unifont, args.unifont)
     if args.out:
-        glyphs = read_hex(kept.read_text().splitlines(), KEPT)
-        wide = read_hex(wide_kept.read_text().splitlines(), WIDE_KEPT)
-        write_if_changed(args.out, c_text(glyphs, wide))
+        write_if_changed(args.out, c_text(latin, wide, args.unifont.name))
     if args.titles_out:
-        write_if_changed(
-            args.titles_out,
-            titles_c_text(read_hex(titles_kept.read_text().splitlines(), TITLES_KEPT)),
-        )
+        write_if_changed(args.titles_out, titles_c_text(titles, args.unifont.name))
     return 0
 
 

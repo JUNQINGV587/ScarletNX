@@ -56,7 +56,10 @@ static void monitor(int listener, int life, int gate, pid_t target, const char* 
     char ready, pid[32];
     signal(SIGPIPE, SIG_IGN);
     /* Parent first authorizes ptrace, then lets the helper accept clients. */
-    if (read(life, &ready, 1) != 1) goto done;
+    ssize_t began;
+    do began = read(life, &ready, 1); /* a signal as the helper starts is no end of the parent */
+    while (began < 0 && errno == EINTR);
+    if (began != 1) goto done;
     fds[0].fd = life;
     fds[0].events = POLLIN;
     fds[1].fd = listener;
@@ -86,7 +89,8 @@ static void monitor(int listener, int life, int gate, pid_t target, const char* 
         close(peer);
         if (dup2(transport[1], STDIN_FILENO) < 0 || dup2(transport[1], STDOUT_FILENO) < 0) _exit(126);
         if (transport[1] > STDOUT_FILENO) close(transport[1]);
-        execl(server, server, "--once", "--attach", "stdio", pid, (char*)NULL);
+        char* const argv[] = {(char*)server, "--once", "--attach", "stdio", pid, NULL};
+        execv(server, argv); /* not execl: the PS5's libc has none */
         perror("scarletnx: starting gdbserver");
         _exit(127);
     }

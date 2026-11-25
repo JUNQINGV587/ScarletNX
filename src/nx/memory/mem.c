@@ -136,8 +136,8 @@ static void layout_fixed(const char* which) {
    region its bounds, a 6 GiB alias region and an 8 GiB heap region above it, and the kernel's pages in the last GiB.
    What the layout has to guarantee is that every address the game holds fits in 36 bits: the SDK marshals an IPC
    buffer descriptor's address into 4 bits above 32 and 22 above 36 and drops the rest, so an address of the 39-bit
-   layout comes back to the runtime as that address's low 36 bits, which nothing was ever mapped at. Zelda: Breath
-   of the Wild's main stack, at 78 GiB above, came back as 12 GiB and its first RomFS read wrote the header there */
+   layout comes back to the runtime as that address's low 36 bits, which nothing was ever mapped at. One
+   open world game's main stack, at 78 GiB above, came back as 12 GiB and its first RomFS read wrote the header there */
 void mem_layout36(void) {
     layout_fixed("the 36-bit one, which lies below 64 GiB with its code at 128 MiB");
     g_layout.base = 0x8000000ull;
@@ -170,13 +170,13 @@ void mem_layout_large_heap(void) {
     }
 }
 
-/* EXPERIMENT: an Ounce program's alias region, 256 GiB where the 39-bit layout's is 64. The SDK's virtual address
-   memory (nn::os::AllocateAddressRegion) takes its regions from the alias region, GetInfo 2 and 3 less GetInfo 28,
-   and one game reserves 60 GiB there twice, at its startup and again in its main, and frees neither: 64 GiB can't
-   hold both. A Switch 1 program on the Ounce reports the 64 GiB, so an Ounce program's layout differs, by a size not
-   known. The heap, stack and kernel regions move up past it, all within the 512 GiB reservation */
+/* An Ounce program's alias region: 128 GiB where the 39-bit layout's is 64, as GetInfo 3 answers a native program on
+   that console (GetInfo 28, the alias region's extra, is 0 there). The SDK's virtual address memory takes its regions
+   from the alias region, GetInfo 2 and 3 less GetInfo 28, and one game reserves 60 GiB there twice, at its startup
+   and again in its main, and frees neither: 64 GiB can't hold both. A Switch 1 program on the Ounce reports the 64 GiB.
+   The heap, stack and kernel regions move up past it, all within the 512 GiB reservation */
 void mem_layout_ounce_alias(void) {
-    u64 extra = 192 * GIB;
+    u64 extra = 64 * GIB;
     if (g_as_size < AS_TOP || g_layout.alias_size != 64 * GIB || g_layout.kern_end + extra > g_layout.end) return;
     g_layout.alias_size += extra;
     g_layout.heap += extra;
@@ -216,6 +216,13 @@ void mem_layout32(unsigned aspace) {
    Everything here is under g_mem_lk; a change of host memory also holds the renderer's memory lock around it
    (g_gpu_mapping_begin, taken first), which may query the list itself */
 static PMutex g_mem_lk = PMUTEX_INIT;
+/* The context SNX_LOCK_MARK needs is the one g_pm_tracy_snx makes through pm_tracy_make (tracy.c). thread.c keeps it
+   in the PMutex, behind its PmNamed wrapper whose first word is that profiler context; read it as pm_named does. Null
+   until the lock is announced (or a client starts), so a mark is a no-op then. */
+[[maybe_unused]] static SnxTracyLock* mem_lock_context(void) {
+    void* named = atomic_load_explicit(&g_mem_lk.tracy, memory_order_acquire);
+    return named ? *(SnxTracyLock**)named : NULL;
+}
 static u64 g_host_page = PAGE; /* plat_vm_page: set by mem_init, before other threads */
 static MemBlock* g_blk;
 static u32 g_nblk, g_capblk;
@@ -239,6 +246,7 @@ static _Thread_local struct {
 static void runs_stale_nl(void) { atomic_fetch_add_explicit(&g_unmap_gen, 1, memory_order_release); }
 static void mem_lock(void) {
     pm_lock(&g_mem_lk);
+    SNX_LOCK_MARK(mem_lock_context()); /* held here, every other thread's read or write waits */
     t_mem.held = 1;
 }
 static void mem_unlock(void) {
@@ -401,6 +409,7 @@ static int movable_nl(u64 a, u64 size) {
 /* Guest memory whose pages are a buffer a GPU shares (mem_migrate): runs sorted and disjoint, under g_mem_lk */
 typedef struct {
     u64 a, b;
+    u8* view; /* the byte at a in a mapping of the buffer's pages (mem_ext_read), or NULL */
 } ExtRun;
 static struct {
     ExtRun* run;
@@ -432,16 +441,17 @@ static void ext_cut_nl(u64 a, u64 b) {
         if (r.a < a && b < r.b) { /* split in two */
             if (ext_room_nl(1)) fatal("Out of memory noting guest memory a GPU shares");
             memmove(&g_ext.run[i + 2], &g_ext.run[i + 1], sizeof *g_ext.run * (size_t)(g_ext.n - i - 1));
-            g_ext.run[i] = (ExtRun){r.a, a};
-            g_ext.run[i + 1] = (ExtRun){b, r.b};
+            g_ext.run[i] = (ExtRun){r.a, a, r.view};
+            g_ext.run[i + 1] = (ExtRun){b, r.b, r.view ? r.view + (b - r.a) : NULL};
             g_ext.n++;
             return;
         }
         if (r.a < a)
             g_ext.run[i].b = a;
-        else if (b < r.b)
+        else if (b < r.b) {
             g_ext.run[i].a = b;
-        else {
+            if (r.view) g_ext.run[i].view = r.view + (b - r.a);
+        } else {
             memmove(&g_ext.run[i], &g_ext.run[i + 1], sizeof *g_ext.run * (size_t)(g_ext.n - i - 1));
             g_ext.n--;
             i--;
@@ -1203,6 +1213,29 @@ void mem_init(void) {
     LOG("memory: %llu KiB host pages, %s\n", (unsigned long long)(g_host_page >> 10),
         g_pool_on ? "views share their source's pages (alias pool)" : "views are copies (no alias pool)");
 }
+/* the guest's pages in files (plat_vm_files), before the game commits any: not under NCE, whose reservation is the
+   guest's own addresses and not g_mem's */
+int mem_files_on(const char* dir) {
+    int r;
+    if (g_mem_identity || !g_mem) {
+        errno = ENOTSUP;
+        return -1;
+    }
+    mem_lock();
+    r = g_nblk == 1 && g_blk[0].state == MS_FREE ? plat_vm_files(g_mem, g_as_size, dir) : (errno = EBUSY, -1);
+    mem_unlock();
+    return r;
+}
+int mem_files_room(const char* dir, u64 need, char* out, size_t size) {
+    SnxU64 free_bytes = 0, total = 0;
+    if (snx_disk_room(dir, &free_bytes, &total)) {
+        snprintf(out, size, "the free space on the disk of %s could not be read: %s", dir, strerror(errno));
+        return -1;
+    }
+    snprintf(out, size, "%llu MiB free on the disk of %s, %llu needed", (unsigned long long)(free_bytes >> 20), dir,
+             (unsigned long long)(need >> 20));
+    return free_bytes < need ? -1 : 0;
+}
 
 /* ============================================================ mapping */
 int mem_map(u64 addr, u64 size, u32 state, u32 perm) {
@@ -1513,25 +1546,83 @@ int mem_own_prepare(u64 a, u64 size, MemPoolRun* runs, u32 max, u32* n) {
         }
         at = hi;
     }
-    /* the runs of pool pages, in order */
+    /* the runs of pool pages, in order: past max they are counted, not stored, so the caller can ask again with room
+       for all of them */
+    MemPoolRun last = {0};
     for (at = a; at < end;) {
         const MemBlock* b = &g_blk[blk_index_nl(at)];
         u64 hi = blk_end(b) < end ? blk_end(b) : end, off = b->pool - 1 + (at - b->addr);
-        if (*n && runs[*n - 1].addr + runs[*n - 1].size == at && runs[*n - 1].pool + runs[*n - 1].size == off)
-            runs[*n - 1].size += hi - at;
-        else if (*n == max) {
-            r = -1;
-            goto out;
+        if (*n && last.addr + last.size == at && last.pool + last.size == off) {
+            last.size += hi - at;
+            if (*n <= max) runs[*n - 1].size = last.size;
         } else {
-            runs[*n].addr = at;
-            runs[*n].size = hi - at;
-            runs[*n].pool = off;
+            last = (MemPoolRun){.addr = at, .size = hi - at, .pool = off};
+            if (*n < max) runs[*n] = last;
             ++*n;
         }
         at = hi;
     }
+    r = *n > max ? -1 : 0;
+out:
+    mem_unlock();
+    return r;
+}
+/* the run of a GPU buffer's pages that holds guest address a, or g_ext.n (under the lock) */
+static u32 ext_at_nl(u64 a) {
+    u32 i = 0;
+    while (i < g_ext.n && g_ext.run[i].b <= a) i++;
+    return i < g_ext.n && g_ext.run[i].a <= a ? i : g_ext.n;
+}
+int mem_ext_runs(u64 a, u64 size, MemPoolRun* runs, u32 max, u32* n) {
+    u64 end = a + size;
+    int r = -1;
+    *n = 0;
+    if ((a | size) & (PAGE - 1) || !size || a < AS_BASE || end > AS_END) return -1;
+    mem_lock();
+    for (u32 i = blk_index_nl(a); i < g_nblk && g_blk[i].addr < end; i++)
+        if (!data_state(g_blk[i].state) || g_blk[i].pool) goto out;
+    /* the runs side by side, each with its view: a run without one has no place to read its CPU bytes from */
+    for (u64 at = a; at < end;) {
+        const u32 i = ext_at_nl(at);
+        if (i == g_ext.n || !g_ext.run[i].view || *n == max) goto out;
+        const u64 hi = g_ext.run[i].b < end ? g_ext.run[i].b : end;
+        runs[*n] = (MemPoolRun){at, hi - at, (u64)(uintptr_t)(g_ext.run[i].view + (at - g_ext.run[i].a))};
+        ++*n;
+        at = hi;
+    }
     r = 0;
 out:
+    if (r) *n = 0;
+    mem_unlock();
+    return r;
+}
+int mem_ext_is(u64 a, u64 size, const u8* view) {
+    int r = 1;
+    if (!size || !view || a + size < a) return 0;
+    mem_lock();
+    for (u64 at = a, end = a + size; at < end && r;) {
+        const u32 i = ext_at_nl(at);
+        r = i < g_ext.n && g_ext.run[i].view && g_ext.run[i].view + (at - g_ext.run[i].a) == view + (at - a);
+        if (r) at = g_ext.run[i].b;
+    }
+    mem_unlock();
+    return r;
+}
+int mem_ext_read(u64 a, void* dst, u64 size) {
+    u8* d = (u8*)dst;
+    int r = 0;
+    if (!size || a + size < a) return -1;
+    mem_lock();
+    for (u64 at = a, end = a + size; at < end && !r;) {
+        const u32 i = ext_at_nl(at);
+        if (i == g_ext.n || !g_ext.run[i].view) {
+            r = -1;
+            break;
+        }
+        const u64 hi = g_ext.run[i].b < end ? g_ext.run[i].b : end;
+        memcpy(d + (at - a), g_ext.run[i].view + (at - g_ext.run[i].a), (size_t)(hi - at));
+        at = hi;
+    }
     mem_unlock();
     return r;
 }
@@ -1575,7 +1666,7 @@ static void pool_give_back_nl(u64 a, u64 size) {
     }
     if (any) pool_set_nl(a, size, 0);
 }
-int mem_migrate(u64 a, u64 size, int fd) {
+int mem_migrate(u64 a, u64 size, int fd, u8* view) {
     u64 end = a + size;
     u32 at;
     int r = 0, s;
@@ -1602,14 +1693,14 @@ int mem_migrate(u64 a, u64 size, int fd) {
     ext_cut_nl(a, end); /* pages another buffer had are this one's now */
     for (at = 0; at < g_ext.n && g_ext.run[at].a < a; at++) {}
     memmove(&g_ext.run[at + 1], &g_ext.run[at], sizeof *g_ext.run * (size_t)(g_ext.n - at));
-    g_ext.run[at] = (ExtRun){a, end};
+    g_ext.run[at] = (ExtRun){a, end, view};
     g_ext.n++;
 out:
     mem_unlock();
     return r;
 }
-int mem_unmigrate(u64 a, u64 size) {
-    u64 end = a + size, at = a;
+int mem_unmigrate(u64 a, u64 size, u64* moved) {
+    u64 end = a + size, at = a, back = 0;
     int r = 0;
     mem_lock();
     for (;;) {
@@ -1617,6 +1708,11 @@ int mem_unmigrate(u64 a, u64 size) {
         while (i < g_ext.n && g_ext.run[i].b <= at) i++;
         if (i == g_ext.n || g_ext.run[i].a >= end) break;
         u64 lo = g_ext.run[i].a > at ? g_ext.run[i].a : at, hi = g_ext.run[i].b < end ? g_ext.run[i].b : end;
+        /* the copy reads the pages, which a watch over them traps where they are (own_watch_in_place): a fault there
+           waits for the trap thread, which can wait for the renderer's lock that the caller holds. What the GPU holds
+           there lands first, as promote_nl's does (the caller publishes the targets pending there before:
+           uma.c's imp_let_go) */
+        own_acquire(lo, hi - lo);
         plat_freeze(GP(lo), hi - lo);
         int u = plat_vm_unshare(GP(lo), hi - lo);
         plat_thaw();
@@ -1625,11 +1721,14 @@ int mem_unmigrate(u64 a, u64 size) {
                   (unsigned long long)((hi - lo) >> 10));
         if (u)
             r = MEM_NOMEM;
-        else
+        else {
             ext_cut_nl(lo, hi);
+            back += hi - lo;
+        }
         at = hi;
     }
     mem_unlock();
+    if (moved) *moved = back;
     return r;
 }
 int mem_pool_any(u64 a, u64 size) {

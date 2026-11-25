@@ -41,6 +41,7 @@
 #include "nx/runtime/options.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
+#include "nx/runtime/platform/tracy.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/ledger.h"
 #include "nx/gpu/vk/resource_stats.h"
@@ -128,6 +129,9 @@ static struct {
     u64 gone_bytes;
     int readers; /* it changes blocks of an image in use: after the work submitted before it (VK_BIND_*) */
 } g_bind;
+/* the sparse binds a present, and the submissions that waited for one: the counter for the "submitted, not started"
+   idle of the GPU profile (vk_sparse_flush makes a submission wait on the bind timeline) */
+u64 g_vk_sparse_binds, g_vk_sparse_waits;
 
 /* An allocation of size bytes of system memory, no bigger than g_vk.alloc_cap, found none while its heap had the
    room: the driver gives less in one allocation than the device's limit says, and from now on none is bigger than a
@@ -295,6 +299,7 @@ static void bind_flush(void) {
         h->comp = g_bind.readers & VK_BIND_MOVE ? vk_compute_submitted() : 0;
         h->after = g_bind.issued;
         h->value = ++g_bind.issued;
+        g_vk_sparse_binds++;
         vk_rec_call(bind_run, g_bind.buf, g_bind.used);
     }
     for (u32 i = 0; i < g_bind.ngone; i++) vk_defer_call(gone_free, (void*)(uintptr_t)bind_gone()[i]);
@@ -310,6 +315,7 @@ int vk_sparse_flush(VkSemaphoreSubmitInfo* wait) {
     bind_flush();
     if (g_bind.waited == g_bind.issued) return 0;
     g_bind.waited = g_bind.issued;
+    g_vk_sparse_waits++;
     *wait = (VkSemaphoreSubmitInfo){.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
                                     .semaphore = g_bind.sem,
                                     .value = g_bind.issued,
@@ -517,7 +523,10 @@ static int image_create_r(const VkImageCreateInfo* ii, VkImage* img, DevMem* mem
                   (unsigned long long)(req.memoryRequirements.size >> 20), (unsigned long long)(g_vk.alloc_cap >> 20));
     }
     /* an owner of the low class takes the blocks of that class (devmem.h) */
-    const DevMemWant aci = {.at = DM_DEVICE, .low = vk_mem_owner_prio(owner) == DM_PRIO_LOW, .moves = moves};
+    const DevMemWant aci = {.at = DM_DEVICE,
+                            .low = vk_mem_owner_prio(owner) == DM_PRIO_LOW,
+                            .moves = moves,
+                            .sized = owner == VK_OWN_TARGET || owner == VK_OWN_IMAGE_OTHER};
     *res = vk_devmem_image(ii, &aci, img, mem);
     if (VK_OK(*res)) vk_mem_track(*mem, owner);
     return VK_OK(*res);
@@ -1593,6 +1602,13 @@ u64 vk_image_resident_need(VkImage img, const u8* want, const u64* keys, u32 n) 
     return need;
 }
 
+int vk_image_resident_has(VkImage img, u32 first, u32 n) {
+    const Pieces* p = pieces_of(img);
+    if (!p || !p->per_layer || first > p->n || n > p->n - first) return 0;
+    for (u32 i = first; i < first + n; i++)
+        if (!p->pages[i]) return 0;
+    return 1;
+}
 int vk_image_resident(VkImage img, u8* want, const u64* keys, u32 n, u64* bytes) {
     Pieces* p = pieces_of(img);
     *bytes = p ? p->bound : 0;
@@ -1744,6 +1760,8 @@ int vk_mem_heap(void) {
     return g_heap;
 }
 u64 vk_mem_budget_cap(u64 bytes) {
+    /* rare: a cache changed the budget the device memory allocator works to */
+    SNX_ZONE_TV(z, "vk mem budget cap", bytes, "%llu MB", (unsigned long long)(bytes >> 20));
     u64 had;
     if (g_heap < 0) heap_find(); /* which reads vk_budget_mb once */
     had = g_budget_cap;
@@ -1805,6 +1823,14 @@ void vk_mem_use(u64* usage, u64* budget) {
         if (g_uma_budget.budget < *budget) *budget = g_uma_budget.budget;
     }
 #endif
+}
+
+u64 vk_mem_heap_use(void) {
+    DevMemBudget b[VK_MAX_MEMORY_HEAPS];
+    if (g_heap < 0) heap_find();
+    vk_devmem_budgets(b);
+    const u64 u = b[g_heap].usage, gone = vk_deferred_bytes();
+    return u > gone ? u - gone : 0;
 }
 
 /* the present clock: a present and its time every quarter second at most, seventeen minutes back */

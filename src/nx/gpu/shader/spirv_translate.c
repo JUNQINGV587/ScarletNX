@@ -8,6 +8,33 @@
 #include "nx/gpu/shader/capture_tiles_spirv.h"
 #include "nx/gpu/shader/depth_stencil_spirv.h"
 #include "nx/gpu/shader/write_log.h"
+#include "nx/runtime/platform/tracy.h"
+#include "common/platform/time.h"
+
+/* The translation phases timed for the trace's dominant-phase detail. decode is timed in to_spirv, the others in
+   translate; a NULL phase array turns the timing off outside a capture. */
+enum { PH_DECODE, PH_DATAFLOW, PH_STRUCTURE, PH_ALLOC, PH_EMIT, PH_N };
+static const char* const snx_phase_name[PH_N] = {"decode", "dataflow", "structure", "alloc", "emit"};
+
+/* a refusal that reaches here leaves its reason as a one-line mark and increments the failures plot, so a trace says
+   why such a translation was rejected without a run through the log. Opcode and viewport-mask refusals mark their own
+   detailed reason; a few argument and allocation guards return with no reason */
+static u32* snx_reject(ShaderInfo* si, const char* reason) {
+    SNX_MSG(reason, strlen(reason));
+    SNX_PLOT("shader translate failures", 1);
+    return direct_reject(si, reason);
+}
+static u32* snx_reject_buffers(ShaderInfo* si, const char* reason, u32* pop_targets, u8* gb_at) {
+    free(gb_at);
+    free(pop_targets);
+    return snx_reject(si, reason);
+}
+/* A refusal that already wrote its own detailed reason into first_unsupported marks and plots that reason here. */
+static void snx_refuse_reason(ShaderInfo* si) {
+    size_t len = strlen(si->first_unsupported);
+    SNX_MSG(si->first_unsupported, len);
+    SNX_PLOT("shader translate failures", 1);
+}
 
 /* Programmable blend owns an ordered storage image. Coverage-only keeps its native integer attachment and kills
    late-failed lanes after the interlock. Every invocation executes one begin/end pair; discarded/helper lanes
@@ -146,267 +173,6 @@ ShCaps g_spirv_translate = {.tex_array = SNX_TEX_ARRAY,
                             .quad = 1,
                             .quad_compute = 1,
                             .tessellation = 1};
-
-/* the family of instructions whose branches take each opcode, FAM_NONE for one no branch takes (refused by
-   the prescan, or one that writes nothing): a family's function is the only one with branches for its opcodes */
-enum { FAM_NONE, FAM_FLOW, FAM_IO, FAM_THREAD, FAM_INT, FAM_FLOAT, FAM_MEMORY, FAM_TEXTURE };
-static int op_family(int op) {
-    switch (op) {
-        case O_JCAL:
-        case O_JMP:
-        case O_JMX:
-        case O_BRA:
-        case O_BRX:
-        case O_SSY:
-        case O_SYNC:
-        case O_PBK:
-        case O_BRK:
-        case O_PCNT:
-        case O_CONT:
-        case O_EXIT:
-        case O_KIL:
-        case O_CAL:
-        case O_RET:
-        case O_PRET:
-        case O_PEXIT:
-        case O_IDE:
-        case O_CCTL:
-        case O_CCTLL:
-        case O_BPT: return FAM_FLOW;
-        case O_IPA:
-        case O_ALD:
-        case O_AST:
-        case O_OUT_R:
-        case O_OUT_C:
-        case O_OUT_I:
-        case O_ISBERD:
-        case O_AL2P:
-        case O_PIXLD: return FAM_IO;
-        case O_S2R:
-        case O_CS2R:
-        case O_BAR:
-        case O_MEMBAR:
-        case O_VOTE:
-        case O_SHFL: return FAM_THREAD;
-        case O_I2I_R:
-        case O_I2I_C:
-        case O_I2I_I:
-        case O_MOV_R:
-        case O_MOV_C:
-        case O_MOV_I:
-        case O_MOV32I:
-        case O_IADD_R:
-        case O_IADD_C:
-        case O_IADD_I:
-        case O_IADD32I:
-        case O_IADD3_R:
-        case O_IADD3_C:
-        case O_IADD3_I:
-        case O_ISCADD_R:
-        case O_ISCADD_C:
-        case O_ISCADD_I:
-        case O_ISCADD32I:
-        case O_IMNMX_R:
-        case O_IMNMX_C:
-        case O_IMNMX_I:
-        case O_ISETP_R:
-        case O_ISETP_C:
-        case O_ISETP_I:
-        case O_ISET_R:
-        case O_ISET_C:
-        case O_ISET_I:
-        case O_ICMP_R:
-        case O_ICMP_RC:
-        case O_ICMP_CR:
-        case O_ICMP_I:
-        case O_LOP_R:
-        case O_LOP_C:
-        case O_LOP_I:
-        case O_LOP32I:
-        case O_LOP3_R:
-        case O_LOP3_C:
-        case O_LOP3_I:
-        case O_SHL_R:
-        case O_SHL_C:
-        case O_SHL_I:
-        case O_SHR_R:
-        case O_SHR_C:
-        case O_SHR_I:
-        case O_SHF_LR:
-        case O_SHF_LI:
-        case O_SHF_RR:
-        case O_SHF_RI:
-        case O_BFE_R:
-        case O_BFE_C:
-        case O_BFE_I:
-        case O_BFI_R:
-        case O_BFI_RC:
-        case O_BFI_CR:
-        case O_BFI_I:
-        case O_SEL_R:
-        case O_SEL_C:
-        case O_SEL_I:
-        case O_POPC_R:
-        case O_POPC_C:
-        case O_POPC_I:
-        case O_FLO_R:
-        case O_FLO_C:
-        case O_FLO_I:
-        case O_PRMT_R:
-        case O_PRMT_RC:
-        case O_PRMT_CR:
-        case O_PRMT_I:
-        case O_XMAD_R:
-        case O_XMAD_RC:
-        case O_XMAD_CR:
-        case O_XMAD_I:
-        case O_IMUL_R:
-        case O_IMUL_C:
-        case O_IMUL_I:
-        case O_IMUL32I:
-        case O_IMAD_R:
-        case O_IMAD_RC:
-        case O_IMAD_CR:
-        case O_IMAD_I:
-        case O_IMAD32I:
-        case O_LEA_HR:
-        case O_LEA_HC:
-        case O_LEA_LR:
-        case O_LEA_LC:
-        case O_LEA_LI:
-        case O_PSETP:
-        case O_PSET:
-        case O_P2R_R:
-        case O_P2R_C:
-        case O_P2R_I:
-        case O_R2P_R:
-        case O_R2P_C:
-        case O_R2P_I:
-        case O_CSET:
-        case O_CSETP:
-        case O_VMNMX:
-        case O_VMAD:
-        case O_VSETP:
-        case O_VADD:
-        case O_VABSDIFF:
-        case O_VSET:
-        case O_VSHL:
-        case O_VSHR: return FAM_INT;
-        case O_FADD_R:
-        case O_FADD_C:
-        case O_FADD_I:
-        case O_FADD32I:
-        case O_FMUL_R:
-        case O_FMUL_C:
-        case O_FMUL_I:
-        case O_FMUL32I:
-        case O_FFMA_R:
-        case O_FFMA_RC:
-        case O_FFMA_CR:
-        case O_FFMA_I:
-        case O_FFMA32I:
-        case O_FMNMX_R:
-        case O_FMNMX_C:
-        case O_FMNMX_I:
-        case O_FSETP_R:
-        case O_FSETP_C:
-        case O_FSETP_I:
-        case O_FSET_R:
-        case O_FSET_C:
-        case O_FSET_I:
-        case O_FCMP_R:
-        case O_FCMP_RC:
-        case O_FCMP_CR:
-        case O_FCMP_I:
-        case O_MUFU:
-        case O_RRO_R:
-        case O_RRO_C:
-        case O_RRO_I:
-        case O_F2F_R:
-        case O_F2F_C:
-        case O_F2F_I:
-        case O_F2I_R:
-        case O_F2I_C:
-        case O_F2I_I:
-        case O_I2F_R:
-        case O_I2F_C:
-        case O_I2F_I:
-        case O_FSWZADD:
-        case O_FCHK_R:
-        case O_FCHK_C:
-        case O_FCHK_I:
-        case O_HADD2_R:
-        case O_HADD2_C:
-        case O_HADD2_I:
-        case O_HADD2_32I:
-        case O_HMUL2_R:
-        case O_HMUL2_C:
-        case O_HMUL2_I:
-        case O_HMUL2_32I:
-        case O_HFMA2_R:
-        case O_HFMA2_RC:
-        case O_HFMA2_CR:
-        case O_HFMA2_I:
-        case O_HFMA2_32I:
-        case O_HSETP2_R:
-        case O_HSETP2_C:
-        case O_HSETP2_I:
-        case O_HSET2_R:
-        case O_HSET2_C:
-        case O_HSET2_I:
-        case O_DADD_R:
-        case O_DADD_C:
-        case O_DADD_I:
-        case O_DMUL_R:
-        case O_DMUL_C:
-        case O_DMUL_I:
-        case O_DFMA_R:
-        case O_DFMA_RC:
-        case O_DFMA_CR:
-        case O_DFMA_I:
-        case O_DSET_R:
-        case O_DSET_C:
-        case O_DSET_I:
-        case O_DSETP_R:
-        case O_DSETP_C:
-        case O_DSETP_I:
-        case O_DMNMX_R:
-        case O_DMNMX_C:
-        case O_DMNMX_I: return FAM_FLOAT;
-        case O_LDC:
-        case O_LDG:
-        case O_STG:
-        case O_LDS:
-        case O_STS:
-        case O_LDL:
-        case O_STL:
-        case O_ATOM:
-        case O_ATOMS:
-        case O_RED:
-        case O_ATOM_CAS:
-        case O_ATOMS_CAS: return FAM_MEMORY;
-        case O_TEX:
-        case O_TEX_B:
-        case O_TEXS:
-        case O_TLD:
-        case O_TLD_B:
-        case O_TLDS:
-        case O_TLD4:
-        case O_TLD4_B:
-        case O_TLD4S:
-        case O_TXQ:
-        case O_TXQ_B:
-        case O_TMML:
-        case O_TMML_B:
-        case O_TXD:
-        case O_TXD_B:
-        case O_SULD:
-        case O_SUST:
-        case O_SURED:
-        case O_SUATOM: return FAM_TEXTURE;
-        default: return FAM_NONE;
-    }
-}
 
 /* A conservative source-invariance proof for portable coverage reduction. Only these pure register, uniform
    constant and control operations may contribute to the source color. In particular, FSWZADD, PIXLD, input loads,
@@ -581,23 +347,28 @@ static int uv_sample(const ShFlow* f, u32 i, const u32* sph, int plain, u32 x, u
 
 static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage, ShaderInfo* si, size_t* word_count,
                       int can_flush, int can_preserve, int can_preserve_f64, int can_subgroup, u32 legacy_fs,
-                      const ShFlow* flow);
+                      const ShFlow* flow, u64* phase);
 static u32* to_spirv(const u8* code, const u64* insn, u32 max_bytes, int stage, ShaderInfo* si, size_t* word_count,
-                     int can_flush, int can_preserve, int can_preserve_f64, int can_subgroup, u32 legacy_fs) {
+                     int can_flush, int can_preserve, int can_preserve_f64, int can_subgroup, u32 legacy_fs,
+                     u64* phase) {
     if (!code || !si || !word_count || max_bytes < 96 || stage < ST_VS || stage > ST_CS) return NULL;
     if (stage == ST_CS) {
         ShaderInfo original = *si;
         u32* simple = shader_compute_to_spirv(code, max_bytes, si, word_count, can_flush, can_preserve);
         if (simple) return simple;
         *si = original;
-        if (!si->cs_local[0] || !si->cs_local[1] || !si->cs_local[2]) return direct_reject(si, "compute local size");
+        if (!si->cs_local[0] || !si->cs_local[1] || !si->cs_local[2]) return snx_reject(si, "compute local size");
     }
+    u64 pt = phase ? plat_ns() : 0;
+    SNX_ZONE(z_snx_decode, "shader decode");
     u32 len;
     shader_hash(code, max_bytes, &len);
     ShFlow f;
-    if (!shader_flow_init(&f, insn, len / 8)) return direct_reject(si, "out of memory");
+    if (!shader_flow_init(&f, insn, len / 8)) return snx_reject(si, "out of memory");
+    SNX_ZONE_END(z_snx_decode);
+    if (phase) phase[PH_DECODE] += plat_ns() - pt;
     u32* r = translate(code, insn, max_bytes, stage, si, word_count, can_flush, can_preserve, can_preserve_f64,
-                       can_subgroup, legacy_fs, &f);
+                       can_subgroup, legacy_fs, &f, phase);
     shader_flow_free(&f);
     return r;
 }
@@ -630,7 +401,8 @@ static int direct_memh_slot(const ShFlow* flow, ShaderInfo* si, u32 memh_at[SH_M
 /* to_spirv's translation, once flow holds the program's words and what dataflow.c's searches ask of them */
 static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage, ShaderInfo* si, size_t* word_count,
                       int can_flush, int can_preserve, int can_preserve_f64, int can_subgroup, u32 legacy_fs,
-                      const ShFlow* flow) {
+                      const ShFlow* flow, u64* phase) {
+    u64 pt = 0; /* set just before the dataflow timing below */
     u32 n = flow->n, clip;
     u32 sph[20];
     for (u32 i = 0; i < 20; i++) sph[i] = snx_ld_le32(code + i * 4);
@@ -646,11 +418,11 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         sph[6 + generic / 4] = (sph[6 + generic / 4] & ~(0xffu << shift)) | mode << shift;
     }
     u32 target = stage == ST_CS ? 0 : sph[18];
-    if (stage == ST_FS && (sph[19] & ~3u)) return direct_reject(si, "fragment output beyond depth and mask");
+    if (stage == ST_FS && (sph[19] & ~3u)) return snx_reject(si, "fragment output beyond depth and mask");
     if ((si->advanced_blend_mask & SH_CAPTURE_SOURCE) &&
         (target >> (4 * (si->capture_outputs ? si->capture_outputs : 1))))
-        return direct_reject(si, "capture validity collides with guest color outputs");
-    if (si->late_depth && (sph[19] & 2u)) return direct_reject(si, "late depth replacement");
+        return snx_reject(si, "capture validity collides with guest color outputs");
+    if (si->late_depth && (sph[19] & 2u)) return snx_reject(si, "late depth replacement");
     /* the sample mask (SPH word 19 bit 0) and depth (bit 1) follow the colours, in that order */
     int passthrough = stage == ST_GS && (sph[0] >> 24 & 1);
     u8 used[255] = {0};
@@ -719,7 +491,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     if (stage == ST_FS)
         for (int rt = 0; rt < 8; rt++)
             if ((target >> (rt * 4)) & 15) {
-                if (out_reg > 251) return direct_reject(si, "fragment output registers");
+                if (out_reg > 251) return snx_reject(si, "fragment output registers");
                 for (int k = 0; k < 4; k++)
                     if (target & (1u << (rt * 4 + k))) used[out_reg + k] = 1;
                 out_reg += 4;
@@ -728,6 +500,8 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         if (sph[19] & 1u) used[out_reg] = 1;
         if (sph[19] & 2u) used[out_reg + 1] = 1;
     }
+    pt = phase ? plat_ns() : 0;
+    SNX_ZONE(z_snx_dataflow, "shader dataflow");
     int has_exit = 0, mixed_sample_invariant = stage == ST_FS;
     /* the TEX.B instructions that choose among constant buffer handles, and the first one (ShaderInfo.chosen_tex) */
     u32 chosen_tex = 0;
@@ -850,18 +624,20 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                 snprintf(si->first_unsupported, sizeof si->first_unsupported, "%s %016llx",
                          op ? op->name : "unknown opcode", (unsigned long long)insn[i]);
             si->unsupported = 1;
+            snx_refuse_reason(si);
             return NULL;
         }
-        /* an opcode taken here that no family writes (op_family) would be dropped: refused, the no-ops aside */
-        if (!op_family(op->id) && op->id != O_NOP && op->id != O_DEPBAR && op->id != O_VOTE_VTG) {
+        /* an opcode taken here that no root of sail/sm53.sail writes would be dropped: refused, the no-ops aside */
+        if (!sm53_sail_takes(op->id) && op->id != O_NOP && op->id != O_DEPBAR && op->id != O_VOTE_VTG) {
             snprintf(si->first_unsupported, sizeof si->first_unsupported, "%s %016llx: no family writes it", op->name,
                      (unsigned long long)insn[i]);
             si->unsupported = 1;
+            snx_refuse_reason(si);
             return NULL;
         }
         if (op->id == O_BRA || (op->id == O_CAL && !B(insn[i], 5, 1)) || op->id == O_PRET) {
             u32 target_index = bra_target(insn[i], i);
-            if (target_index >= n || !IDX_OK(target_index)) return direct_reject(si, "branch target");
+            if (target_index >= n || !IDX_OK(target_index)) return snx_reject(si, "branch target");
             has_flow = 1;
             if (op->id == O_CAL) has_calls = 1;
             if (op->id == O_PRET) has_return = 1;
@@ -870,7 +646,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         if (op->id == O_JMP || op->id == O_JMX) has_flow = 1;
         if ((op->id == O_CAL || op->id == O_JCAL || op->id == O_JMP || op->id == O_JMX) && B(insn[i], 5, 1)) {
             u32 bank = B(insn[i], 36, 5), off = B(insn[i], 20, 16);
-            if (bank >= 18 || (off & 3)) return direct_reject(si, "indirect branch constant buffer");
+            if (bank >= 18 || (off & 3)) return snx_reject(si, "indirect branch constant buffer");
             cbuf_used[bank] = 1;
             cbuf_max[bank] = op->id == O_JMX ? 65536 : ((off | 15u) + 1);
         }
@@ -894,7 +670,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             u32 sr = B(insn[i], 20, 8);
             int scope_bit = sr >= 0x50 && sr <= 0x53 ? (sr < 0x52 ? 1 : 2) : 0;
             if (scope_bit && !(g_spirv_translate.clock_scopes & scope_bit))
-                return direct_reject(si, "shader clock unavailable");
+                return snx_reject(si, "shader clock unavailable");
             if (scope_bit) needs_clock = 1;
         }
         if (op->id == O_PIXLD) {
@@ -905,12 +681,12 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         }
         if (op->id == O_SSY || op->id == O_PBK || op->id == O_PCNT) {
             u32 target_index = bra_target(insn[i], i);
-            if (target_index >= n || !IDX_OK(target_index)) return direct_reject(si, "control stack target");
+            if (target_index >= n || !IDX_OK(target_index)) return snx_reject(si, "control stack target");
             has_flow = has_stack = 1;
         }
         if (op->id == O_PEXIT) {
             u32 target_index = bra_target(insn[i], i);
-            if (target_index >= n || !IDX_OK(target_index)) return direct_reject(si, "PEXIT target");
+            if (target_index >= n || !IDX_OK(target_index)) return snx_reject(si, "PEXIT target");
             has_flow = has_stack = has_pexit = 1;
         }
         if (op->id == O_EXIT && !flow_always(insn[i])) has_conditional_exit = 1;
@@ -947,7 +723,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             op->id != O_CCTL && op->id != O_CCTLL && op->id != O_IDE && op->id != O_BPT && op->id != O_PEXIT)
             used[d] = 1;
         if (op->id == O_AL2P && !shader_al2p_predicate_unseen(flow, i))
-            return direct_reject(si, "AL2P range predicate read");
+            return snx_reject(si, "AL2P range predicate read");
         if (op->id == O_ALD && a != 255) {
             /* an indexed read can reach any generic input the header's map lists (bytes 0x18 to 0x27, a bit for
                each of an input's four components) */
@@ -973,7 +749,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                     else if (location < 0x18)
                         levels_used |= location < 0x10 ? 1 : 2;
                 } else if (between && op->id == O_ALD && (location == 0x64 || location == 0x68))
-                    return direct_reject(si, "layer or viewport attribute read unavailable");
+                    return snx_reject(si, "layer or viewport attribute read unavailable");
                 else if (input && location >= 0x2f8 && location <= 0x2fc)
                     needs_instance = 1;
                 else if (input && (location == 0x2f0 || location == 0x2f4))
@@ -1006,12 +782,14 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                         si->unsupported = 1;
                         snprintf(si->first_unsupported, sizeof si->first_unsupported,
                                  "viewport mask R%u at %x: no constant", d, i * 8);
+                        snx_refuse_reason(si);
                         return NULL;
                     }
                     if (mask > 1) {
                         si->unsupported = 1;
                         snprintf(si->first_unsupported, sizeof si->first_unsupported,
                                  "viewport mask %#x at %x: a broadcast", mask, i * 8);
+                        snx_refuse_reason(si);
                         return NULL;
                     }
                     viewport_mask_one |= mask;
@@ -1118,7 +896,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         }
         if (op->id == O_LDG || op->id == O_STG) {
             u32 count = B(insn[i], 48, 3) == 5 ? 2 : B(insn[i], 48, 3) >= 6 ? 4 : 1;
-            if (d != 255 && d + count > 256) return direct_reject(si, "global memory register range");
+            if (d != 255 && d + count > 256) return snx_reject(si, "global memory register range");
             for (u32 k = 0; k < count; k++)
                 if (d + k < 255) used[d + k] = 1;
             /* a 64-bit address's high word, which an access whose buffer is found when it runs compares */
@@ -1149,7 +927,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             needs_local = 1;
             if (a < 255) used[a] = 1;
             u32 words = B(insn[i], 48, 3) == 5 ? 2 : B(insn[i], 48, 3) >= 6 ? 4 : 1;
-            if (d != 255 && d + words > 255) return direct_reject(si, "local memory register range");
+            if (d != 255 && d + words > 255) return snx_reject(si, "local memory register range");
             for (u32 k = 0; k < words; k++)
                 if (d + k < 255) used[d + k] = 1;
         }
@@ -1157,7 +935,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             needs_shared = 1;
             if (a < 255) used[a] = 1;
             u32 words = B(insn[i], 48, 3) == 5 ? 2 : B(insn[i], 48, 3) >= 6 ? 4 : 1;
-            if (d != 255 && d + words > 255) return direct_reject(si, "shared memory register range");
+            if (d != 255 && d + words > 255) return snx_reject(si, "shared memory register range");
             for (u32 k = 0; k < words; k++)
                 if (d + k < 255) used[d + k] = 1;
         }
@@ -1167,7 +945,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             if (b < 255) used[b] = 1;
             if (shader_shared_atomic_opcode(insn[i]) == 0xfffffffeu) {
                 if (stage != ST_CS || (u64)si->cs_local[0] * si->cs_local[1] * si->cs_local[2] != 1)
-                    return direct_reject(si, "64-bit shared exchange requires one invocation");
+                    return snx_reject(si, "64-bit shared exchange requires one invocation");
                 if (b + 1 < 255) used[b + 1] = 1;
                 if (d + 1 < 255) used[d + 1] = 1;
             }
@@ -1254,7 +1032,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             needs_glsl = 1;
         if (op->id == O_IMUL_C || op->id == O_IMAD_RC || op->id == O_IMAD_CR) {
             u32 idx = B(insn[i], 34, 5), off = B(insn[i], 20, 14) * 4;
-            if (idx >= 18) return direct_reject(si, "constant buffer index");
+            if (idx >= 18) return snx_reject(si, "constant buffer index");
             cbuf_used[idx] = 1;
             if ((off | 15u) + 1 > cbuf_max[idx]) cbuf_max[idx] = (off | 15u) + 1;
             if (stage == ST_VS && idx == 0 && (off == SH_CB0_BASE_VERTEX || off == SH_CB0_BASE_INSTANCE))
@@ -1274,7 +1052,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             op->id == O_DFMA_CR || op->id == O_DMNMX_C || op->id == O_DSET_C || op->id == O_DSETP_C ||
             op->id == O_OUT_C || op->id == O_PRMT_RC || op->id == O_PRMT_CR) {
             u32 idx = B(insn[i], 34, 5), off = B(insn[i], 20, 14) * 4;
-            if (idx >= 18) return direct_reject(si, "constant buffer index");
+            if (idx >= 18) return snx_reject(si, "constant buffer index");
             cbuf_used[idx] = 1;
             if ((off | 15u) + 1 > cbuf_max[idx]) cbuf_max[idx] = (off | 15u) + 1;
             if (stage == ST_VS && idx == 0 && (off == SH_CB0_BASE_VERTEX || off == SH_CB0_BASE_INSTANCE))
@@ -1311,7 +1089,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                     textures[slot].array == array && !textures[slot].bindless && !textures[slot].flags)
                     break;
             if (slot == texture_count) {
-                if (texture_count >= SH_MAXTEX) return direct_reject(si, "texture descriptor count");
+                if (texture_count >= SH_MAXTEX) return snx_reject(si, "texture descriptor count");
                 textures[slot].cbuf_off = off;
                 textures[slot].type = (u8)type;
                 textures[slot].shadow = (u8)shadow;
@@ -1355,30 +1133,16 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             if (bindless && !handle_count)
                 read_slot = direct_memh_slot(flow, si, memh_at, &nmemh, textures, &texture_count, i, b, type, array,
                                              0, multisample);
-            if (read_slot == -2) return direct_reject(si, "texture descriptor count");
-            int choose = bindless && !handle_count && read_slot < 0;
-            ShHandleChoice choice = {0};
-            int candidates = choose ? shader_direct_handle_choice(flow, i, b, &choice) : 1;
-            if (!candidates) return shader_untracked_handle(si, "texture", insn, i, b);
-            if (choose && chosen_tex++ == 0)
-                shader_direct_handle_note(chosen_why, sizeof chosen_why, "TLD.B", i, b, &choice);
-            for (int cand = 0; cand < candidates; cand++) {
-                if (choose) {
-                    bank = choice.bank[cand];
-                    off = choice.off[cand];
-                    bank2 = choice.bank2[cand];
-                    off2 = choice.off2[cand];
-                }
-                int slot = read_slot >= 0
-                               ? read_slot
-                               : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, 0,
-                                                              multisample ? 2 : 0, bindless, bank,
-                                                              choose ? choice.words[cand] : handle_count, bank2, off2,
-                                                              indexed, ldc);
-                if (slot < 0) return direct_reject(si, "texture descriptor count");
-                tex_read |= 1ull << slot;
-                if (op->id == O_TLD ? !shader_direct_own_pixel_fetch(flow, i) : 1) tex_elsewhere |= 1ull << slot;
-            }
+            if (read_slot == -2) return snx_reject(si, "texture descriptor count");
+            if (bindless && !handle_count && read_slot < 0)
+                return shader_untracked_handle(si, "texture", insn, i, b);
+            if (read_slot < 0)
+                read_slot = shader_direct_add_typed_slot(textures, &texture_count, off, type, array, 0,
+                                                         multisample ? 2 : 0, bindless, bank, handle_count, bank2,
+                                                         off2, indexed, ldc);
+            if (read_slot < 0) return snx_reject(si, "texture descriptor count");
+            tex_read |= 1ull << read_slot;
+            if (op->id == O_TLD ? !shader_direct_own_pixel_fetch(flow, i) : 1) tex_elsewhere |= 1ull << read_slot;
             u32 coordinate_count = (type == 0 ? 1u : type == 1 ? 2u : 3u) + (u32)array;
             for (u32 k = 0; k < coordinate_count; k++)
                 if (a + k < 255) used[a + k] = 1;
@@ -1433,7 +1197,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                 int type = dim; /* 1, 3, 4 or 5: the forms shader_supported() takes here */
                 int slot = shader_direct_image_slot(&image_info, off, bindless, bank, r32ui, type);
                 if (slot == image_info.nimg) {
-                    if (slot >= 8) return direct_reject(si, "storage image descriptor count");
+                    if (slot >= 8) return snx_reject(si, "storage image descriptor count");
                     int different_format = !!(si->img_int_mask & (1u << slot));
                     int kind = r32ui ? 1 : (bindless != different_format ? 2 : 0);
                     if (!r32ui && (si->img_sint_mask & (1u << slot))) kind = 3;
@@ -1458,7 +1222,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                         (bindless && textures[slot].bl_cbuf != bank)))
                     slot++;
                 if (slot == texture_count) {
-                    if (slot >= SH_MAXTEX) return direct_reject(si, "texture descriptor count");
+                    if (slot >= SH_MAXTEX) return snx_reject(si, "texture descriptor count");
                     textures[slot].cbuf_off = off;
                     textures[slot].type = (u8)sample_type;
                     textures[slot].array = (u8)arrayed;
@@ -1558,7 +1322,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                     !textures[slot].shadow && !textures[slot].bindless && textures[slot].flags == (multisample ? 2 : 0))
                     break;
             if (slot == texture_count) {
-                if (texture_count >= SH_MAXTEX) return direct_reject(si, "texture descriptor count");
+                if (texture_count >= SH_MAXTEX) return snx_reject(si, "texture descriptor count");
                 textures[slot].cbuf_off = off;
                 textures[slot].type = (u8)type;
                 textures[slot].array = (u8)array;
@@ -1587,7 +1351,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             u32 mode = bindless ? B(insn[i], 37, 3) : B(insn[i], 55, 3);
             u32 clamp = B(insn[i], bindless ? 40 : 58, 1);
             if (clamp && stage == ST_FS && !g_spirv_translate.resource_min_lod)
-                return direct_reject(si, "fragment minimum LOD needs shaderResourceMinLod");
+                return snx_reject(si, "fragment minimum LOD needs shaderResourceMinLod");
             /* Explicit LOD (also every non-fragment sample) clamps LC through GLSL FMax. */
             if (clamp && (mode == 1 || mode == 3 || mode == 7 || stage != ST_FS)) needs_glsl = 1;
             u32 offset_enabled = B(insn[i], bindless ? 36 : 54, 1);
@@ -1609,32 +1373,48 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                                   ? direct_memh_slot(flow, si, memh_at, &nmemh, textures, &texture_count, i, b,
                                                      type, array, shadow, 0)
                                   : -1;
-            if (memory_slot == -2) return direct_reject(si, "texture descriptor count");
+            if (memory_slot == -2) return snx_reject(si, "texture descriptor count");
             /* a handle the writes don't agree on: each constant buffer handle that can reach it, chosen when it runs */
-            int choose = bindless && !handle_count && memory_slot < 0;
-            ShHandleChoice choice = {0};
-            int candidates = choose ? shader_direct_handle_choice(flow, i, b, &choice) : 1;
+            u32 cand_bank[SH_HANDLE_CANDIDATES], cand_off[SH_HANDLE_CANDIDATES];
+            u32 cand_bank2[SH_HANDLE_CANDIDATES], cand_off2[SH_HANDLE_CANDIDATES];
+            u8 cand_words[SH_HANDLE_CANDIDATES];
+            int pair_candidates = 0;
+            int candidates = bindless && !handle_count && memory_slot < 0
+                                 ? shader_direct_handle_candidates(flow, i, b, cand_bank, cand_off,
+                                                                   SH_HANDLE_CANDIDATES)
+                                 : 1;
+            if (!candidates && bindless && !handle_count && memory_slot < 0) {
+                candidates = shader_direct_handle_candidates_pair(flow, i, b, cand_bank, cand_off, cand_bank2,
+                                                                  cand_off2, cand_words, SH_HANDLE_CANDIDATES);
+                pair_candidates = candidates > 0;
+            }
             if (!candidates) return shader_untracked_handle(si, "texture", insn, i, b);
-            if (choose && chosen_tex++ == 0)
-                shader_direct_handle_note(chosen_why, sizeof chosen_why, "TEX.B", i, b, &choice);
+            if (bindless && !handle_count && memory_slot < 0 && chosen_tex++ == 0) {
+                int at = snprintf(chosen_why, sizeof chosen_why, "TEX.B at %x, R%u:", i * 8, b);
+                for (int cand = 0; cand < candidates && at > 0 && (size_t)at < sizeof chosen_why; cand++)
+                    at += snprintf(chosen_why + at, sizeof chosen_why - (size_t)at, "%s c[%u][0x%x]", cand ? "," : "",
+                                   cand_bank[cand], cand_off[cand] * 4);
+            }
             int read_slot = -1;
             for (int cand = 0; cand < candidates; cand++) {
                 if (memory_slot >= 0) {
                     read_slot = memory_slot;
                 } else {
-                    if (choose) {
-                        bank = choice.bank[cand];
-                        off = choice.off[cand];
-                        bank2 = choice.bank2[cand];
-                        off2 = choice.off2[cand];
+                    if (bindless && !handle_count) {
+                        bank = cand_bank[cand];
+                        off = cand_off[cand];
+                        if (pair_candidates) {
+                            bank2 = cand_bank2[cand];
+                            off2 = cand_off2[cand];
+                        }
                     }
-                    int handle_words = choose ? choice.words[cand] : (handle_count ? handle_count : 1);
+                    int handle_words = pair_candidates ? cand_words[cand] : (handle_count ? handle_count : 1);
                     read_slot = shader_direct_add_typed_slot(textures, &texture_count, off, type, array, shadow, 0,
                                                              bindless, bank, handle_words, bank2, off2, indexed, ldc);
                 }
-                if (read_slot < 0) return direct_reject(si, "texture descriptor count");
+                if (read_slot < 0) return snx_reject(si, "texture descriptor count");
                 tex_read |= 1ull << read_slot;
-                if (choose) tex_elsewhere |= 1ull << read_slot;
+                if (!handle_count && bindless && memory_slot < 0) tex_elsewhere |= 1ull << read_slot;
             }
             u32 coordinate = a + (array || clamp), dimensions = type == 0 ? 1 : type >= 2 ? 3 : 2;
             int plain = type == 1 && !array && !shadow && !offset_enabled && !clamp && mode <= 1;
@@ -1671,29 +1451,16 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                                   ? direct_memh_slot(flow, si, memh_at, &nmemh, textures, &texture_count, i, b, type,
                                                      array, 0, 0)
                                   : -1;
-            if (memory_slot == -2) return direct_reject(si, "texture descriptor count");
+            if (memory_slot == -2) return snx_reject(si, "texture descriptor count");
+            if (bindless && !handle_count && memory_slot < 0)
+                return shader_untracked_handle(si, "texture", insn, i, b);
             if (handle_count == 1) indexed = shader_direct_indexed_handle(flow, i, b, stage, &ldc);
-            int choose = bindless && !handle_count && memory_slot < 0;
-            ShHandleChoice choice = {0};
-            int candidates = choose ? shader_direct_handle_choice(flow, i, b, &choice) : 1;
-            if (!candidates) return shader_untracked_handle(si, "texture", insn, i, b);
-            if (choose && chosen_tex++ == 0)
-                shader_direct_handle_note(chosen_why, sizeof chosen_why, "TMML.B", i, b, &choice);
-            for (int cand = 0; cand < candidates; cand++) {
-                if (choose) {
-                    bank = choice.bank[cand];
-                    off = choice.off[cand];
-                    bank2 = choice.bank2[cand];
-                    off2 = choice.off2[cand];
-                }
-                int slot = memory_slot >= 0
-                               ? memory_slot
-                               : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, 0, 0,
-                                                              bindless, bank, choose ? choice.words[cand] : handle_count,
-                                                              bank2, off2, indexed, ldc);
-                if (slot < 0) return direct_reject(si, "texture descriptor count");
-                tex_asked |= 1ull << slot;
-            }
+            int asked_slot = memory_slot >= 0
+                                 ? memory_slot
+                                 : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, 0, 0,
+                                                                bindless, bank, handle_count, bank2, off2, indexed, ldc);
+            if (asked_slot < 0) return snx_reject(si, "texture descriptor count");
+            tex_asked |= 1ull << asked_slot;
             for (u32 k = 0; k < array + (type == 0 ? 1 : type == 1 ? 2 : 3); k++)
                 if (a + k < 255) used[a + k] = 1;
             if (bindless && b < 255) used[b] = 1;
@@ -1715,30 +1482,17 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                                   ? direct_memh_slot(flow, si, memh_at, &nmemh, textures, &texture_count, i, a, type,
                                                      array, 0, 0)
                                   : -1;
-            if (memory_slot == -2) return direct_reject(si, "texture descriptor count");
+            if (memory_slot == -2) return snx_reject(si, "texture descriptor count");
+            if (bindless && !handle_count && memory_slot < 0)
+                return shader_untracked_handle(si, "texture", insn, i, a);
             if (handle_count == 1) indexed = shader_direct_indexed_handle(flow, i, a, stage, &ldc);
-            int choose = bindless && !handle_count && memory_slot < 0;
-            ShHandleChoice choice = {0};
-            int candidates = choose ? shader_direct_handle_choice(flow, i, a, &choice) : 1;
-            if (!candidates) return shader_untracked_handle(si, "texture", insn, i, a);
-            if (choose && chosen_tex++ == 0)
-                shader_direct_handle_note(chosen_why, sizeof chosen_why, "TXD.B", i, a, &choice);
-            for (int cand = 0; cand < candidates; cand++) {
-                if (choose) {
-                    bank = choice.bank[cand];
-                    off = choice.off[cand];
-                    bank2 = choice.bank2[cand];
-                    off2 = choice.off2[cand];
-                }
-                int slot = memory_slot >= 0
-                               ? memory_slot
-                               : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, 0, 0,
-                                                              bindless, bank, choose ? choice.words[cand] : handle_count,
-                                                              bank2, off2, indexed, ldc);
-                if (slot < 0) return direct_reject(si, "texture descriptor count");
-                tex_read |= 1ull << slot;
-                tex_elsewhere |= 1ull << slot;
-            }
+            int read_slot = memory_slot >= 0
+                                ? memory_slot
+                                : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, 0, 0,
+                                                               bindless, bank, handle_count, bank2, off2, indexed, ldc);
+            if (read_slot < 0) return snx_reject(si, "texture descriptor count");
+            tex_read |= 1ull << read_slot;
+            tex_elsewhere |= 1ull << read_slot;
             u32 coord = a + (u32)bindless, aoffi = B(insn[i], 35, 1);
             for (u32 k = 0; k < count + (array || aoffi); k++)
                 if (a + k + (u32)bindless < 255) used[coord + k] = 1;
@@ -1759,70 +1513,42 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             u32 memory_probe = bindless && !handle_count
                                    ? shader_direct_memory_handle(flow, si, memh_at, &nmemh, i, a)
                                    : SH_PROBE_NONE;
-            int choose = bindless && !handle_count && memory_probe == SH_PROBE_NONE;
-            ShHandleChoice choice = {0};
-            int candidates = choose ? shader_direct_handle_choice(flow, i, a, &choice) : 1;
-            if (!candidates) return shader_untracked_handle(si, "texture", insn, i, a);
-            if (choose && chosen_tex++ == 0)
-                shader_direct_handle_note(chosen_why, sizeof chosen_why, "TXQ.B", i, a, &choice);
-            if (choose) {
-                for (int cand = 0; cand < candidates; cand++) {
-                    u32 qtype = 1, qarray = 0;
-                    int guessed = 0;
-                    if (!indexed &&
-                        !shader_direct_query_type(flow, bindless, choice.bank[cand], choice.off[cand], &qtype, &qarray)) {
-                        /* as below: a texture nothing else in the program reads takes the header's dimension once the
-                           renderer has bound it, and 2D before that */
-                        u8 hint = texture_count < SH_MAXTEX ? si->tex_query_hint[texture_count] : 0;
-                        if (hint) {
-                            qtype = (hint - 1) & 3;
-                            qarray = (hint - 1) >> 2 & 1;
-                        }
-                        guessed = 1;
+            if (bindless && !handle_count && memory_probe == SH_PROBE_NONE)
+                return shader_untracked_handle(si, "texture", insn, i, a);
+            u32 qtype = 1, qarray = 0;
+            int guessed = 0, qslot, have_type = 0;
+            if (memory_probe != SH_PROBE_NONE) {
+                for (int k = 0; k < texture_count; k++) {
+                    if ((textures[k].flags & SNX_TEX_MEMORY) && textures[k].cbuf_off == memory_probe) {
+                        qtype = textures[k].type;
+                        qarray = textures[k].array;
+                        have_type = 1;
+                        break;
                     }
-                    int qslot = shader_direct_add_typed_slot(textures, &texture_count, choice.off[cand], qtype, qarray,
-                                                             0, 0, bindless, choice.bank[cand], choice.words[cand],
-                                                             choice.bank2[cand], choice.off2[cand], indexed, ldc);
-                    if (qslot < 0) return direct_reject(si, "texture descriptor count");
-                    if (guessed) tex_query |= 1ull << qslot;
-                    tex_asked |= 1ull << qslot;
                 }
-            } else {
-                u32 qtype = 1, qarray = 0;
-                int guessed = 0, qslot, have_type = 0;
-                if (memory_probe != SH_PROBE_NONE) {
-                    for (int k = 0; k < texture_count; k++) {
-                        if ((textures[k].flags & SNX_TEX_MEMORY) && textures[k].cbuf_off == memory_probe) {
-                            qtype = textures[k].type;
-                            qarray = textures[k].array;
-                            have_type = 1;
-                            break;
-                        }
-                    }
-                } else if (indexed || shader_direct_query_type(flow, bindless, bank, off, &qtype, &qarray)) {
-                    have_type = 1;
-                }
-                if (!have_type) {
-                    /* nothing else in the program reads that texture (one game queries a volume through a bound
-                       handle and fetches it through a bindless one, which no tracking joins): the header's dimension,
-                       from the key, once the renderer has bound it; 2D before that */
-                    u8 hint = texture_count < SH_MAXTEX ? si->tex_query_hint[texture_count] : 0;
-                    if (hint) {
-                        qtype = (hint - 1) & 3;
-                        qarray = (hint - 1) >> 2 & 1;
-                    }
-                    guessed = 1;
-                }
-                qslot = memory_probe != SH_PROBE_NONE
-                            ? direct_memh_slot(flow, si, memh_at, &nmemh, textures, &texture_count, i, a, qtype,
-                                               qarray, 0, 0)
-                            : shader_direct_add_typed_slot(textures, &texture_count, off, qtype, qarray, 0, 0,
-                                                           bindless, bank, handle_count, bank2, off2, indexed, ldc);
-                if (qslot == -2) return direct_reject(si, "texture descriptor count");
-                if (qslot < 0) return direct_reject(si, "texture descriptor count");
-                if (guessed) tex_query |= 1ull << qslot;
-                tex_asked |= 1ull << qslot;
+            } else if (indexed || shader_direct_query_type(flow, bindless, bank, off, &qtype, &qarray)) {
+                have_type = 1;
             }
+            if (!have_type) {
+                /* nothing else in the program reads that texture (one game queries a volume through a bound handle
+                   and fetches it through a bindless one, which no tracking joins): the header's dimension, from the
+                   key, once the renderer has bound it; 2D before that */
+                u8 hint = texture_count < SH_MAXTEX ? si->tex_query_hint[texture_count] : 0;
+                if (hint) {
+                    qtype = (hint - 1) & 3;
+                    qarray = (hint - 1) >> 2 & 1;
+                }
+                guessed = 1;
+            }
+            qslot = memory_probe != SH_PROBE_NONE
+                        ? direct_memh_slot(flow, si, memh_at, &nmemh, textures, &texture_count, i, a, qtype, qarray,
+                                           0, 0)
+                        : shader_direct_add_typed_slot(textures, &texture_count, off, qtype, qarray, 0, 0, bindless,
+                                                       bank, handle_count, bank2, off2, indexed, ldc);
+            if (qslot == -2) return snx_reject(si, "texture descriptor count");
+            if (qslot < 0) return snx_reject(si, "texture descriptor count");
+            if (guessed) tex_query |= 1ull << qslot;
+            tex_asked |= 1ull << qslot;
             needs_image_query = 1;
             if (a < 255) used[a] = 1;
             if (bindless && a + 1 < 255) used[a + 1] = 1;
@@ -1847,29 +1573,16 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                                   ? direct_memh_slot(flow, si, memh_at, &nmemh, textures, &texture_count, i, b, type,
                                                      array, shadow, 0)
                                   : -1;
-            if (memory_slot == -2) return direct_reject(si, "texture descriptor count");
-            int choose = bindless && !handle_count && memory_slot < 0;
-            ShHandleChoice choice = {0};
-            int candidates = choose ? shader_direct_handle_choice(flow, i, b, &choice) : 1;
-            if (!candidates) return shader_untracked_handle(si, "texture", insn, i, b);
-            if (choose && chosen_tex++ == 0)
-                shader_direct_handle_note(chosen_why, sizeof chosen_why, "TLD4.B", i, b, &choice);
-            for (int cand = 0; cand < candidates; cand++) {
-                if (choose) {
-                    bank = choice.bank[cand];
-                    off = choice.off[cand];
-                    bank2 = choice.bank2[cand];
-                    off2 = choice.off2[cand];
-                }
-                int slot = memory_slot >= 0
-                               ? memory_slot
-                               : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, shadow, 0,
-                                                              bindless, bank, choose ? choice.words[cand] : handle_count,
-                                                              bank2, off2, indexed, ldc);
-                if (slot < 0) return direct_reject(si, "texture descriptor count");
-                tex_read |= 1ull << slot;
-                tex_elsewhere |= 1ull << slot;
-            }
+            if (memory_slot == -2) return snx_reject(si, "texture descriptor count");
+            if (bindless && !handle_count && memory_slot < 0)
+                return shader_untracked_handle(si, "texture", insn, i, b);
+            int read_slot = memory_slot >= 0
+                                ? memory_slot
+                                : shader_direct_add_typed_slot(textures, &texture_count, off, type, array, shadow, 0,
+                                                               bindless, bank, handle_count, bank2, off2, indexed, ldc);
+            if (read_slot < 0) return snx_reject(si, "texture descriptor count");
+            tex_read |= 1ull << read_slot;
+            tex_elsewhere |= 1ull << read_slot;
             if (a < 255) used[a] = 1;
             if (op->id == O_TLD4S) {
                 if (b < 255) used[b] = 1;
@@ -1980,12 +1693,14 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
        subgroups in the fragment stage, runs each invocation as one lane alone too, the lane of its place in its 2x2
        quad (DirectCtx.quad_lane, from FragCoord): its ballot is that lane's bit, the votes are its predicate,
        FSWZADD takes the mode of its place, a SHFL within the quad reads the other pixel's register through fine
-       derivatives (emit_thread.c's quad_read; dFdx and dFdy are SHFL.BFLY then FSWZADD on the console) and any other
-       SHFL keeps its own value. Those reads take every pixel of the quad in step, as derivatives do */
+       derivatives (sail/sm53_thread_spirv.h's quad_read; dFdx and dFdy are SHFL.BFLY then FSWZADD on the console) and any other
+       SHFL keeps its own value. Those reads take every pixel of the quad in step, as derivatives do.
+       A compute program's warps are whole, so on a device whose subgroups are narrower one runs as lone lanes only where
+       warp_idioms.c shows that gives what the console does (shader_lone_lane_gives, once it is written) */
     int quad_lane = stage == ST_FS && !can_subgroup && (votes || swizzle_lanes || lane_used);
-    int lone_lane = quad_lane ||
-                    (votes && !swizzle_lanes && !can_subgroup && (stage == ST_VS || stage == ST_TES || stage == ST_GS));
-    int lane_model = quad_lane || ((!needs_subgroup || lone_lane) && stage != ST_FS && stage != ST_CS);
+    int lone_lane = quad_lane || (votes && !swizzle_lanes && !can_subgroup &&
+                                  (stage == ST_VS || stage == ST_TES || stage == ST_GS || stage == ST_CS));
+    int lane_model = quad_lane || (stage == ST_CS ? lone_lane : (!needs_subgroup || lone_lane) && stage != ST_FS);
     int lane_is_invocation = lane_model && stage == ST_TCS;
     if (lane_used && lane_is_invocation) invocation_used = 1;
     if (lane_used && !lane_model) needs_subgroup = 1;
@@ -1996,10 +1711,10 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         if (quad_reads) needs_derivatives = 1;
     }
     if (needs_f16 && (g_spirv_translate.half_rounding & 2)) needs_f64 = 1;
-    if (!has_exit) return direct_reject(si, "missing exit");
-    if (has_pexit && has_conditional_exit) return direct_reject(si, "conditional EXIT with PEXIT token");
-    if (needs_subgroup && !can_subgroup) return direct_reject(si, "subgroup ballot/shuffle unavailable");
-    if (needs_f64 && !can_preserve_f64) return direct_reject(si, "FP64 float controls unavailable");
+    if (!has_exit) return snx_reject(si, "missing exit");
+    if (has_pexit && has_conditional_exit) return snx_reject(si, "conditional EXIT with PEXIT token");
+    if (needs_subgroup && !can_subgroup) return snx_reject(si, "subgroup ballot/shuffle unavailable");
+    if (needs_f64 && !can_preserve_f64) return snx_reject(si, "FP64 float controls unavailable");
     /* The flow loop runs one block per iteration, so lanes that took the two sides of a branch reach the join on
        different iterations, and VOTE, SHFL and BAR would see part of the warp. Each iteration runs only the lanes
        at the subgroup's lowest pc, as the hardware reconverges: lanes ahead wait for the others to reach them. */
@@ -2013,15 +1728,19 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
        mode is the whole module's). Never on a device that flushes by itself, which also flushes those that keep them:
        the flush would change no bit */
     int soft_ftz_on = can_flush != SH_FTZ_NATIVE && (can_flush == SH_FTZ_EMULATE || fp32_preserve);
-    if (needs_shared && (stage != ST_CS || si->shared_size <= 0)) return direct_reject(si, "shared memory size");
+    if (needs_shared && (stage != ST_CS || si->shared_size <= 0)) return snx_reject(si, "shared memory size");
     for (int i = 0; i < texture_count; i++)
-        if (textures[i].shadow && (si->tex_int_mask & (1ull << i))) return direct_reject(si, "integer shadow texture");
+        if (textures[i].shadow && (si->tex_int_mask & (1ull << i))) return snx_reject(si, "integer shadow texture");
     u32* pop_targets = has_stack || has_return ? calloc(n, sizeof *pop_targets) : NULL;
     if ((has_stack || has_return) && !pop_targets) return NULL;
     /* why the program's flow runs in the dispatch loop below, for the log (ShaderInfo.flow_why) */
     char flow_why[sizeof si->flow_why] = "";
     int crs_static =
         !has_pexit && (has_stack || has_return) && shader_resolve_crs(insn, n, pop_targets, flow_why, sizeof flow_why);
+    /* a rare decision: why the control stack stays at run time instead of being resolved here */
+    SNX_ZONE_T(z_snx_crs, "shader control stack", "%s",
+               !has_stack && !has_return ? "none" : crs_static ? "static" : flow_why[0] ? flow_why : "dynamic");
+    SNX_ZONE_END(z_snx_crs);
     int dynamic_stack = has_pexit || (has_stack && !crs_static);
     /* where the walk follows the stack, each RET branches to its PRET's target or ends the program: only calls, and
        returns it can't follow, keep a stack of return points at run time */
@@ -2054,23 +1773,9 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         else if (op == O_MOV_C) {
             tag = shader_gbuf_tag(stage, B(w, 34, 5), B(w, 20, 14) * 4);
             if (!tag) tag = shader_gbuf_tag_any(stage, B(w, 34, 5), B(w, 20, 14) * 4);
-        } else if (op == O_LDC && (B(w, 48, 3) == 4 || B(w, 48, 3) == 5)) {
-            /* LDC.IS/ISL reads a pointer through a register-indexed constant table too. A bare bank's words are
-               pointers, so every indexed slot is a candidate: the renderer binds their mapped runs as windows and
-               shader_global_dynamic selects the one holding the address. A fixed bank-0 descriptor stays direct. */
-            u32 bank = B(w, 36, 5), off = (u32)(i32)(i16)B(w, 20, 16);
-            if (a != 255 && bank < 18 && off < 0x10000) {
-                /* The immediate byte offset only chooses the table's first entry; its descriptor is always window 0,
-                   and carries the offset for the renderer's scan of the bank. Bank 0's 16-byte descriptors stay
-                   direct. A fragment program reads its windows at SNX_VKB_MBASEFS (vk/render.c writes them there). */
-                if (bank > 0)
-                    tag = (SH_GBUF_TABLE_KEY(bank, 0) | off) + 1;
-                else
-                    tag = 0xcbf; /* reject if a global access consumes it */
-            } else {
-                tag = shader_gbuf_tag(stage, bank, off);
-                if (!tag) tag = shader_gbuf_tag_any(stage, bank, off);
-            }
+        } else if (op == O_LDC && a == 255 && (B(w, 48, 3) == 4 || B(w, 48, 3) == 5)) {
+            tag = shader_gbuf_tag(stage, B(w, 36, 5), (u32)(i32)(i16)B(w, 20, 16));
+            if (!tag) tag = shader_gbuf_tag_any(stage, B(w, 36, 5), (u32)(i32)(i16)B(w, 20, 16));
         } else if (op == O_MOV_R)
             tag = b == 255 ? 0 : gtags[b];
         else if (op == O_IADD32I && a < 255)
@@ -2129,19 +1834,11 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                 untracked_at = i;
                 untracked_reg = a;
                 return shader_untracked_reject(si, insn, untracked_at, untracked_reg, gb_at, pop_targets);
-            } else if (current == 0xcbf) {
-                free(gb_at);
-                free(pop_targets);
-                return direct_reject(si, "register-indexed global base has no dynamic path for this stage or bank");
-            } else if (SH_GBUF_TABLE((u32)(current - 1)) && op != O_LDG && op != O_STG) {
-                free(gb_at);
-                free(pop_targets);
-                return direct_reject(si, "dynamic global atomic from a register-indexed constant table");
             } else if (current == 0xcbe) {
                 if (op != O_STG) {
                     free(gb_at);
                     free(pop_targets);
-                    return direct_reject(si, "direct CBE address used for a non-export operation");
+                    return snx_reject(si, "direct CBE address used for a non-export operation");
                 }
                 gb_at[i] = 255; /* disabled direct CBE export */
             } else {
@@ -2152,22 +1849,19 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                     if (ngbuf == (needs_shared && si->shared_spill ? SH_SHARED_SPILL : 16)) {
                         free(gb_at);
                         free(pop_targets);
-                        return direct_reject(si, needs_shared && si->shared_spill
+                        return snx_reject(si, needs_shared && si->shared_spill
                                                      ? "global buffer count, with the shared memory in a buffer"
                                                      : "global buffer count");
                     }
                     gbuf_off[ngbuf++] = descriptor;
                 }
-                gb_at[i] = SH_GBUF_TABLE(descriptor) ? GB_DYNAMIC : (u8)(slot + 1);
+                gb_at[i] = (u8)(slot + 1);
                 if (op != O_LDG) gbuf_wmask |= 1u << slot;
                 if (op != O_STG) gbuf_rmask |= 1u << slot; /* a load or an atomic */
                 {
                     u32 bank = SH_GBUF_BANK(descriptor), at = SH_GBUF_OFFSET(descriptor);
                     cbuf_used[bank] = 1;
-                    if (SH_GBUF_TABLE(descriptor))
-                        cbuf_max[bank] = 65536; /* the register index may name any entry, not only the immediate one */
-                    else if ((at | 15u) + 1 > cbuf_max[bank])
-                        cbuf_max[bank] = (at | 15u) + 1;
+                    if ((at | 15u) + 1 > cbuf_max[bank]) cbuf_max[bank] = (at | 15u) + 1;
                 }
             }
         }
@@ -2178,26 +1872,6 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         for (r = second; r < second + 2 && r < 255; r++)
             if (shader_writes_reg(w, op, r)) gtags[r] = 0;
         if (shader_writes_reg(w, op, d)) gtags[d] = tag;
-    }
-    /* An indexed LDC names a bank of pointers, not one buffer. The scan reserved its first window; fill the slots
-       left beside the fixed buffers with the other windows, as SM86 does. Their masks copy window 0's dynamic use. */
-    u32 ntables = 0;
-    for (int slot = 0; slot < ngbuf; slot++)
-        if (SH_GBUF_TABLE(gbuf_off[slot])) ntables++;
-    if (ntables) {
-        u32 limit = si->shared_spill ? 15 : 16;
-        u32 windows = (limit - ngbuf + ntables) / ntables;
-        if (windows > SH_GBUF_TABLE_MAX) windows = SH_GBUF_TABLE_MAX;
-        u32 fixed_ngbuf = ngbuf;
-        for (int slot = 0; slot < fixed_ngbuf; slot++) {
-            if (!SH_GBUF_TABLE(gbuf_off[slot])) continue;
-            u32 bank = SH_GBUF_BANK(gbuf_off[slot]);
-            for (u32 window = 1; window < windows; window++, ngbuf++) {
-                gbuf_off[ngbuf] = SH_GBUF_TABLE_KEY(bank, window) | SH_GBUF_OFFSET(gbuf_off[slot]);
-                if (gbuf_rmask >> slot & 1) gbuf_rmask |= 1u << ngbuf;
-                if (gbuf_wmask >> slot & 1) gbuf_wmask |= 1u << ngbuf;
-            }
-        }
     }
     /* an untracked access needs a tracked buffer to be in; one that stores may write any of them */
     if (untracked_at && ngbuf) {
@@ -2225,52 +1899,52 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
        primitive), the evaluation program's domain, spacing and output (ShaderInfo.rt_int_mask), and the geometry
        program's input and output primitives */
     if (stage == ST_TCS && (!out_vertices || out_vertices > 32))
-        return direct_reject_with_buffers(si, "patch output vertices", pop_targets, gb_at);
+        return snx_reject_buffers(si, "patch output vertices", pop_targets, gb_at);
     /* a mask of viewport 0 takes the place of an index the program writes, which the translation, keeping the
        index, wouldn't */
     if (viewport_mask_one && viewport_used)
-        return direct_reject_with_buffers(si, "viewport mask 1 beside a viewport index: viewport 0 or the index's",
+        return snx_reject_buffers(si, "viewport mask 1 beside a viewport index: viewport 0 or the index's",
                                           pop_targets, gb_at);
     /* Only the last active vertex-processing stage selects the layer and viewport. A control program can write
        these outputs, but its later evaluation stage makes them inert. They have no downstream builtin inputs. */
     if (stage == ST_TCS) layer_output_used = viewport_used = 0;
     if (viewport_used && !(g_spirv_translate.viewport_index & (stage == ST_GS ? 2 : 1)))
-        return direct_reject_with_buffers(si, "viewport index output unavailable", pop_targets, gb_at);
+        return snx_reject_buffers(si, "viewport index output unavailable", pop_targets, gb_at);
     if ((point_size_used || point_in_used) && stage == ST_TCS && !g_spirv_translate.stage_point_size)
-        return direct_reject_with_buffers(si, "tessellation point size unavailable", pop_targets, gb_at);
+        return snx_reject_buffers(si, "tessellation point size unavailable", pop_targets, gb_at);
     if (stage == ST_TES && ((si->rt_int_mask & 3) == 3 || ((si->rt_int_mask >> 4) & 3) == 3))
-        return direct_reject_with_buffers(si, "tessellation domain or spacing", pop_targets, gb_at);
+        return snx_reject_buffers(si, "tessellation domain or spacing", pop_targets, gb_at);
     if (stage == ST_GS && in_vertices != 1 && in_vertices != 2 && in_vertices != 3 && in_vertices != 4 &&
         in_vertices != 6)
-        return direct_reject_with_buffers(si, "geometry input primitive", pop_targets, gb_at);
+        return snx_reject_buffers(si, "geometry input primitive", pop_targets, gb_at);
     if (stage == ST_GS && !passthrough && ((sph[3] >> 24) & 15) != 1 && ((sph[3] >> 24) & 15) != 6 &&
         ((sph[3] >> 24) & 15) != 7)
-        return direct_reject_with_buffers(si, "geometry output topology", pop_targets, gb_at);
+        return snx_reject_buffers(si, "geometry output topology", pop_targets, gb_at);
     if (stage == ST_GS && ((sph[4] & 0xfff) > 256 || (sph[2] >> 24) > 32))
-        return direct_reject_with_buffers(si, "geometry output vertices or invocations", pop_targets, gb_at);
+        return snx_reject_buffers(si, "geometry output vertices or invocations", pop_targets, gb_at);
     u32 stream_mask = 0;
     for (u32 b = 0; b < 4; b++) {
         if (!si->xfb.count[b]) continue;
         if (si->xfb.stream[b] > 3 || (si->xfb.stream[b] && stage != ST_GS))
-            return direct_reject_with_buffers(si, "transform feedback stream", pop_targets, gb_at);
+            return snx_reject_buffers(si, "transform feedback stream", pop_targets, gb_at);
         if (si->xfb.stream[b]) stream_mask |= 1u << si->xfb.stream[b];
     }
     if (stream_mask && !g_spirv_translate.geometry_streams)
-        return direct_reject_with_buffers(si, "geometry streams unavailable", pop_targets, gb_at);
+        return snx_reject_buffers(si, "geometry streams unavailable", pop_targets, gb_at);
     if (stream_mask && !g_spirv_translate.geometry_streams_lines_triangles && ((sph[3] >> 24) & 15) != 1)
-        return direct_reject_with_buffers(si, "nonpoint transform feedback streams unavailable", pop_targets, gb_at);
+        return snx_reject_buffers(si, "nonpoint transform feedback streams unavailable", pop_targets, gb_at);
     /* Each distinct handle range and sampled image kind needs its own descriptor table. */
     for (k_indexed = 0; k_indexed < texture_count; k_indexed++) {
         const ShTex* t = &textures[k_indexed];
         if (!(t->flags & SNX_TEX_INDEXED)) continue;
         if ((t->flags & 1) || ((t->flags & 2) && stage == ST_CS))
-            return direct_reject_with_buffers(si, "indexed raw or compute multisample texture", pop_targets, gb_at);
+            return snx_reject_buffers(si, "indexed raw or compute multisample texture", pop_targets, gb_at);
         indexed_shadow |= t->shadow;
         int table = 0;
         while (table < indexed_count && !shader_same_indexed_table(t, &textures[first_indexed[table]])) table++;
         if (table == indexed_count) {
             if (indexed_count == SH_INDEXED_TABLES)
-                return direct_reject_with_buffers(si, "indexed texture table count", pop_targets, gb_at);
+                return snx_reject_buffers(si, "indexed texture table count", pop_targets, gb_at);
             first_indexed[indexed_count++] = k_indexed;
         }
         indexed_table[k_indexed] = table;
@@ -2291,7 +1965,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             ((si->advanced_blend >> 44) & 3) > 2 ||
             ((si->advanced_blend_mask & SH_BLEND_MULTISAMPLE) &&
              (!(si->advanced_blend_mask >> 8 & 63) || (si->advanced_blend_mask >> 8 & 63) > 32)))
-            return direct_reject_with_buffers(si, "programmable blend interface", pop_targets, gb_at);
+            return snx_reject_buffers(si, "programmable blend interface", pop_targets, gb_at);
         needs_fragcoord = needs_demote = 1;
         if (si->advanced_blend_mask & SH_BLEND_ARRAY) layer_input_used = 1;
         if (si->advanced_blend_mask & SH_BLEND_MULTISAMPLE) needs_coverage = 1;
@@ -2307,7 +1981,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         if ((predraw & ~(own & predraw_capable(textures, texture_count, si))) || advanced_blend || si->late_depth ||
             (si->advanced_blend_mask & SH_CAPTURE_TILED) || snx_popcount64(predraw) > SH_PREDRAW_MAX ||
             image_info.nimg + 1 + (int)snx_popcount64(predraw) > 8)
-            return direct_reject_with_buffers(si, "pre-draw capture interface", pop_targets, gb_at);
+            return snx_reject_buffers(si, "pre-draw capture interface", pop_targets, gb_at);
         needs_fragcoord = 1;
     }
     if (stage == ST_FS && (si->advanced_blend_mask & SH_CAPTURE_TILED)) {
@@ -2317,7 +1991,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     if (si->coverage_to_color) {
         if (stage != ST_FS || si->coverage_to_color > 8 || advanced_blend ||
             !(si->rt_int_mask & (1u << (si->coverage_to_color - 1))))
-            return direct_reject_with_buffers(si, "coverage-to-color integer output", pop_targets, gb_at);
+            return snx_reject_buffers(si, "coverage-to-color integer output", pop_targets, gb_at);
         needs_coverage = 1;
     }
     /* the per-vertex pass: the generics it takes, and a generic of the three positions, which nothing else may use */
@@ -2328,17 +2002,21 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         for (u32 g = pv_flat ? pv_slot + 1 : 32; g < 32 && g < shader_varying_copy(pv_mask, pv_slot, 32, 0); g++)
             taken |= inputs_used[g];
         if (ipa_indexed || legacy_fs || taken || (pv_flat && shader_varying_copy(pv_mask, pv_slot, 32, 0) > 32))
-            return direct_reject_with_buffers(si, "a per-vertex pass over indexed, legacy or the position's inputs",
+            return snx_reject_buffers(si, "a per-vertex pass over indexed, legacy or the position's inputs",
                                               pop_targets, gb_at);
         if (pv_mask) needs_frag_ndc = needs_fragcoord = 1;
     }
     if (position_slot && (position_slot > 32 || indexed_store || outputs_used[position_slot - 1]))
-        return direct_reject_with_buffers(si, "the position's copy onto a generic the program writes", pop_targets,
+        return snx_reject_buffers(si, "the position's copy onto a generic the program writes", pop_targets,
                                           gb_at);
     /* a capture's push constants have their own third vector */
     if (needs_frag_ndc && (si->advanced_blend_mask & SH_CAPTURE_SOURCE))
-        return direct_reject_with_buffers(si, "a varying pass in a capture's fragment program", pop_targets, gb_at);
+        return snx_reject_buffers(si, "a varying pass in a capture's fragment program", pop_targets, gb_at);
+    SNX_ZONE_END(z_snx_dataflow);
+    if (phase) phase[PH_DATAFLOW] += plat_ns() - pt;
     /* the program's blocks and its structure, before the module is started: a refusal here has nothing to undo */
+    pt = phase ? plat_ns() : 0;
+    SNX_ZONE(z_snx_structure, "shader structure");
     u32 *case_labels = NULL, *case_literals = NULL;
     u8* block_start = NULL;
     size_t case_count = 0;
@@ -2404,9 +2082,27 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             char why[sizeof si->first_unsupported];
             snprintf(why, sizeof why, "derivatives after flow, without fragment subgroups, in a program with %s", with);
             free(case_labels);
-            return direct_reject_with_buffers(si, why, pop_targets, gb_at);
+            return snx_reject_buffers(si, why, pop_targets, gb_at);
         }
     }
+    if (has_flow && flow_why[0]) {
+        SNX_ZONE_TEXT(z_snx_structure, "dispatch loop: %s", flow_why);
+        SNX_ZONE_VALUE(z_snx_structure, 1);
+        SNX_PLOT("shader flow fallback", 1);
+    }
+    SNX_ZONE_END(z_snx_structure);
+    if (phase) phase[PH_STRUCTURE] += plat_ns() - pt;
+    {
+        u32 nb = 0;
+        if (block_start)
+            for (u32 i = 11; i < n; i++)
+                if (IDX_OK(i) && block_start[i]) nb++;
+        SNX_PLOT("shader instructions", (double)n);
+        SNX_PLOT("shader blocks", (double)(nb ? nb : 1));
+        SNX_PLOT("shader branches", (double)flow->nflow);
+    }
+    pt = phase ? plat_ns() : 0;
+    SNX_ZONE(z_snx_alloc, "shader alloc");
     DirectCtx* c = calloc(1, sizeof *c);
     if (!c) {
         free(case_labels);
@@ -2925,14 +2621,6 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
             &c->emit, vec4_u32, c->u32_type, c->u32_type, shader_vk_set(stage), i, 4096, &c->cbuf_pointer[i]);
         interfaces[count++] = c->cbuf[i];
     }
-    int needs_mbase = 0;
-    for (int i = 0; i < ngbuf; i++) needs_mbase |= SH_GBUF_TABLE(gbuf_off[i]);
-    if (needs_mbase) {
-        c->mbase = spv_emit_uniform_vec4_array(&c->emit, vec4_u32, c->u32_type, c->u32_type, shader_vk_set(stage),
-                                               stage == ST_FS ? SNX_VKB_MBASEFS : SNX_VKB_MBASE, 16,
-                                               &c->mbase_pointer);
-        interfaces[count++] = c->mbase;
-    }
     if (indexed_shadow) {
         c->tex_func_buffer =
             spv_emit_uniform_vec4_array(&c->emit, vec4_u32, c->u32_type, c->u32_type, shader_vk_tex_set(stage),
@@ -3383,6 +3071,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     }
 
     size_t case_index = 0;
+    shader_direct_memory_finish(flow, si, memh_at, nmemh, textures, texture_count);
     const Tr tr = {
         .si = si,
         .stage = stage,
@@ -3497,6 +3186,12 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         .block_start = block_start,
         .structure = structure,
     };
+    SNX_ZONE_END(z_snx_alloc);
+    if (phase) phase[PH_ALLOC] += plat_ns() - pt;
+    pt = phase ? plat_ns() : 0;
+    SNX_ZONE(z_snx_emit, "shader emission");
+    ShNotes notes = {0};
+    if (lone_lane && stage == ST_CS) c->notes = &notes;
     for (u32 i = 11; structure || i < n; i++) {
         /* structured: the blocks in the order their constructs need, the constructs written between them */
         while (structure && i >= se.body_end) {
@@ -3546,6 +3241,7 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
         u64 w = insn[i];
         int op = (i < n ? flow->op[i] : decode(w))->id;
         u32 d = B(w, 0, 8), a = B(w, 8, 8), b = B(w, 20, 8);
+        notes.at = i;
         u32 guard_merge = 0;
         c->guard = 0; /* the instruction before may have ended its translation early */
         if (structure && (op == O_BRA || op == O_SYNC || op == O_BRK || op == O_CONT || op == O_RET)) {
@@ -3578,16 +3274,8 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                 spv_emit_label(&c->emit, execute);
             }
         }
-        /* the instruction to the family whose branches take its opcode */
-        switch (op_family(op)) {
-            case FAM_FLOW: emit_flow(&tr, i, w, op, d, a, b); break;
-            case FAM_IO: emit_io(&tr, i, w, op, d, a, b); break;
-            case FAM_THREAD: emit_thread(&tr, i, w, op, d, a, b); break;
-            case FAM_INT: emit_int(&tr, i, w, op, d, a, b); break;
-            case FAM_FLOAT: emit_float(&tr, i, w, op, d, a, b); break;
-            case FAM_MEMORY: emit_memory(&tr, i, w, op, d, a, b); break;
-            case FAM_TEXTURE: emit_texture(&tr, i, w, op, d, a, b); break;
-        }
+        /* the instruction, from its Sail (sm53_sail.c, sail/sm53.sail): one no root takes was refused before */
+        sm53_sail_emit(&tr, i, w, op, d, a, b);
         /* no texture is sparse, so every texel a fetch reads is resident */
         pred_write(c, shader_sparse_predicate(w, op), c->false_value);
         c->guard = 0;
@@ -3645,10 +3333,16 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
                                  frontface, depth_buffer, advanced_blend ? outputs[0] : 0, blend_image, blend_image_type);
     spv_emit_function_end(&c->emit);
     u32* result = spv_emit_finish(&c->emit, word_count);
+    SNX_ZONE_END(z_snx_emit);
+    if (phase) phase[PH_EMIT] += plat_ns() - pt;
     u32 spec = 0;
     for (u32 id = 0; id < SH_SPEC_COUNT; id++)
         if (c->spec[id]) spec |= 1u << id;
     spv_emit_destroy(&c->emit);
+    char lone_why[sizeof si->first_unsupported] = "";
+    int lone_wrong = c->notes && !shader_lone_lane_gives(flow, crs_static || !has_stack ? pop_targets : NULL, &notes,
+                                                         si, lone_why, sizeof lone_why);
+    free(notes.word);
     free(c->ftz);
     free(c->ftz_of);
     free(c->ftz_of_block);
@@ -3658,6 +3352,10 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     free(se.label); /* and what was used */
     free(pop_targets);
     free(gb_at);
+    if (lone_wrong) {
+        free(result);
+        return snx_reject(si, lone_why);
+    }
     ShaderInfo next = {0};
     next.stage = stage;
     next.chosen_tex = chosen_tex;
@@ -3752,6 +3450,14 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
     next.mixed_sample_invariant = mixed_sample_invariant && !next.in_mask && !needs_fragcoord && !needs_sample_id &&
                                   !texture_count && !ngbuf && !image_info.nimg && !(sph[19] & 3u) &&
                                   !si->advanced_blend && !si->advanced_blend_mask && !si->coverage_to_color;
+    /* a variant can be shared between sample counts only when no guest value depends on the invocation: the trace
+       marks whether that held, so a hit or a miss of that sharing is visible. The conditions are the ones below */
+    if (stage == ST_FS) {
+        const char* variant_why = next.mixed_sample_invariant ? "shader variant shared: sample invariant"
+                                                              : "shader variant per sample";
+        SNX_MSG(variant_why, strlen(variant_why));
+        SNX_PLOT("shader sample-invariant", (double)next.mixed_sample_invariant);
+    }
     if (indexed_store) next.out_mask = ~0u;
     memcpy(next.sph, sph, sizeof sph);
     if (si->coverage_to_color) next.sph[18] |= 15u << ((si->coverage_to_color - 1) * 4);
@@ -3760,49 +3466,94 @@ static u32* translate(const u8* code, const u64* insn, u32 max_bytes, int stage,
 }
 u32* shader_to_spirv(const u8* code, u32 max_bytes, int stage, ShaderInfo* si, size_t* word_count, int can_flush,
                      int can_preserve, int can_preserve_f64, int can_subgroup) {
+    /* one zone around the whole Maxwell translation, so its span can be read against the SM86 one; the gate keeps
+       the clock read out of a run with no client */
+    int trace = snx_tracy_enter();
+    u64 t0 = trace ? plat_ns() : 0;
+    if (trace) snx_tracy_leave();
+    SNX_ZONE_CS(z_snx_maxwell, "shader translate maxwell", 4); /* four frames: the compile's caller, not the worker's whole stack */
+    /* a stage and code size from the start: an early rejection returns before the phase text and value below */
+    SNX_ZONE_VALUE(z_snx_maxwell, stage);
+    SNX_ZONE_TEXT(z_snx_maxwell, "stage %d, %u code bytes", stage, max_bytes);
     u64* copy;
     const u64* insn;
     u32* r;
+    u64 phase[PH_N] = {0}, h = 0;
+    u64* timing = trace ? phase : NULL; /* no clock reads in a run with no client; NULL turns phase timing off */
     if (si) si->mixed_sample_invariant = si->primitive_split_safe = 0;
     if (!code) return NULL;
     if (si && (!shader_coverage_r1_valid(si->advanced_blend_mask) ||
         ((si->advanced_blend_mask & SH_COVERAGE_R1) && (stage != ST_FS || !can_preserve))))
-        return direct_reject(si, "ratio-one coverage key");
+        return snx_reject(si, "ratio-one coverage key");
     if (si && (si->late_depth > 1 || si->capture_outputs == 1 || si->capture_outputs > 7 ||
         ((si->late_depth || si->capture_outputs || (si->advanced_blend_mask & SH_CAPTURE_SOURCE)) && stage != ST_FS) ||
         (si->capture_outputs && !(si->advanced_blend_mask & SH_CAPTURE_SOURCE))))
-        return direct_reject(si, "fragment epilogue configuration");
+        return snx_reject(si, "fragment epilogue configuration");
     if (si && si->late_depth &&
         ((!si->advanced_blend && !si->coverage_to_color) || !can_preserve ||
          si->early_fragment_tests || si->coverage_early_tests ||
          (si->advanced_blend_mask & (SH_BLEND_ARRAY | SH_BLEND_MULTISAMPLE | SH_BLEND_EARLY_TESTS |
                                     SH_CAPTURE_SOURCE | SH_CAPTURE_TILED)) ||
          ((si->advanced_blend_mask & SH_ALPHA_COVERAGE) && (si->advanced_blend_mask >> 8 & 63) != 1)))
-        return direct_reject(si, "late depth interface");
+        return snx_reject(si, "late depth interface");
     if (si) {
         u32 alpha = si->advanced_blend_mask & (SH_ALPHA_COVERAGE | SH_ALPHA_COVERAGE_DITHER | SH_ALPHA_TO_ONE);
         u32 samples = si->advanced_blend_mask >> 8 & 63;
         if ((alpha && stage != ST_FS) ||
             ((alpha & SH_ALPHA_COVERAGE_DITHER) && !(alpha & SH_ALPHA_COVERAGE)) ||
             ((alpha & SH_ALPHA_COVERAGE) && (!samples || samples > 16 || (samples & (samples - 1)))))
-            return direct_reject(si, "alpha coverage key");
+            return snx_reject(si, "alpha coverage key");
     }
     insn = shader_words(code, max_bytes, &copy);
     if (!insn) return NULL;
     u64* moved = NULL;
     u32 legacy_fs = 0, len = 0, sph[20];
     if (stage >= ST_VS && stage <= ST_FS && max_bytes >= 96) {
-        shader_hash(code, max_bytes, &len);
+        h = shader_hash(code, max_bytes, &len);
+        SNX_ZONE_TEXT(z_snx_maxwell, "stage %d, %u insn, hash %016llx", stage, len / 8, (unsigned long long)h);
+        (void)h; /* the text's arguments are dropped without a client */
         for (u32 i = 0; i < 20; i++) sph[i] = snx_ld_le32(code + i * 4);
         if (shader_legacy_varyings(insn, len / 8, max_bytes / 8, sph, stage, si, &moved, &legacy_fs)) {
             free(copy);
-            if (!si->unsupported) return direct_reject(si, "legacy varyings: out of memory");
+            if (!si->unsupported) return snx_reject(si, "legacy varyings: out of memory");
             return NULL;
         }
     }
     r = to_spirv(code, moved ? moved : insn, max_bytes, stage, si, word_count, can_flush, can_preserve,
-                 can_preserve_f64, can_subgroup, legacy_fs);
+                 can_preserve_f64, can_subgroup, legacy_fs, timing);
     free(moved);
     free(copy);
+    if (trace) {
+        if (r) {
+            int dom = 0;
+            for (int i = 1; i < PH_N; i++)
+                if (phase[i] > phase[dom]) dom = i;
+            SNX_ZONE_VALUE(z_snx_maxwell, dom + 1); /* 1 decode, 2 dataflow, 3 structure, 4 alloc, 5 emit */
+            SNX_ZONE_TEXT(z_snx_maxwell, "%u spv words, made, %s %llu us", (unsigned)*word_count,
+                          snx_phase_name[dom], (unsigned long long)(phase[dom] / 1000));
+            /* No GLSL/SPIR-V text survives the translate, so register a small textual summary (shader identity,
+               instruction and word counts, entry point) instead. The key is __FILE__ because that is what the zone's
+               source location sends as its file: the GUI source view asks for that exact name. tracy_conn.cpp copies
+               the bytes on add, so a thread-local buffer is stable across the call and private to each translator. */
+            static _Thread_local char summary[192];
+            int sn = snprintf(summary, sizeof summary,
+                              "Maxwell -> SPIR-V: stage %d, hash %016llx, %u insn, %u words, entry main\n", stage,
+                              (unsigned long long)h, len / 8, (unsigned)*word_count);
+            if (sn > 0)
+                snx_tracy_source_add(__FILE__, summary,
+                                     (size_t)(sn < (int)sizeof summary ? sn : (int)sizeof summary - 1));
+        } else {
+            /* an early refusal skips a phase's accumulation, so a dominant phase here would name work the reject
+               never did */
+            SNX_ZONE_VALUE(z_snx_maxwell, 0);
+            if (si && si->first_unsupported[0]) {
+                SNX_ZONE_TEXT(z_snx_maxwell, "rejected: %.80s", si->first_unsupported);
+                /* a rejected shader is rare: mark the one that failed with its own callstack, not only the zone's text */
+                SNX_MSG_CS(si->first_unsupported, strlen(si->first_unsupported), 4);
+            } else
+                SNX_ZONE_TEXT(z_snx_maxwell, "no module");
+        }
+        SNX_PLOT("shader maxwell translate us", (double)(plat_ns() - t0) / 1000.0);
+    }
     return r;
 }

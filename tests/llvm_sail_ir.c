@@ -61,9 +61,10 @@ static const char* const generated_ops[] = {
     "PACIBZ",   "PACIBSP",  "AUTIAZ",  "AUTIASP",   "AUTIBZ",    "AUTIBSP",   "CLREX",     "DSB_DMB", "ISB",
     "STR_i",    "LDR_i",    "STR",     "LDR",       "LD_lit",    "STP",       "LDP",       "STXR",    "LDXR",
     "STXP",     "LDXP",     "STLR",    "LDAR",      "LDAPR",     "LDAPR_i",   "STLR_i",    "CAS",     "CASP",
-    "LDADD",    "LDCLR",    "LDEOR",   "LDSET",     "LDSMAX",    "LDSMIN",    "LDUMAX",    "LDUMIN",  "SWP"};
+    "LDADD",    "LDCLR",    "LDEOR",   "LDSET",     "LDSMAX",    "LDSMIN",    "LDUMAX",    "LDUMIN",  "SWP",
+    "LDRA"};
 #define GENERATED_OPS (sizeof generated_ops / sizeof *generated_ops)
-#define FIRST_LDST    (GENERATED_OPS - 27)
+#define FIRST_LDST    (GENERATED_OPS - 28)
 /* and the ones ir_fpu.c sends to it: every scalar floating-point instruction */
 static const char* const fp_ops[] = {
     "FADD_s",    "FSUB_s",     "FDIV_s",     "FMUL_s",     "FNMUL_s",    "FMAX_s",    "FMIN_s",    "FMAXNM_s",
@@ -75,9 +76,12 @@ static const char* const fp_ops[] = {
     "FCVTZU_g",  "FCVTAS_g",   "FCVTAU_g",   "FJCVTZS",    "FMOV_ws",    "FMOV_sw",   "FMOV_xd",   "FMOV_dx",
     "FMOV_xu",   "FMOV_ux",    "FMOV_xh",    "FMOV_hx"};
 #define FP_OPS (sizeof fp_ops / sizeof *fp_ops)
-/* and the SIMD ones ir_vec.c sends to it (generated()), each element loop one vector operation */
-static const char* const vec_ops[] = {"ADD_v",  "SUB_v",  "CMEQ_v", "CMTST_v", "CMGE_v", "CMGT_v", "CMHI_v",
-                                      "CMHS_v", "SMAX_v", "SMIN_v", "UMAX_v",  "UMIN_v", "NEG_v",  "ABS_v"};
+/* and the SIMD ones ir_vec.c sends to it (generated()), each element loop one vector operation, a shuffle (the
+   pairwise ops) or a reduction (across lanes) */
+static const char* const vec_ops[] = {"ADD_v",  "SUB_v",  "CMEQ_v",  "CMTST_v", "CMGE_v",  "CMGT_v",  "CMHI_v",
+                                      "CMHS_v", "SMAX_v", "SMIN_v",  "UMAX_v",  "UMIN_v",  "NEG_v",   "ABS_v",
+                                      "MUL_v",  "ADDP_v", "SMAXP_v", "SMINP_v", "UMAXP_v", "UMINP_v", "ADDV",
+                                      "SADDLV", "UADDLV", "SMAXV",   "SMINV",   "UMAXV",   "UMINV"};
 #define VEC_OPS (sizeof vec_ops / sizeof *vec_ops)
 
 typedef struct {

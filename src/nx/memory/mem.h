@@ -139,6 +139,12 @@ void mem_layout_move(u64 by);
 /* how far mem_layout_move moved the layout, 0 when it stays at the console's addresses */
 u64 mem_moved(void);
 void mem_init(void);
+/* the guest's pages in unlinked files of 1 GiB in dir (plat_vm_files), before the game commits any: 0, or -1 with
+   errno (EBUSY once the game has memory, ENOTSUP under NCE) */
+int mem_files_on(const char* dir);
+/* whether the disk of dir has need bytes free for those files: 0, or -1; out says the free space and the need, or why
+   the free space could not be read */
+int mem_files_room(const char* dir, u64 need, char* out, size_t size);
 int mem_map(u64 addr, u64 size, u32 state, u32 perm); /* 0, MEM_BADSTATE when it isn't free, MEM_NOMEM */
 int mem_unmap(u64 addr, u64 size);
 /* Physical memory in the alias region, and the heap, under the memory lock against one combined budget in bytes.
@@ -173,9 +179,11 @@ void mem_set_pages_replaced(void (*fn)(u64 a, u64 size));
    reservation's own pages with their bytes. Unmapping or decommitting moved pages, or moving them into the pool, puts
    other pages there; the moves themselves don't call the hook above, as the caller holds the buffer. Pool pages it
    moves are given back to the pool. 0, MEM_BADSTATE (not all of it is what mem_movable says), or MEM_NOMEM when the
-   host can't share them */
-int mem_migrate(u64 a, u64 size, int fd);
-int mem_unmigrate(u64 a, u64 size);
+   host can't share them. view is a mapping of fd's pages in the process (a memfd's), or NULL: own.c reads the CPU's
+   bytes of a trapped page through it (mem_ext_read), which the buffer keeps mapped while a run of its pages is:
+   a mem_unmigrate that answers MEM_NOMEM leaves some there. *moved (or NULL) is the bytes it moved all the same */
+int mem_migrate(u64 a, u64 size, int fd, u8* view);
+int mem_unmigrate(u64 a, u64 size, u64* moved);
 /* whether [a, a + size) is all the guest's data, in whole host pages, on the reservation's own pages or on pool pages
    that no other address maps (not a view's or its source's, not shared memory's, not those a service maps outside
    the reservation), and not the renderer's placed windows below: what mem_migrate moves */
@@ -234,13 +242,24 @@ int mem_unmap_pool(u64 addr, u64 off, u64 size, u32 state);
 u64 mem_pool_used(void); /* bytes of the pool handed out */
 /* [a, a + size), whole pages, made pool pages mapped there only, ready to be trapped (memory/own.c): the parts that
    aren't pool pages moved there, each part frozen meanwhile. 0 with the range's runs of pool pages in runs (*n of
-   them, at most max), or -1 (unmapped or code memory, pages mapped elsewhere too, or more runs than max). Without the
+   them, at most max), or -1 (unmapped or code memory, pages mapped elsewhere too, or more runs than max: then *n is
+   above max, the count of the runs, which a call with room for them all gets). Without the
    pool (Windows, whose traps land in place) the range stays the reservation's own pages, which nothing else maps
    there: one run, whose pool offset is its address. The caller holds the renderer's lock */
 typedef struct {
     u64 addr, size, pool; /* guest pages [addr, addr + size) are pool pages from pool on */
 } MemPoolRun;
 int mem_own_prepare(u64 a, u64 size, MemPoolRun* runs, u32 max, u32* n);
+/* [a, a + size), whole pages, all a GPU's buffer's (mem_migrate) with a view of its pages, to be trapped where they are
+   (own_watch_in_place): a dma-buf of them keeps them, and a move into the pool would leave it the old ones. 0 with
+   the runs, each with its view's address as its "pool offset", or -1 */
+int mem_ext_runs(u64 a, u64 size, MemPoolRun* runs, u32 max, u32* n);
+/* the bytes of [a, a + size) through the view of the buffer whose pages are there (mem_migrate), under mem.c's lock,
+   which the view outlives: 0, or -1 when a run of such pages with a view doesn't hold them all */
+int mem_ext_read(u64 a, void* dst, u64 size);
+/* 1 when [a, a + size) is all the pages of one GPU's buffer side by side, view (mem_migrate's) mapping a's byte: a
+   region whose import is dead keeps those of its pages that nothing replaced (uma.c's imp_let_go) */
+int mem_ext_is(u64 a, u64 size, const u8* view);
 /* 1 when this thread holds mem.c's lock: the renderer's watch of owed bytes again (vk_rt_watch_owed) waits for a
    later vk_unlock, as mem_own_prepare would take the lock again */
 int mem_lock_held(void);

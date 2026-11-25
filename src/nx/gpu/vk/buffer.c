@@ -20,6 +20,7 @@
 #include "nx/runtime/platform/log.h"
 #include "nx/runtime/platform/plat.h"
 #include "nx/runtime/platform/tracy.h"
+#include "common/platform/time.h"
 #include "nx/gpu/vk/vk.h"
 #include "nx/gpu/vk/ledger.h"
 #include "nx/gpu/vk/pagespace.h"
@@ -28,7 +29,7 @@
 #include "nx/gpu/vk/resource_stats.h"
 #include "nx/gpu/vk/descriptors.h"
 #include "nx/gpu/vk/pending_pages.h"
-#include "nx/runtime/platform/tracy.h"
+#include "nx/gpu/vk/addr_gens.h"
 
 typedef struct {
     u64 start, len, hash, shash;
@@ -60,7 +61,8 @@ typedef struct {
                                next free one in own_next */
 } Vb;
 /* The cache of guest ranges as buffers: its entries in one array by index (0 is none), and an index of them by range,
-   open addressed. Entries live twenty seconds after their last use, and draws make new ranges all the time (constant
+   open addressed. An entry with a buffer of its own lives twenty seconds after its last use; one that only holds what
+   its next check compares (the staging ring) goes after two seconds. Draws make new ranges all the time (constant
    buffers streamed through a ring, vertices at new offsets): chained buckets of separately allocated entries grew
    long, and walking them, a cache miss an entry, was a twentieth of the GPU thread in one game. A lookup reads one
    slot of the index, rarely two */
@@ -284,9 +286,9 @@ static void stage_report(void) {
     char line[1024];
     int at = 0;
     for (int w = 0; w < ST_N; w++)
-        at += snprintf(line + at, sizeof line - (size_t)at, " %s=%llu/%lluMB same %llu/%lluMB changed", names[w],
-                       (unsigned long long)g_st_n[w][0], (unsigned long long)(g_st_bytes[w][0] >> 20),
-                       (unsigned long long)g_st_n[w][1], (unsigned long long)(g_st_bytes[w][1] >> 20));
+        at = snx_appendf(line, sizeof line, at, " %s=%llu/%lluMB same %llu/%lluMB changed", names[w],
+                         (unsigned long long)g_st_n[w][0], (unsigned long long)(g_st_bytes[w][0] >> 20),
+                         (unsigned long long)g_st_n[w][1], (unsigned long long)(g_st_bytes[w][1] >> 20));
     LOG("vulkan: staged by reason:%s; by size <4K %lluMB <64K %lluMB <1M %lluMB >=1M %lluMB; %llu submits\n", line,
         (unsigned long long)(g_st_size[0] >> 20), (unsigned long long)(g_st_size[1] >> 20),
         (unsigned long long)(g_st_size[2] >> 20), (unsigned long long)(g_st_size[3] >> 20),
@@ -297,9 +299,9 @@ static void stage_report(void) {
         for (int s = 0; s < 64; s++)
             if (g_st_top[s].bytes && (best < 0 || g_st_top[s].bytes > g_st_top[best].bytes)) best = s;
         if (best < 0) break;
-        at += snprintf(line + at, sizeof line - (size_t)at, " %llx+%x:%llux/%lluMB", (unsigned long long)g_st_top[best].gva,
-                       g_st_top[best].len, (unsigned long long)g_st_top[best].n,
-                       (unsigned long long)(g_st_top[best].bytes >> 20));
+        at = snx_appendf(line, sizeof line, at, " %llx+%x:%llux/%lluMB", (unsigned long long)g_st_top[best].gva,
+                         g_st_top[best].len, (unsigned long long)g_st_top[best].n,
+                         (unsigned long long)(g_st_top[best].bytes >> 20));
         g_st_top[best].bytes = 0;
     }
     LOG("vulkan: staged most (address+largest length:copies/bytes):%s\n", line);
@@ -657,6 +659,7 @@ static void range_map_free(RangeMap* m) {
 }
 
 typedef struct WwStage WwStage;
+typedef struct WwOpen WwOpen;
 /* this thread's state */
 static _Thread_local struct {
     /* Suppress recursive lookups by the landing thread. Other readers still take vk_lock and wait for landing. */
@@ -670,6 +673,7 @@ static _Thread_local struct {
     u32 ww_stream;
     int ww_streaming;
     WwStage* wstage; /* the running scan's, for ww_note */
+    const WwOpen* wopen; /* vk_ww_open's, for open_note */
 } t_buffer;
 
 static void out_free(GfxOut* o);
@@ -918,7 +922,27 @@ static void out_free(GfxOut* o) {
     out_block_free(o);
 }
 /* The frame fence has signaled. Its stage allocations still exist here; cmd.c frees them only after this call. */
+/* for the statistics, under vk_lock: vk_buf_frame_done's calls, and the nanoseconds of its parts (the walk of g_out,
+   the landing of the results, the retire of the dispatches' logs, vk_mirror_done, vk_uma_frame_done) */
+enum { TAIL_WALK, TAIL_LAND, TAIL_RETIRE, TAIL_MIRROR, TAIL_UMA, TAIL_N };
+static u64 g_tail_calls, g_tail_ns[TAIL_N];
+void vk_buf_frame_done_log(void) {
+    vk_lock();
+    u64 calls = g_tail_calls, ns[TAIL_N];
+    memcpy(ns, g_tail_ns, sizeof ns);
+    g_tail_calls = 0;
+    memset(g_tail_ns, 0, sizeof g_tail_ns);
+    vk_unlock();
+    if (calls)
+        LOG("vulkan: the landings of finished submissions over the last 600 presents: %llu calls, %.2f ms finding the "
+            "outputs, %.2f ms landing them, %.2f ms retiring logs, %.2f ms in the mirror's done, %.2f ms in the UMA "
+            "done\n",
+            (unsigned long long)calls, (double)ns[TAIL_WALK] / 1e6, (double)ns[TAIL_LAND] / 1e6,
+            (double)ns[TAIL_RETIRE] / 1e6, (double)ns[TAIL_MIRROR] / 1e6, (double)ns[TAIL_UMA] / 1e6);
+}
 void vk_buf_frame_done(u64 frame) {
+    u64 t_part = plat_ns(), t_next;
+    g_tail_calls++;
     GfxOut *done = NULL, *done_tail = NULL;
     for (GfxOut** pp = &g_out; *pp;) {
         GfxOut* o = *pp;
@@ -939,6 +963,9 @@ void vk_buf_frame_done(u64 frame) {
     for (GfxOut* o = g_out; o; o = o->next) g_out_tail = o;
     atomic_store_explicit(&g_gfx_any, g_out != NULL || done != NULL, memory_order_relaxed);
     DevMem invalidated = 0;
+    t_next = plat_ns();
+    g_tail_ns[TAIL_WALK] += t_next - t_part;
+    t_part = t_next;
     t_buffer.out_landing++;
     while (done) {
         GfxOut* o = done;
@@ -977,6 +1004,9 @@ void vk_buf_frame_done(u64 frame) {
         out_free(o);
     }
     t_buffer.out_landing--;
+    t_next = plat_ns();
+    g_tail_ns[TAIL_LAND] += t_next - t_part;
+    t_part = t_next;
     /* the dispatches' references to their logs, of the submits done (the results' own, just dropped, came first) */
     u32 kept = 0;
     for (u32 i = 0; i < g_nretire; i++)
@@ -985,9 +1015,16 @@ void vk_buf_frame_done(u64 frame) {
         else
             g_retire[kept++] = g_retire[i];
     g_nretire = kept;
+    t_next = plat_ns();
+    g_tail_ns[TAIL_RETIRE] += t_next - t_part;
+    t_part = t_next;
     vk_mirror_done(frame);
+    t_next = plat_ns();
+    g_tail_ns[TAIL_MIRROR] += t_next - t_part;
+    t_part = t_next;
     atomic_store_explicit(&g_gfx_any, g_out != NULL, memory_order_relaxed);
     vk_uma_frame_done(frame);
+    g_tail_ns[TAIL_UMA] += plat_ns() - t_part;
 }
 /* At the frame's submit: its storage results are copied into host-cached memory (vk_stage_back), where landing them
    compares bytes quickly, or takes a logged one's runs. A result whose copy can't be allocated is read where the
@@ -1496,7 +1533,7 @@ static int gfx_overlay(u64 gva, u64 len, VkBuffer dst, u64 dst_off, u8* host,
     c.dst = dst;
     if (!gap) { /* into a buffer the draws recorded so far read in place: after all of their work, not the writers' alone */
         vk_render_end();
-        copy_barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, out_access(), VK_PIPELINE_STAGE_2_COPY_BIT,
+        copy_barrier(vk_buffer_stages(), out_access(), VK_PIPELINE_STAGE_2_COPY_BIT,
                      VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
         c.started = 1;
     }
@@ -1644,7 +1681,7 @@ static GfxOut* out_absorb(GfxOut* h) {
     memset(&c, 0, sizeof c);
     c.dst = h->buf;
     vk_render_end();
-    copy_barrier(VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, out_access(), VK_PIPELINE_STAGE_2_COPY_BIT,
+    copy_barrier(vk_buffer_stages(), out_access(), VK_PIPELINE_STAGE_2_COPY_BIT,
                  VK_ACCESS_2_TRANSFER_READ_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT);
     c.started = 1;
     for (u32 i = 0; i < n; i++) {
@@ -1911,6 +1948,7 @@ void vk_ww_dirty_clear(u64 cpu, u64 len) {
 static void ww_mark(u8* p, u64 n) {
     u64 o = (u64)(p - g_mem);
     if (o >= AS_SIZE || !n) return;
+    u64 bumped = 0; /* the granules of the generations by address done (addr_gens.h), past the stamps */
     for (u64 pg = o >> 12, e = (o + n - 1) >> 12; pg <= e && pg < (AS_SIZE >> 12); pg++) {
         u64 l = pg >> (WW_LEAF_SHIFT - 12);
         if (!g_wleaf[l]) {
@@ -1927,6 +1965,14 @@ static void ww_mark(u8* p, u64 n) {
         } else /* no table: the stamp below stands for the whole leaf */
             ww_dirty_set(l << (WW_LEAF_SHIFT - 12), (l + 1) << (WW_LEAF_SHIFT - 12));
         g_wleaf_max[l] = g_wclock;
+        /* after the stamp. Without a table the stamp stands for the whole leaf, and so does the bump */
+        const u64 at = g_wleaf[l] ? pg << 12 : l << WW_LEAF_SHIFT, len = g_wleaf[l] ? 0x1000 : 1ull << WW_LEAF_SHIFT;
+        if (at + len > bumped) {
+            const u64 from = at > bumped ? at : bumped, to = (at + len + (1ull << ADDR_GENS_SHIFT) - 1) &
+                                                             ~((1ull << ADDR_GENS_SHIFT) - 1);
+            addr_gens_bump(ADDR_GENS_CPU, from, to - from);
+            bumped = to;
+        }
     }
 }
 /* a range of guest memory [a, e) */
@@ -1942,6 +1988,7 @@ static void ww_mark_pages(u64 o, u64 e) {
         if (!g_wleaf[l] && pg == l * lp && end == lend) {
             g_wleaf_max[l] = g_wclock;
             ww_dirty_set(pg, end);
+            addr_gens_bump(ADDR_GENS_CPU, pg << 12, (end - pg) << 12); /* after the stamp, as ww_mark bumps */
         } else
             ww_mark(GP(pg << 12), (end - pg) << 12);
         pg = end;
@@ -2047,6 +2094,19 @@ static _Atomic int g_wscan_failed;     /* atomic */
 static _Atomic int g_wscan_on;         /* atomic: the scanner runs */
 static PMutex g_wscan_wlk = PMUTEX_INIT;
 static PCond g_wscan_cv;
+/* The checks scanning now (atomic). On Windows the scanner starts no scan while one does: the write watch calls of
+   two threads at once slow each other down. In one game a check's call that found no page took 64 us against the
+   scanner's 14 us, about 47 us a leaf against 4, and with the scanner waiting the checks took 12 us a leaf. A check
+   runs on the thread that records the draws, which sets the frame rate, and the scanner's next leaves can wait. The
+   other hosts' scans were not measured so: their scanner keeps going. A test sets WW_SCANS_SERIAL on any host */
+static _Atomic int g_wcheck_scans;
+#if !defined(WW_SCANS_SERIAL)
+#if defined(_WIN32)
+#define WW_SCANS_SERIAL 1
+#else
+#define WW_SCANS_SERIAL 0
+#endif
+#endif
 /* plat_ww_scan's callback: a run of written pages. When the stage is full its last range grows over the new one
    (scans go up through memory), marking more than was written: a cache over the rest only checks its contents once */
 static void ww_note(u8* p, u64 n) {
@@ -2077,19 +2137,30 @@ static int ww_scan_free(u64 a, u64 e) {
     }
     return r;
 }
+/* the leaves [lo, hi], in address order as every claimer takes them */
+static void ww_claim_all(u64 lo, u64 hi) {
+    for (u64 l = lo; l <= hi; l++)
+        while (!ww_claim(l)) plat_yield();
+}
+static void ww_claims_end(u64 lo, u64 hi) {
+    for (u64 l = lo; l <= hi; l++) atomic_store_explicit(&g_wleaf_busy[l], 0, memory_order_release);
+}
+/* written range r in g_wres (under g_wres_lk) */
+static void wres_add_nl(WwRange r) {
+    const int n = atomic_load_explicit(&g_wres_n, memory_order_relaxed);
+    if (n < WW_RES_N) {
+        g_wres[n] = r;
+        atomic_store_explicit(&g_wres_n, n + 1, memory_order_release);
+    } else { /* full: the last range covers this one too */
+        WwRange* w = &g_wres[WW_RES_N - 1];
+        if (r.a < w->a) w->a = r.a;
+        if (r.e > w->e) w->e = r.e;
+    }
+}
 /* what a scan put in st, in g_wres for the next check to mark, before its leaves' claims end */
 static void ww_publish(WwStage* st) {
     pm_lock(&g_wres_lk);
-    int n = atomic_load_explicit(&g_wres_n, memory_order_relaxed);
-    for (int i = 0; i < st->n; i++)
-        if (n < WW_RES_N)
-            g_wres[n++] = st->r[i];
-        else { /* full: the last range covers this one too */
-            WwRange* w = &g_wres[WW_RES_N - 1];
-            if (st->r[i].a < w->a) w->a = st->r[i].a;
-            if (st->r[i].e > w->e) w->e = st->r[i].e;
-        }
-    atomic_store_explicit(&g_wres_n, n, memory_order_release);
+    for (int i = 0; i < st->n; i++) wres_add_nl(st->r[i]);
     pm_unlock(&g_wres_lk);
     st->n = 0;
 }
@@ -2314,6 +2385,8 @@ static void ww_scanner(void* arg) {
                 l = ww_next_ever(l + 1, n);
                 continue;
             }
+            /* before its claims, which a check would wait for */
+            while (WW_SCANS_SERIAL && atomic_load_explicit(&g_wcheck_scans, memory_order_acquire)) plat_yield();
             u64 lo = l;
             while (l < n && l - lo < WW_RUN_MAX && ww_wanted(l, seen, from) && ww_claim(l)) l++;
             if (l == lo) { /* a check is scanning it */
@@ -2378,6 +2451,8 @@ static int ww_take_leaves(u64 lo, u64 hi, u32 seen) {
         }
     }
     if (first <= hi) {
+        if (WW_SCANS_SERIAL)
+            atomic_fetch_add_explicit(&g_wcheck_scans, 1, memory_order_acq_rel); /* the scanner waits */
         /* the scanner may be scanning some of them: wait for those, which it may have scanned in this epoch */
         for (a = first; a <= last; a++)
             while (!ww_claim(a)) plat_yield();
@@ -2394,9 +2469,11 @@ static int ww_take_leaves(u64 lo, u64 hi, u32 seen) {
             while (a <= last && (i32)(atomic_load_explicit(&g_wleaf_done[a], memory_order_relaxed) - seen) < 0) a++;
             if (ww_scan_leaves(run, a - 1, seen, &g_wstage_check) < 0) {
                 for (; a <= last; a++) atomic_store_explicit(&g_wleaf_busy[a], 0, memory_order_release);
+                if (WW_SCANS_SERIAL) atomic_fetch_sub_explicit(&g_wcheck_scans, 1, memory_order_acq_rel);
                 return -1;
             }
         }
+        if (WW_SCANS_SERIAL) atomic_fetch_sub_explicit(&g_wcheck_scans, 1, memory_order_acq_rel);
     }
     ww_take_scanned();
     for (a = l; a <= hi; a++)
@@ -2535,6 +2612,10 @@ int vk_ww_take(const u8* host, u64 len) {
     return ww_take(host, len);
 }
 u32 vk_ww_now(void) { return g_wclock; }
+int vk_ww_gen(const u8* host, u64 len, u32* gen) {
+    if (!host || host < g_mem) return 0;
+    return addr_gens_read(ADDR_GENS_CPU, (u64)(host - g_mem), len, gen);
+}
 void vk_ww_stats(u32 presents) {
     static u32 epoch0;
     u32 e = atomic_load_explicit(&g_ww_epoch, memory_order_relaxed);
@@ -2556,12 +2637,11 @@ void vk_ww_stats(u32 presents) {
 static int ww_cool_range(u64 a, u64 e) {
     u64 lo = a >> WW_LEAF_SHIFT, hi = (e - 1) >> WW_LEAF_SHIFT;
     if (!plat_ww_hot_in(GP(a), e - a)) return 0;
-    for (u64 l = lo; l <= hi; l++)
-        while (!ww_claim(l)) plat_yield();
+    ww_claim_all(lo, hi);
     t_buffer.wstage = &g_wstage_check;
     plat_ww_cool(GP(a), e - a, ww_note);
     ww_publish(&g_wstage_check);
-    for (u64 l = lo; l <= hi; l++) atomic_store_explicit(&g_wleaf_busy[l], 0, memory_order_release);
+    ww_claims_end(lo, hi);
     return 1;
 }
 void vk_ww_cool(const u8* host, u64 len) {
@@ -2579,6 +2659,64 @@ void vk_ww_cool(const u8* host, u64 len) {
     if (!cooled) return;
     ww_take_scanned(); /* newer than every baseline before, and no newer than the one the caller takes next */
     ww_take_peers();
+}
+/* A watch over a region's pages (vk_own_watch) traps them, and a scan skips a trapped page: what the CPU wrote on it
+   after its last scan would be in none, as nothing of it is left when the page opens. So it is scanned before the
+   trap */
+void vk_ww_watching(u64 lo, u64 hi) {
+    const u64 first = lo >> WW_LEAF_SHIFT, last = (hi - 1) >> WW_LEAF_SHIFT;
+    if (g_ww <= 0 || atomic_load_explicit(&g_wscan_failed, memory_order_acquire)) return; /* no baseline to miss it */
+    ww_claim_all(first, last);
+    t_buffer.wstage = &g_wstage_check;
+    if (ww_scan_free(lo, hi) < 0) atomic_store_explicit(&g_wscan_failed, 1, memory_order_release);
+    ww_publish(&g_wstage_check);
+    ww_claims_end(first, last);
+}
+/* The pages that vk_ww_open opens, from guest address lo on: the hash of each from before, and a bit for each that its
+   scan found written */
+struct WwOpen {
+    u64 lo, n;
+    u64 *hash, *written;
+};
+static void open_note(u8* p, u64 size) {
+    const WwOpen* o = t_buffer.wopen;
+    for (u64 k = (u64)(p - GP(o->lo)) >> 12, e = k + (size >> 12); k < e && k < o->n; k++)
+        o->written[k >> 6] |= 1ull << (k & 63);
+}
+/* They read as written once open (plat_trap_continue), and a report of that, taken for the CPU's write, is newer than
+   every baseline: a target drawn there after gave its pixels up for memory's older bytes at its next publish, as after
+   a landing (vk_ww_landed). What a landing notes there is compared at a later scan, through the pool's mirror. These
+   pages have no place there, and the view of the region's buffer goes with it, so they are scanned as they open, with
+   their leaves claimed over both: no other scan reports them. A thread that the opening woke, or any other, may have
+   written them by then: a page whose bytes are not those from before counts, as any written page. Read while the watch
+   is on them, where no thread can have written them */
+void vk_ww_open(u64 lo, u64 hi, const u8* bytes, void (*go)(void* ctx), void* ctx) {
+    const u64 n = (hi - lo) >> 12, first = lo >> WW_LEAF_SHIFT, last = (hi - 1) >> WW_LEAF_SHIFT;
+    WwOpen o = {.lo = lo, .n = n, .hash = calloc(n + ((n + 63) >> 6), sizeof *o.hash)};
+    if (!o.hash) {
+        WARN_LIMIT(4,
+                   "vulkan: no memory to tell the CPU's writes to %llu KiB of guest memory at %llx from their watch's "
+                   "end: all of it reads as written\n",
+                   (unsigned long long)((hi - lo) >> 10), (unsigned long long)lo);
+        go(ctx);
+        return;
+    }
+    o.written = o.hash + n;
+    for (u64 k = 0; k < n; k++) o.hash[k] = vk_hash(bytes + (k << 12), 4096);
+    ww_claim_all(first, last);
+    go(ctx);
+    t_buffer.wopen = &o;
+    /* -1 too where the host tracks no writes: no consumer asks then */
+    if (plat_ww_scan(GP(lo), hi - lo, open_note) < 0) atomic_store_explicit(&g_wscan_failed, 1, memory_order_release);
+    t_buffer.wopen = NULL;
+    for (u64 k = 0; k < n; k++)
+        if ((o.written[k >> 6] >> (k & 63) & 1) && vk_hash(bytes + (k << 12), 4096) != o.hash[k]) {
+            pm_lock(&g_wres_lk);
+            wres_add_nl((WwRange){lo + (k << 12), lo + ((k + 1) << 12)});
+            pm_unlock(&g_wres_lk);
+        }
+    ww_claims_end(first, last);
+    free(o.hash);
 }
 /* fn(user, at, n) for each run of [host, host + len) on pages written after since, at the range's byte offset at: for
    a range vk_written_since(host, len, since) has just found written, so its pages are marked */
@@ -2749,7 +2887,7 @@ static int keep_new(u64 gva, u32 len, u64 align, int ordered, VkBuffer* buf, u64
     int paged = ((gva | len) & 0xFFF) != 0; /* not whole pages: the page cache keeps it, where there is one */
     if (!own_traps())
         why = KF_TRAPS_OFF;
-    else if (vk_uma())
+    else if (vk_uma() && !vk_uma_storage_copied()) /* the hybrid stages storage as the copies' path does */
         why = KF_UMA;
     else if (!len)
         why = KF_EMPTY;
@@ -2933,7 +3071,7 @@ static int back_record(GfxOut* o) {
     }
     vk_render_end();
     VkCommandBuffer cb = vk_cmd();
-    vk_all_barrier(cb); /* the program's writes, and what read or wrote the bytes before it, first */
+    vk_all_barrier_by(VK_BAR_BUFFER, cb); /* the program's writes, and what read or wrote the bytes before it, first */
     int ok = 1;
     for (i = 0; i < n && ok; i++) {
         u32 from = (u32)(p[i].cpu - o->cpu), to = from + (u32)p[i].len;
@@ -2942,7 +3080,7 @@ static int back_record(GfxOut* o) {
         else
             ok = vk_wlog_merge(w->log, w->part, from, to, o->buf, o->off, p[i].res->buf, p[i].res_off);
     }
-    vk_all_barrier(cb); /* and what reads or writes them next, after it */
+    vk_all_barrier_by(VK_BAR_BUFFER, cb); /* and what reads or writes them next, after it */
     if (!ok) {          /* out of descriptors: the bytes merged so far are the ones its landing writes there too */
         back_unref(p, n);
         return 0;
@@ -3023,9 +3161,15 @@ static int copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered)
     }
     /* with unified memory the shader writes guest memory where it is, with nothing to land: not over bytes the GPU
        holds elsewhere (owned, a compute or storage image result, a queued release), which land first as before. Its
-       barriers go by page (uma.c's order) whether or not the front end gives its own (ordered 0): more than NVN asks
-       for, never fewer. What refuses it is counted (vk_uma_refused) */
-    if (vk_uma()) {
+       barriers go by page (uma.c's order). Where the front end gives its own (ordered 0), a write over this
+       submission's reads and writes waits for one of those, as here; a read of a write gets its barrier. What refuses
+       it is counted (vk_uma_refused).
+       Not on a discrete GPU with host imports, where read-only storage is copied too (vk_uma_storage_copied): there
+       each store and each later read of the bytes crosses the bus. One game's world, whose draws wrote 189 storage
+       ranges a present (20 MB), had the GPU busy 34 to 88 ms a present in its passes and ran at 16 to 18 frames a
+       second, against 42 to 54 with these writes in the GPU's memory as below. The GPU mirror takes the writes of the programs
+       that log them before this (compute.c's mirror_plan) */
+    if (vk_uma() && !vk_uma_storage_copied()) {
         int why = pending                 ? VK_UMA_REFUSED_RESULT
                   : range_owned(gva, len) ? VK_UMA_REFUSED_OWNED
                   : atomic_load_explicit(&g_cs_any, memory_order_relaxed) && vk_compute_pending(gva, len)
@@ -3036,7 +3180,7 @@ static int copy_writable(u64 gva, u32 len, VkBuffer* buf, u64* off, int ordered)
                                                  : -1;
         if (why >= 0)
             vk_uma_refused(why);
-        else if (vk_uma_write(gva, len, bind_align, buf, off))
+        else if (vk_uma_write(gva, len, bind_align, ordered, buf, off))
             return 1;
     }
     /* a logged result has no original bytes: its input goes straight into the buffer the shader writes */
@@ -3409,7 +3553,7 @@ static int atlas_fill(DrawPage* p, size_t unique, u8* ptr, VkBuffer atlas, u64 a
    are those of the fast path's blk bit and of copy_writable (fast_check's list), asked without landing anything. 1
    when bound in place, else 0 with the reason (VK_ALIAS_*) in *why */
 static int alias_in_place(VkDrawStorage* draw, const u8 active[VK_DRAW_STAGES * 16], int* why) {
-    if (!vk_uma() || g_settings.guest_buffers_copied == 2) {
+    if (!vk_uma() || g_settings.guest_buffers_copied == 2 || vk_uma_storage_copied()) {
         *why = VK_ALIAS_OFF;
         return 0;
     }
@@ -3461,7 +3605,7 @@ static int alias_in_place(VkDrawStorage* draw, const u8 active[VK_DRAW_STAGES * 
                 vk_release_pending(gva, len) || range_owned(gva, len))
                 fail = pass ? VK_ALIAS_READ : VK_ALIAS_WRITE;
             else if (!(pass ? vk_uma_get(gva, len, align, &buf[k], &off[k])
-                            : vk_uma_write(gva, len, align, &buf[k], &off[k])))
+                            : vk_uma_write(gva, len, align, 1, &buf[k], &off[k])))
                 fail = pass ? VK_ALIAS_READ : VK_ALIAS_WRITE;
             else if (buf[k] != region || off[k] != base + (cpu[k] - lo))
                 fail = VK_ALIAS_SPLIT;
@@ -3850,7 +3994,7 @@ static int make_own_(u32 i, VkBuffer sb, u64 so);
 /* a buffer of its own being made, as a profiler zone (SNX_TRACY builds) */
 static int make_own(u32 i, VkBuffer sb, u64 so) {
     VkResourceScope scope = vk_resource_begin();
-    SNX_ZONE_V(z, "own buffer", g_vb[i].len);
+    SNX_ZONE_TV(z, "vk: own buffer", g_vb[i].len, "slot %u, staging @%llx", i, (unsigned long long)so);
     int r = make_own_(i, sb, so);
     SNX_ZONE_END(z);
     vk_resource_end(VK_RESOURCE_BUFFER_CACHE_BUILD, scope);
@@ -4012,7 +4156,7 @@ static int buf_get_owned(u32 i, Vb* e, u64 gva, u64 len, int strict, u32 epoch, 
         if ((res->borrowed || res->by == VK_OWN_BY_DRAW) &&
             atomic_load_explicit(&res->written, memory_order_acquire) == vk_submit_number()) {
             vk_render_end();
-            vk_all_barrier(vk_cmd());
+            vk_all_barrier_by(VK_BAR_BUFFER, vk_cmd());
         }
         sb = ((const VkOwnRes*)o[0].res)->buf;
         so = o[0].res_off;
@@ -4124,7 +4268,8 @@ static int buf_get_(u64 gva, u64 len, VkBuffer* buf, u64* off, int strict, u64 a
        result of any kind, a storage image, a queued release, the mirror's writes, a page the runtime wrote: its blk
        bit) is guest memory itself: bound in place with none of the checks below (uma.c's vk_uma_read). A
        blk page, or a range in no region, takes them */
-    const int dear = (inplace & IN_DEAR) && vk_uma_imports_dear() && !(inplace & IN_FAST);
+    /* read-only storage (IN_FAST) is dear too where it is copied (a discrete GPU: vk_uma_storage_copied) */
+    const int dear = (inplace & IN_DEAR) && vk_uma_imports_dear() && (!(inplace & IN_FAST) || vk_uma_storage_copied());
     if ((inplace & 3) && vk_uma() && !g_buffer.chain_only && !dear && vk_uma_read(gva, len, align, buf, off)) {
         g_buf_kind = 16;
         if (g_settings.draw_state_check) fast_check(gva, len, *buf, *off, strict, align, inplace);
@@ -4416,7 +4561,15 @@ static int buf_get_(u64 gva, u64 len, VkBuffer* buf, u64* off, int strict, u64 a
            and an 8192x8192 RGBA8 texture's levels took 760 MiB of them that nothing read again, where a phone had
            1 GB available. Such a source takes one once it stays the same, as every other range does */
         int at_once = len >= PATCH_MIN && g_ww > 0 && (strict != 2 || len <= copy_src_at_once());
+        /* frequent, so a small code: 0 stays in the staging ring, 1 counts pending, 2 paged, 3 stable range, 4 big
+           range with tracked writes */
+        SNX_ZONE(z_choice, "vk mem buffer own choice");
         if (ncounts || e->paged > 0 || !((e->stable >= 2 || at_once) && make_own(i, sb, so))) {
+            SNX_ZONE_VALUE(z_choice, ncounts ? 1 : e->paged > 0 ? 2 : 0);
+            SNX_ZONE_TEXT(z_choice, "%lluKB: %s", (unsigned long long)(len >> 10),
+                          ncounts ? "counts pending, staging ring"
+                          : e->paged > 0 ? "paged, staging ring"
+                                         : "staging ring");
             /* changing (or new) data: read from this frame's staging ring */
             e->buf = sb;
             e->off = so;
@@ -4425,6 +4578,10 @@ static int buf_get_(u64 gva, u64 len, VkBuffer* buf, u64* off, int strict, u64 a
                 stage_note(why, changed, gva, len);
             }
             e->frame = vk_submit_number();
+        } else {
+            SNX_ZONE_VALUE(z_choice, e->stable >= 2 ? 3 : 4);
+            SNX_ZONE_TEXT(z_choice, "%lluKB: %s", (unsigned long long)(len >> 10),
+                          e->stable >= 2 ? "stable range, own buffer" : "big range with tracked writes, own buffer");
         }
     }
     if (ncounts && !vk_query_counts(sb, so, counts, ncounts)) { /* not on the GPU: the reports performed, waited for */
@@ -4635,7 +4792,9 @@ int vk_buf_get_strict(u64 gva, u64 len, VkBuffer* buf, u64* off) {
         !vk_release_pending(gva, len)) {
         u64 align = g_vk.props.limits.minStorageBufferOffsetAlignment;
         g_buffer.lk = LK_STRICT;
-        const int got = buf_get(gva, len, buf, off, 1, align ? align : 1, IN_TRY);
+        /* a dispatch's read-only storage: copied as vertices are where storage is (a discrete GPU), else in place */
+        const int got = buf_get(gva, len, buf, off, 1, align ? align : 1,
+                                IN_TRY | (vk_uma_storage_copied() ? IN_DEAR | IN_FAST : 0));
         g_buffer.lk = LK_OTHER;
         return got;
     }
@@ -4723,9 +4882,11 @@ void vk_buf_order_request(int writes_only) {
     /* One later dependency covers every earlier point. Readbacks and surface consumers retain their own orders. */
     if (vk_buf_order_pending(writes_only)) g_buffer.order.required = 1;
     vk_pages_order_request();
+    vk_uma_order_request();
 }
 void vk_buf_ordered(void) {
     vk_pages_ordered();
+    vk_uma_ordered();
     g_buffer.order.owner_reads_ordered = g_buffer.order.owner_reads; /* the renderer's barrier is from all commands */
     g_buffer.order.submit = vk_submit_number();
     g_buffer.order.work = g_vk_drawn + g_vk_dispatches;
@@ -4956,7 +5117,8 @@ static void buf_frame(void) {
             (unsigned long long)(g_buffer.wstat.merged - g_buffer.wstat_seen.merged),
             (unsigned long long)(g_buffer.wstat.kept - g_buffer.wstat_seen.kept));
         g_buffer.wstat_seen = g_buffer.wstat;
-        LOG("vulkan: keep_new rejected (traps_off=%llu uma=%llu empty=%llu unaligned=%llu not_contig=%llu "
+        LOG("vulkan: keep_new rejected since start (cumulative; unlike the per-interval counts above): "
+            "traps_off=%llu uma=%llu empty=%llu unaligned=%llu not_contig=%llu "
             "cpu_read=%llu; in the page cache: pages_not_one_run=%llu other_result_on_pages=%llu "
             "other_pending_on_pages=%llu cache_refused=%llu)\n",
             (unsigned long long)g_keep_fail[KF_TRAPS_OFF], (unsigned long long)g_keep_fail[KF_UMA],

@@ -72,8 +72,9 @@ def check_sources(repo):
 
 
 # The environment variables the code in src/ reads: the system's, SDL's and the package's (CLAUDE.md, "Settings, not
-# environment variables, in src/"). An option of a program in src/ is a setting of src/nx/runtime/settings.txt, or a
-# command-line option of a driver with no settings table
+# environment variables, in src/"). An option of a program in src/ is a setting of src/nx/runtime/settings.txt, a table
+# a driver for its own, which its command line takes by the key (--key=value) and the launcher passes; a run's inputs
+# (a file, a script of presses) are the driver's command line's alone
 ENV_SYSTEM = {
     'HOME',
     'USERPROFILE',
@@ -183,6 +184,34 @@ def call_arguments(source, start):
     return arguments
 
 
+# the programs of src/ with a command line of their own, each one's main by the path from the repository
+DRIVER_MAINS = (
+    'src/nx/runtime/main.c',
+    'src/gnuabi/runtime/main.c',
+    'src/3ds/runtime/main.c',
+    'src/vita/runtime/main.c',
+    'src/agb/runtime/main.c',
+    'src/nds/runtime/main.c',
+    'src/android/runtime/main.c',
+)
+
+
+def check_driver_settings(repo):
+    """every driver takes the settings of its tables by their keys (settings_arg), which the launcher passes it: no
+    option of a driver waits for a table of settings.txt to show in the menus"""
+    errors = []
+    for name in DRIVER_MAINS:
+        path = repo / name
+        if not path.is_file():
+            errors.append(f'{name}: missing: DRIVER_MAINS names the mains that take the settings')
+        elif 'settings_arg(' not in without_comments(path.read_text(encoding='utf-8', errors='replace')):
+            errors.append(
+                f'{name}: it takes no setting of src/nx/runtime/settings.txt: its options are settings, in a table of '
+                'their own, taken by the key (settings_arg, --key=value) and passed by the launcher'
+            )
+    return errors
+
+
 def check_environment(repo):
     """every read of an environment variable in src/ names one of ENV_SYSTEM, or a deprecated one in its own files"""
     errors = []
@@ -217,9 +246,61 @@ def check_environment(repo):
             )
             errors.append(
                 f'{shown}:{line}: {call}("{name}"): {name} is {where}. An option is a setting of '
-                'src/nx/runtime/settings.txt, or a command-line option of a driver with no settings table (CLAUDE.md, '
-                '"Settings, not environment variables, in src/")'
+                'src/nx/runtime/settings.txt, which every driver takes by its key (--key=value), and a run input its '
+                'command line alone (CLAUDE.md, "Settings, not environment variables, in src/")'
             )
+    return errors
+
+
+DETACH = re.compile(r'(?<![A-Za-z0-9_])SDL_DetachThread\s*\(')
+
+
+def check_detached_threads(repo):
+    """no SDL_DetachThread in src/: it reads the thread's handle after it marks the thread detached, and a thread that
+    ends in between has freed the handle (SDL 3.4.18). A thread is waited for at its last answer (SDL_WaitThread)"""
+    errors = []
+    for path in sorted((repo / 'src').rglob('*')):
+        if path.suffix not in {'.c', '.h', '.cpp', '.hpp', '.inc', '.m', '.mm'}:
+            continue
+        source = without_comments(path.read_text(encoding='utf-8', errors='replace'), literals=False)
+        shown = path.relative_to(repo).as_posix()
+        for match in DETACH.finditer(source):
+            line = source.count('\n', 0, match.start()) + 1
+            errors.append(
+                f'{shown}:{line}: SDL_DetachThread reads a thread that may have ended and been freed (SDL 3.4.18): keep '
+                'the thread and wait for it when its last answer comes'
+            )
+    return errors
+
+
+THREAD32_STUB = re.compile(
+    r'(?<![A-Za-z0-9_])(arm_cpu|hook_a32_cpu)\s*\(\s*(?:CPU|SnxArmCPU)\s*\*\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)\s*\{([^}]*)\}'
+)
+
+
+def check_test_threads(repo):
+    """a test that gives the handlers a 32-bit thread's registers (its arm_cpu returns some) finds them from the CPU,
+    and the CPU from the registers (its hook_a32_cpu), as the runtime does in one KThread: an A32 adapter holds the
+    registers through a restrict pointer, and registers that are an object of the test's own, returned whatever the
+    argument, are not that pointer's to the compiler, which then moves the adapter's reads past the handler's writes
+    (hook_install_a32 on Windows on Arm with ThinLTO returned to a stale lr)"""
+    errors = []
+    for path in sorted((repo / 'tests').rglob('*.c')):
+        shown = path.relative_to(repo).as_posix()
+        source = without_comments(path.read_text(encoding='utf-8', errors='replace'), literals=False)
+        stubs = {m.group(1): m for m in THREAD32_STUB.finditer(source)}
+        registers = stubs.get('arm_cpu')
+        if not registers or re.search(r'return\s+(?:\(void\)\s*\w+\s*,\s*)?(?:NULL|0|nullptr)\s*;', registers.group(3)):
+            continue  # no registers for a handler to reach
+        for name, match in sorted(stubs.items()):
+            if re.search(r'\(void\)\s*' + re.escape(match.group(2)) + r'\b', match.group(3)):
+                line = source.count('\n', 0, match.start()) + 1
+                errors.append(
+                    f"{shown}:{line}: {name} returns an object of the test's whatever its argument, and arm_cpu gives "
+                    "the handlers a thread's registers: an A32 adapter holds them through a restrict pointer, so find "
+                    'the registers from the CPU and the CPU from the registers, in one struct, as '
+                    "tests/hook_install_a32.c's Thread32 (src/nx/runtime/arm.c does it in KThread)"
+                )
     return errors
 
 
@@ -251,20 +332,41 @@ def check_window_pixels(repo):
 DYNAMIC_DESCRIPTOR = re.compile(r'\bVK_DESCRIPTOR_TYPE_(UNIFORM|STORAGE)_BUFFER_DYNAMIC\b')
 
 
+# the dynamic descriptors of src/nx that follow cb_dynamic.c's vk_cb_dynamic_choose, which takes no slot on Android,
+# where Turnip runs (#2780): the type it gives a slot (cb_dynamic.h), the pool's room for them (pipeline.c) and the bind
+# that gives their offsets (render.c), as many as each has
+DYNAMIC_DESCRIPTOR_CHOSEN = {
+    'src/nx/gpu/vk/cb_dynamic.h': 1,
+    'src/nx/gpu/vk/pipeline.c': 1,
+    'src/nx/gpu/vk/render.c': 1,
+}
+# the choice's rule for Android, without which those are dynamic on Turnip too
+DYNAMIC_DESCRIPTOR_ANDROID = re.compile(
+    r'#if defined\(__ANDROID__\)\s*(?:/\*.*?\*/\s*)?if \(!off\)\s*off = "off on Android', re.S
+)
+
+
 def check_dynamic_descriptors(repo):
     """no descriptor of src/nx is a dynamic buffer: the NX runtime gives Turnip's reserved descriptor set back as a fifth
     one (gpu_driver_load.c's turnip_sets), and that set is where Turnip keeps dynamic buffers, which then read as zeros.
-    A switch's case naming the type, as a recorder copying any descriptor write does, is no use of it. What was seen,
-    beside the other drivers' quirks: docs/layers/gpu/driver-quirks.md"""
+    A switch's case naming the type, as a recorder copying any descriptor write does, is no use of it; nor are the
+    constant buffers' DYNAMIC_DESCRIPTOR_CHOSEN while cb_dynamic.c chooses none on Android. What was seen, beside the
+    other drivers' quirks: docs/layers/gpu/driver-quirks.md"""
     errors = []
+    chosen = 0
     for path in sorted((repo / 'src/nx').rglob('*')):
         if path.suffix not in {'.c', '.h', '.cpp', '.hpp', '.inc'}:
             continue
         source = without_comments(path.read_text(encoding='utf-8', errors='replace'))
         shown = path.relative_to(repo).as_posix()
+        allowed = DYNAMIC_DESCRIPTOR_CHOSEN.get(shown, 0)
         for match in DYNAMIC_DESCRIPTOR.finditer(source):
             line_start = source.rfind('\n', 0, match.start()) + 1
             if re.match(r'\s*case\s*$', source[line_start : match.start()]):
+                continue
+            if allowed:
+                allowed -= 1
+                chosen += 1
                 continue
             line = source.count('\n', 0, match.start()) + 1
             errors.append(
@@ -273,6 +375,13 @@ def check_dynamic_descriptors(repo):
                 'buffer and give the shader its offset (ui.c and ui.vert do it with a push constant; '
                 'docs/layers/gpu/driver-quirks.md#turnip)'
             )
+    choose = repo / 'src/nx/gpu/vk/cb_dynamic.c'
+    if chosen and not (choose.is_file() and DYNAMIC_DESCRIPTOR_ANDROID.search(choose.read_text(encoding='utf-8'))):
+        errors.append(
+            'src/nx/gpu/vk/cb_dynamic.c: vk_cb_dynamic_choose takes dynamic slots on Android: Turnip keeps dynamic '
+            "buffers in the descriptor set the runtime takes back for a fifth (gpu_driver_load.c's turnip_sets), so "
+            'they read as zeros there. Keep its #if defined(__ANDROID__) that sets off (#2780)'
+        )
     return errors
 
 
@@ -599,6 +708,156 @@ def check_device_makers(repo):
     return errors
 
 
+WEAK = re.compile(r'\[\[[^\]]*\bgnu::weak\b[^\]]*\]\]|__attribute__\s*\(\(\s*weak\s*\)\)')
+# what no program of ours defines: another library's (jemalloc), the ELF linker's, and ours that only Apple's programs
+# have or that no build links yet
+WEAK_DECLARED = {
+    'mallocx',
+    'rallocx',
+    'dallocx',
+    'sallocx',
+    'mallctl',
+    '__ehdr_start',
+    'snx_apple_power_watch',
+    'snx_module_static',
+}
+
+
+def check_weak_declarations(repo):
+    """no function or object of ours is declared weak and left for the program to define or not: where the program
+    defines it, LLVM reads the declaration's address on Windows on Arm through a GOT slot, which COFF has not, so the
+    load reads the function's own first words (lld's "misaligned ldr/str offset" when it starts at an odd word, and a
+    test for null that is always true otherwise). The default is a weak definition beside its caller, which the
+    program's own takes the place of (driver.c's snx_setting_known); WEAK_DECLARED names what no program defines"""
+    errors = []
+    for path in sorted((repo / 'src').rglob('*')):
+        if path.suffix not in {'.c', '.h', '.cpp', '.hpp', '.inc', '.m', '.mm'}:
+            continue
+        shown = path.relative_to(repo).as_posix()
+        source = without_comments(path.read_text(encoding='utf-8', errors='replace'), literals=False)
+        for match in WEAK.finditer(source):
+            ends = re.search(r'[;{=]', source[match.end() :])
+            if not ends or ends.group(0) != ';':
+                continue  # a definition: a body or a value
+            declared = source[match.end() : match.end() + ends.start()]
+            name = re.search(r'([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(|\[|$)', declared.strip())
+            if name and name.group(1) in WEAK_DECLARED:
+                continue
+            line = source.count('\n', 0, match.start()) + 1
+            errors.append(
+                f'{shown}:{line}: {name.group(1) if name else declared.strip()} is declared weak with no definition: '
+                'where the program defines it, LLVM reads it on Windows on Arm through a GOT slot COFF has not, the '
+                'function\'s own first words (lld: "misaligned ldr/str offset"). Give its default as a weak definition '
+                "beside its caller, as src/nx/runtime/driver/driver.c's snx_setting_known, or name it in "
+                'WEAK_DECLARED (tests/architecture.py) when no program of ours defines it'
+            )
+    return errors
+
+
+# A driver, a vendor or a device compared in the code: the VkDriverId's names, a comparison or a switch on an identity
+# field, a device's or driver's name matched as text, and a GPU vendor's PCI ID compared
+DRIVER_ID_NAME = re.compile(r'\bVK_DRIVER_ID_[A-Z0-9_]+\b')
+DRIVER_FIELD = r'\b(?:vendorID|driverID|deviceID|vendor_id|driver_id|device_id|vendor)\b'
+DRIVER_COMPARED = re.compile(
+    rf'{DRIVER_FIELD}[^;\n]*?(?:==|!=)|(?:==|!=)[^;\n]*?{DRIVER_FIELD}|\bswitch\s*\([^)\n]*{DRIVER_FIELD}'
+)
+DRIVER_NAMED = re.compile(
+    r'\b(?:str(?:n|case|ncase)?cmp|strstr|strcasestr|memcmp)\s*\([^;\n]*'
+    r'\b(?:deviceName|driverName|driverInfo|driver_name|driver_info|gpu_name)\b'
+)
+VENDOR_COMPARED = re.compile(r'(?:==|!=)\s*0x(?:10DE|1002|8086|5143|13B5|106B|1010|14E4|144D)[uU]?\b', re.IGNORECASE)
+DRIVER_READER = 'src/common/gpu/vk/extension_bans.c'
+DRIVER_TABLE = 'src/common/gpu/vk/extension_bans.txt'
+# The comparisons that are no choice of a way by driver, each line as the file writes it (its spaces as one) with why
+# it stays. A driver that breaks something or runs it slower never joins them: it is a line of the table
+DRIVER_CHOICES = {
+    'src/common/gpu/vk/driver_tag.c': {
+        'if (vendor != props->vendorID || device != props->deviceID) {': "a pipeline cache's header is another GPU's: "
+        'the identity of a file, which chooses no way',
+    },
+    'src/common/gpu/vk/gpu_pstate.c': {
+        '(mode == SNX_GPU_PSTATE_AUTO && (d->type == SNX_GPU_TYPE_DISCRETE || d->vendor == SNX_GPU_VENDOR_QUALCOMM));': (
+            "gpu_pstate holds the clocks through the interface of the GPU's vendor, and Auto takes it where that "
+            "interface is the phone's"
+        ),
+        'int way = d->vendor == SNX_GPU_VENDOR_NVIDIA;': "which vendor's interface holds the clocks",
+        'way = way || d->vendor == SNX_GPU_VENDOR_AMD;': "which vendor's interface holds the clocks",
+        'way = way || d->vendor == SNX_GPU_VENDOR_QUALCOMM;': "which vendor's interface holds the clocks",
+        'if (d->vendor == SNX_GPU_VENDOR_NVIDIA) {': "NVIDIA's interface: VK_NV_low_latency2's boost",
+        'if (d->vendor == SNX_GPU_VENDOR_QUALCOMM) return kgsl_hold(d, head, say);': "Qualcomm's interface: kgsl",
+    },
+    'src/nx/gpu/vk/device.c': {
+        'if (pstate.vendor == SNX_GPU_VENDOR_NVIDIA && snx_gpu_pstate_wanted(d->pstate, &pstate)) {': (
+            "gpu_pstate's boost on NVIDIA needs VK_NV_low_latency2 enabled: the vendor's own interface"
+        ),
+    },
+    'src/nx/gpu/vk/upscaler/dlss.cpp': {
+        'if (props.vendorID != 0x10DE) {': "DLSS is NVIDIA's own interface (Streamline): it runs on its GPUs alone",
+    },
+    'src/nx/gpu/vk/ui.c': {
+        'switch (g_vk.props.vendorID) {': "a GPU that renders in tiles, which no Vulkan property tells: the hardware's "
+        'architecture by its maker, whatever driver runs it',
+    },
+    'src/nx/gpu/vk/vk.h': {
+        'return vendor == 0x13B5u ? VK_ASTC_ENC_ARM : vendor == 0x5143u ? VK_ASTC_ENC_QCOM : VK_ASTC_ENC_GENERIC;': (
+            'the ASTC encoder written for the GPU family, whatever driver runs it: three programs with one result'
+        ),
+    },
+    'src/gui/gpu_driver_fetch.c': {
+        'if (strncmp(gpu_name, "Adreno ", 7)) return 0;': "the model number in an Adreno's name, for the list of "
+        'driver packages a phone can install',
+        'if (strncmp(gpu_name, family[f].name, n)) continue;': "the GPU family in a device's name, for the same list",
+    },
+}
+
+
+def check_driver_choices(repo):
+    """no source of src/ chooses a way by comparing a driver, a vendor or a device: such a choice is a line of
+    src/common/gpu/vk/extension_bans.txt, "off" where a driver breaks something or runs it slower (vk_ban) and "prefer"
+    where only some drivers take a way (vk_prefer), with its source, the case that tests it again and the setting that
+    goes over it. The table's reader matches the lines; DRIVER_CHOICES lists the comparisons that choose no way"""
+    errors = []
+    seen = {name: set() for name in DRIVER_CHOICES}
+    for path in sorted((repo / 'src').rglob('*')):
+        if path.suffix not in {'.c', '.h', '.cpp', '.hpp', '.inc', '.m', '.mm'}:
+            continue
+        shown = path.relative_to(repo).as_posix()
+        if shown == DRIVER_READER:
+            continue
+        text = path.read_text(encoding='utf-8', errors='replace')
+        kept = without_comments(text).split('\n')
+        allowed = DRIVER_CHOICES.get(shown, {})
+        for number, line in enumerate(without_comments(text, literals=False).split('\n'), 1):
+            found = (
+                DRIVER_ID_NAME.search(line)
+                or DRIVER_COMPARED.search(line)
+                or DRIVER_NAMED.search(line)
+                or VENDOR_COMPARED.search(line)
+            )
+            if not found or re.match(r'\s*#\s*define\b', line):
+                continue
+            written = ' '.join(kept[number - 1].split())
+            if written in allowed:
+                seen[shown].add(written)
+                continue
+            errors.append(
+                f'{shown}:{number}: "{written}" compares a driver, a vendor or a device, which only the extension '
+                f'bans do: put it in {DRIVER_TABLE}, an "off" line asked with vk_ban where the driver breaks '
+                'something or runs it slower, a "prefer" line asked with vk_prefer where only some drivers take a '
+                'way, each with its source and the case that tests it again. A comparison that chooses no way (a '
+                "cache's identity, a vendor's own interface) joins DRIVER_CHOICES in tests/architecture.py with its "
+                'reason'
+            )
+    for name, lines in DRIVER_CHOICES.items():
+        for written in lines:
+            if written not in seen[name]:
+                errors.append(
+                    f'tests/architecture.py: DRIVER_CHOICES allows "{written}" in {name}, which has no such line: '
+                    'take the entry out'
+                )
+    return errors
+
+
 def check_graph(graph):
     source = graph.read_text(encoding='utf-8')
     nodes = {
@@ -660,7 +919,15 @@ def check_graph(graph):
         ('snx_agb_program', ('scarletnx-nx', 'scarletnx-gnuabi', 'scarletnx-3ds', 'snx_driver', 'snx_nx_module')),
         (
             'scarletnx-nds',
-            ('scarletnx-nx', 'scarletnx-gnuabi', 'scarletnx-3ds', 'scarletnx-agb', 'snx_ctr_board', 'snx_driver', 'snx_nx_module'),
+            (
+                'scarletnx-nx',
+                'scarletnx-gnuabi',
+                'scarletnx-3ds',
+                'scarletnx-agb',
+                'snx_ctr_board',
+                'snx_driver',
+                'snx_nx_module',
+            ),
         ),
         (
             'snx_nds_program',
@@ -1109,14 +1376,19 @@ def main():
         parser.error('--sanitizers checks the build tree --build names')
     errors = (
         check_sources(args.repo.resolve())
+        + check_driver_choices(args.repo.resolve())
         + check_include_flags(args.repo.resolve())
         + check_environment(args.repo.resolve())
+        + check_driver_settings(args.repo.resolve())
+        + check_test_threads(args.repo.resolve())
         + check_window_pixels(args.repo.resolve())
+        + check_detached_threads(args.repo.resolve())
         + check_state_fns(args.repo.resolve())
         + check_dynamic_descriptors(args.repo.resolve())
         + check_packages(args.repo.resolve())
         + check_cmake_versions(args.repo.resolve())
         + check_device_makers(args.repo.resolve())
+        + check_weak_declarations(args.repo.resolve())
     )
     if args.build:
         graph = args.build.resolve() / 'architecture-targets.dot'

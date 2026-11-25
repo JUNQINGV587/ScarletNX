@@ -566,6 +566,29 @@ static void test_game_forms(const char* dir) {
 
 /* ---- programs run on the CPU (support/spv_eval.c) ---- */
 
+/* An Ounce draw's per-draw block (SNX_VKB_DRAW) for the evaluator: a window of two blocks, with the draw's pc[] words in
+   the second one, and the push constant word 0 that names it (in 16-byte units). A program that reads at the wrong
+   place gets the first block's zeros or reads past the window. Returns the draw's pc[] */
+/* spv_eval with a zero per-draw block where the test binds none: what a draw whose pc[] words are 0 gives each
+   graphics stage (its depth fix, base instance, windows) */
+static const char* eval_draw(const u32* spv, size_t count, SpvEvalEnv* env) {
+    static u32 zero[SNX_DRAW_WORDS];
+    if (!env->ubo[SNX_VKB_DRAW]) {
+        memset(zero, 0, sizeof zero);
+        env->ubo[SNX_VKB_DRAW] = zero;
+        env->ubo_words[SNX_VKB_DRAW] = SNX_DRAW_WORDS;
+    }
+    return spv_eval(spv, count, env);
+}
+#define DRAW_AT (SNX_DRAW_WORDS / 4)
+static u32* draw_block(SpvEvalEnv* env, u32 window[2 * SNX_DRAW_WORDS]) {
+    memset(window, 0, 2 * SNX_DRAW_WORDS * sizeof *window);
+    env->ubo[SNX_VKB_DRAW] = window;
+    env->ubo_words[SNX_VKB_DRAW] = 2 * SNX_DRAW_WORDS;
+    env->push[0] = DRAW_AT;
+    return window + 4 * DRAW_AT;
+}
+
 static u32 f2u(float f) {
     u32 u;
     memcpy(&u, &f, 4);
@@ -595,11 +618,53 @@ static int run_fs_at(const u8* code, u32 n, u32 lane, const u32* cb1, u32 cb1_wo
     for (u32 k = 0; cb1 && k < cb1_words && k < 1024; k++) bank1[k] = cb1[k];
     env.ubo[SNX_VKB_CB + 1] = bank1;
     env.ubo_words[SNX_VKB_CB + 1] = 1024;
-    const char* why = spv_eval(spv, count, &env);
+    const char* why = eval_draw(spv, count, &env);
     free(spv);
     if (why) fprintf(stderr, "run_fs: the evaluator stops at %s\n", why);
     for (u32 k = 0; k < 4; k++) out[k] = env.out[0][k];
     return !why && env.out_written[0];
+}
+
+/* A loop's exit, @PT CALL.REL.NOINC to the code after its back edge (the BRA back right after the CALL), then 33,000
+   instructions, a call of a function after the main program's EXIT, and that function: no BRA to itself but the
+   function's own. The exit is a branch, though the function's RET lies before that BRA: taken for a call, everything
+   after the loop was copied and went past 65,536 instructions */
+static void test_loop_exit_call(void) {
+    const u32 body = 33000;
+    u8* big = calloc((size_t)body + 16, 16);
+    CHECK(big != NULL);
+    if (!big) return;
+    u32 n = 0;
+    Word x = fix(0x944);
+    set(&x, 34, 48, (u64)(2 - 0 - 1) * 4);
+    set(&x, 86, 4, 0xf);
+    put(big, n++, x);             /* 0: the loop's exit, to 2 */
+    put(big, n, bra(n, 0, 7, 0)); /* 1: back to the loop's start */
+    n++;
+    for (u32 k = 0; k < body; k++) {
+        x = alu(0x002, 1, 3, 255); /* MOV R3, RZ */
+        set(&x, 32, 8, 255);
+        put(big, n++, x);
+    }
+    const u32 call = n++; /* the call of the function, set below */
+    put(big, n++, exit_insn());
+    const u32 entry = n;
+    x = alu(0x002, 4, 0, 255); /* MOV R0, 1.0 */
+    set(&x, 32, 32, 0x3f800000u);
+    put(big, n++, x);
+    x = fix(0x950); /* RET.REL.NODEC R2 */
+    set(&x, 24, 8, 2);
+    set(&x, 86, 4, 0xf);
+    put(big, n++, x);
+    put(big, n, bra(n, n, 7, 0));
+    n++;
+    x = fix(0x944);
+    set(&x, 34, 48, (u64)(entry - call - 1) * 4);
+    set(&x, 86, 4, 0xf);
+    put(big, call, x);
+    u32 out[4] = {0};
+    CHECK(run_fs_at(big, n, 0, NULL, 0, out) && out[0] == 0x3f800000u);
+    free(big);
 }
 
 /* the jump table of the BRX test: c[1][0x10] on, the targets' byte addresses, then a word that is no target */
@@ -888,6 +953,97 @@ static void test_image_kinds(const char* dir) {
     }
 }
 
+/* SUST.P, SULD.P and SUATOM of 1D buffers (dimension 1): storage texel buffers (ImageBuffer), bound at SNX_VKB_IMGBUF
+   plus their slot as a Maxwell program's buffer images are, with one integer coordinate. The store and the load share
+   the handle in c[0][0x30] and a slot; the atomic's R32ui image in c[0][0x40] is another. Before, the translator
+   refused each of them */
+static void test_buffer_images(const char* dir) {
+    u8 code[16 * 5] = {0};
+    Word x = fix(0xb9b); /* SUST.P.1D.BUFFER.RGBA [R0], R4, c[0][0x30] */
+    set(&x, 24, 8, 0);
+    set(&x, 32, 8, 4);
+    set(&x, 40, 14, 0x30 / 4);
+    set(&x, 61, 3, 1);
+    set(&x, 72, 4, 0xf);
+    put(code, 0, x);
+    x = fix(0xb97); /* SULD.P.1D.BUFFER.R R8, [R0], c[0][0x30] */
+    set(&x, 16, 8, 8);
+    set(&x, 24, 8, 0);
+    set(&x, 40, 14, 0x30 / 4);
+    set(&x, 61, 3, 1);
+    set(&x, 72, 4, 1);
+    set(&x, 81, 3, 7);
+    put(code, 1, x);
+    x = fix(0x593); /* SUATOM.1D.BUFFER.ADD R12, [R0], R4, c[0][0x40] */
+    set(&x, 16, 8, 12);
+    set(&x, 24, 8, 0);
+    set(&x, 32, 8, 4);
+    set(&x, 40, 14, 0x40 / 4);
+    set(&x, 61, 3, 1);
+    set(&x, 81, 3, 7);
+    put(code, 2, x);
+    put(code, 3, exit_insn());
+    put(code, 4, bra(4, 4, 7, 0));
+    ShaderInfo si = {0};
+    si.cs_local[0] = si.cs_local[1] = si.cs_local[2] = 1;
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, 5 * 16, ST_CS, NULL, &si, &count);
+    CHECK(spv != NULL);
+    if (!spv) {
+        fprintf(stderr, "buffer images: %s\n", si.first_unsupported);
+        return;
+    }
+    CHECK(si.nimg == 2 && si.img[0].type == 1 && si.img[0].kind == 2 && si.img[0].cbuf_off == 0x30 / 4);
+    CHECK(si.img[1].type == 1 && si.img[1].kind == 1 && si.img[1].cbuf_off == 0x40 / 4);
+    int buffer_cap = 0;
+    for (size_t i = 5; i < count && spv[i] >> 16; i += spv[i] >> 16)
+        buffer_cap |= spv[i] == (2u << 16 | 17) && spv[i + 1] == 47; /* OpCapability ImageBuffer */
+    CHECK(buffer_cap);
+    /* each image's Binding: SNX_VKB_IMGBUF plus its slot */
+    u32 bindings = 0;
+    for (size_t i = 5; i < count && spv[i] >> 16; i += spv[i] >> 16)
+        if ((spv[i] & 0xffff) == 71 && spv[i] >> 16 == 4 && spv[i + 2] == 33 && spv[i + 3] >= SNX_VKB_IMGBUF &&
+            spv[i + 3] < SNX_VKB_IMGBUF + 2)
+            bindings |= 1u << (spv[i + 3] - SNX_VKB_IMGBUF);
+    CHECK(bindings == 3);
+    CHECK(keep_module(dir, "cs_buffer_images", spv, count));
+    free(spv);
+}
+
+/* S2R SR_THREAD_KILL (0x13) in a fragment program: all ones in a helper lane and 0 in another, which is OpIsHelper-
+   InvocationEXT (5381) and a select; outside a fragment program it is refused */
+static void test_thread_kill(const char* dir) {
+    for (u32 stage = 0; stage < 2; stage++) {
+        u8 code[16 * 4] = {0};
+        u32 n = 0, fsph[32] = {0}, helper = 0;
+        Word x = fix(0x919); /* S2R R0, SR_THREAD_KILL */
+        set(&x, 72, 8, 0x13);
+        put(code, n++, x);
+        put(code, n++, exit_insn());
+        put(code, n, bra(n, n, 7, 0));
+        n++;
+        fsph[0] = sph0(2, 5);
+        fsph[18] = 0xf;
+        ShaderInfo si = {0};
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(code, n * 16, stage ? ST_CS : ST_FS, stage ? NULL : fsph, &si, &count);
+        if (stage) {
+            CHECK(!spv && strstr(si.first_unsupported, "0x13 outside a fragment program"));
+            if (spv) free(spv);
+            continue;
+        }
+        CHECK(spv != NULL);
+        if (!spv) {
+            fprintf(stderr, "thread kill: %s\n", si.first_unsupported);
+            continue;
+        }
+        for (u32 i = 5; i + 2 < count; i += spv[i] >> 16 ? spv[i] >> 16 : 1) helper += (spv[i] & 0xffff) == 5381;
+        CHECK(helper == 1);
+        CHECK(keep_module(dir, "fs_thread_kill", spv, count));
+        free(spv);
+    }
+}
+
 /* A fragment program's KILL says so in has_discard, which the renderer reads before it tests depth ahead of the
    program; one without a KILL leaves it 0 */
 static void test_kill_discard(void) {
@@ -1061,7 +1217,7 @@ static void test_minmax_samples(const char* dir) {
             env.image_size[SNX_VKB_TEX][0] = env.image_size[SNX_VKB_TEX][1] = 4;
             for (u32 g = 0; g < 4; g++)
                 for (u32 t = 0; t < 4; t++) env.gather[SNX_VKB_TEX][g][t] = f2u(gathered[g][t]);
-            const char* why = spv_eval(spv, count, &env);
+            const char* why = eval_draw(spv, count, &env);
             const float* want = greatest ? at[c].greatest : at[c].least;
             int same = !why && env.out_written[0];
             for (u32 g = 0; same && g < 4; g++) same = u2f(env.out[0][g]) == want[g];
@@ -1379,7 +1535,7 @@ static void test_shfl_operands(const char* dir) {
                         SpvEvalEnv env = {0};
                         env.builtin[41][0] = lane;
                         env.shuffle_id = ~0u;
-                        const char* why = spv_eval(spv, count, &env);
+                        const char* why = eval_draw(spv, count, &env);
                         if (why || !env.out_written[0] || env.out[0][0] != ok || env.shuffle_id != (j & 31)) {
                             if (!bad++)
                                 fprintf(stderr,
@@ -1611,7 +1767,7 @@ static void test_shared_no_uniform(const char* dir) {
     CHECK(spv != NULL);
     if (!spv) return;
     SpvEvalEnv env = {0};
-    const char* why = spv_eval(spv, count, &env);
+    const char* why = eval_draw(spv, count, &env);
     if (why) fprintf(stderr, "shared: the evaluator stops at %s\n", why);
     CHECK(!why && env.shared_words >= 9 && env.shared[8] == 7);
     CHECK(keep_module(dir, "cs_shared", spv, count));
@@ -1619,6 +1775,106 @@ static void test_shared_no_uniform(const char* dir) {
 }
 
 /* the program code (n instructions) of stage, with header sph, translated and run once in env: 1 when it ran */
+/* The pool map (ShCaps.pool_map, shader.h's SH_MAP_*): a fragment program's TEX of the handle at c[3][0x40], with the
+   texture table, takes its view and sampler slots from the map, not from the draw's texture words. Handle 5 | 3 << 20:
+   TIC record 5's 2D view slot (77) and TSC record 3's plain sampler slot (9), or with the depth compare its compare
+   one (10). A handle past a pool's limit takes the null slots (0). The draw's bit of the slot (SH_DRAW_MAP_WORDS_FS)
+   takes its texture word instead (1234 and 567). The map in the storage buffer at SNX_TABLE_MAP from the word the
+   per-draw block names, and by device address (a module spirv-val checks, as the evaluator reads no addresses) */
+static void test_pool_map(const char* dir) {
+    const ShCaps saved = g_spirv_translate;
+    g_spirv_translate.cb_windows = 1;
+    g_spirv_translate.tex_table = 1;
+    g_spirv_translate.table_set = 5;
+    g_spirv_translate.pool_map = 1;
+    static const struct {
+        u32 handle, shadow, own, image, sampler;
+    } cases[] = {{5 | 3u << 20, 0, 0, 77, 9},
+                 {5 | 3u << 20, 1, 0, 77, 10},
+                 {300 | 3u << 20, 0, 0, 0, 0},
+                 {5 | 300u << 20, 0, 0, 0, 0},
+                 {5 | 3u << 20, 0, 1, 1234, 567}}; /* the draw's bit of the slot: its texture word */
+    static u32 map[4096];
+    memset(map, 0, sizeof map);
+    const u32 tic_dir = 4, tsc_dir = 8, tic_page = 16, tsc_page = tic_page + 256 * SH_MAP_TIC_WORDS;
+    map[SH_MAP_TIC_DIR] = tic_dir;
+    map[SH_MAP_TSC_DIR] = tsc_dir;
+    map[tic_dir] = tic_page;
+    map[tsc_dir] = tsc_page;
+    map[tic_page + 5 * SH_MAP_TIC_WORDS + SH_MAP_CLASS_2D / 2] = 77 | 88u << 16; /* 2D, and 2D array */
+    map[tsc_page + 3 * SH_MAP_TSC_WORDS] = 9 | 10u << 16;
+    for (u32 k = 0; k < sizeof cases / sizeof *cases; k++) {
+        u8 code[5 * 16] = {0};
+        Word tex = tex_offset();
+        set(&tex, 32, 8, 255); /* no offset register */
+        set(&tex, 76, 1, 0);
+        set(&tex, 54, 5, 3); /* c[3][0x40] */
+        if (cases[k].shadow) set(&tex, 78, 1, 1); /* the depth compare, its reference in R5 */
+        put(code, 0, mov_imm(4, f2u(0.5f)));
+        put(code, 1, mov_imm(5, f2u(0.5f)));
+        put(code, 2, tex);
+        put(code, 3, exit_insn());
+        put(code, 4, bra(4, 4, 7, 0));
+        ShaderInfo si = {0};
+        size_t count = 0;
+        u32* spv = translate_fs(code, 5, &si, &count);
+        CHECK(spv != NULL);
+        if (!spv) break;
+        CHECK(si.tex_table & SH_TEX_TABLE_MAP);
+        if (!k) CHECK(keep_module(dir, "pool_map", spv, count));
+        SpvEvalEnv env = {0};
+        static u32 window[256], cb3[32], words[256];
+        memset(window, 0, sizeof window);
+        memset(cb3, 0, sizeof cb3);
+        for (u32 w = 0; w < 256; w++) words[w] = 1234 | 567u << SNX_TABLE_SAMPLER_SHIFT; /* the draw's words */
+        env.ubo[SNX_VKB_DRAW] = window;
+        env.ubo_words[SNX_VKB_DRAW] = 256;
+        env.push[0] = 0;
+        window[SH_DRAW_MAP] = 0;                    /* the map from word 0 of its buffer */
+        window[SH_DRAW_MAP_HEADER] = 0;             /* its header at word 0 */
+        window[SH_DRAW_MAP_LIMITS] = 255 | 255u << 20; /* the pools' limits */
+        window[SH_DRAW_MAP_WORDS_FS] = cases[k].own; /* slot 0 takes its texture word */
+        cb3[0x40 / 4] = cases[k].handle;
+        env.ubo[SNX_VKB_CB + 3] = cb3;
+        env.ubo_words[SNX_VKB_CB + 3] = 32;
+        env.ubo[SNX_TABLE_MAP] = map;
+        env.ubo_words[SNX_TABLE_MAP] = 4096;
+        env.ubo[SNX_VKB_TEXWORDS] = words;
+        env.ubo_words[SNX_VKB_TEXWORDS] = 256;
+        env.element[0] = env.element[1] = 0xdead;
+        const char* why = spv_eval(spv, count, &env);
+        /* the image table at binding 0 of the table's set, the samplers' at binding 1. The evaluator takes no depth
+           compare sample, which comes after both elements are taken */
+        int ok = (!why || cases[k].shadow) && env.element[0] == cases[k].image && env.element[1] == cases[k].sampler;
+        if (!ok)
+            fprintf(stderr, "pool map, handle %08x%s: %s; image slot %u and sampler slot %u, expected %u and %u\n",
+                    cases[k].handle, cases[k].shadow ? " (depth compare)" : "", why ? why : "ran", env.element[0],
+                    env.element[1], cases[k].image, cases[k].sampler);
+        CHECK(ok);
+        free(spv);
+    }
+    /* by device address: the module, for spirv-val */
+    g_spirv_translate.gbuf_address = 1;
+    {
+        u8 code[5 * 16] = {0};
+        Word tex = tex_offset();
+        set(&tex, 32, 8, 255);
+        set(&tex, 76, 1, 0);
+        set(&tex, 54, 5, 3);
+        put(code, 0, mov_imm(4, f2u(0.5f)));
+        put(code, 1, mov_imm(5, f2u(0.5f)));
+        put(code, 2, tex);
+        put(code, 3, exit_insn());
+        put(code, 4, bra(4, 4, 7, 0));
+        ShaderInfo si = {0};
+        size_t count = 0;
+        u32* spv = translate_fs(code, 5, &si, &count);
+        CHECK(spv != NULL && (si.tex_table & SH_TEX_TABLE_MAP));
+        if (spv) CHECK(keep_module(dir, "pool_map_address", spv, count));
+        free(spv);
+    }
+    g_spirv_translate = saved;
+}
 static int run_stage(int stage, const u8* code, u32 n, const u32* sph, SpvEvalEnv* env) {
     ShaderInfo si = {0};
     size_t count = 0;
@@ -1627,7 +1883,7 @@ static int run_stage(int stage, const u8* code, u32 n, const u32* sph, SpvEvalEn
         fprintf(stderr, "run_stage: %s\n", si.first_unsupported);
         return 0;
     }
-    const char* why = spv_eval(spv, count, env);
+    const char* why = eval_draw(spv, count, env);
     free(spv);
     if (why) fprintf(stderr, "run_stage: the evaluator stops at %s\n", why);
     return !why;
@@ -1964,11 +2220,12 @@ static void test_resolution_scale(const char* dir) {
         env.builtin[15][1] = f2u(cases[k].fy);
         env.ubo[SNX_VKB_RS] = scale;
         env.ubo_words[SNX_VKB_RS] = 4;
-        env.push[4] = cases[k].scaled; /* the uvec4 after the fragment stage's vec4: slot 0's bit */
-        env.push[8] = cases[k].own;    /* and the one after it: slot 0's target has the size drawn to */
+        u32 window[2 * SNX_DRAW_WORDS], *pc = draw_block(&env, window);
+        pc[8] = cases[k].scaled; /* the per-draw block at byte 32: slot 0's bit */
+        pc[24] = cases[k].own;   /* and at byte 96: slot 0's target has the size drawn to */
         env.image_size[SNX_VKB_TEX][0] = 32;
         env.image_size[SNX_VKB_TEX][1] = 16;
-        const char* why = spv_eval(spv, count, &env);
+        const char* why = eval_draw(spv, count, &env);
         if (why) fprintf(stderr, "resolution scale: the evaluator stops at %s\n", why);
         CHECK(!why && env.out_written[0]);
         free(spv);
@@ -2019,7 +2276,7 @@ static void test_resolution_scale(const char* dir) {
     for (u32 k = 0; k < nv && k < 64; k++) pushed += spv[vars[k] + 3] == 9; /* PushConstant */
     CHECK(!pushed);
     SpvEvalEnv env = {0};
-    const char* why = spv_eval(spv, count, &env);
+    const char* why = eval_draw(spv, count, &env);
     if (why) fprintf(stderr, "resolution scale, compute: the evaluator stops at %s\n", why);
     CHECK(!why && env.fetched[SNX_VKB_TEX][0] == 5 && env.fetched[SNX_VKB_TEX][1] == 3);
     free(spv);
@@ -2146,7 +2403,7 @@ static void test_ffma_fused(void) {
         put(code, fmul, x);
         ShaderInfo si = {0};
         size_t count = 0;
-        u32* spv = sm86_to_spirv_ftz(code, n * 16, ST_CS, NULL, &si, &count, SH_FTZ_MODE);
+        u32* spv = sm86_to_spirv_ftz(code, n * 16, ST_CS, NULL, &si, &count, SH_FTZ_MODE, SM86_LANES_WARP);
         CHECK(spv != NULL);
         u32 fmas = 0, bare = 0;
         for (size_t i = 5; spv && i < count && spv[i] >> 16; i += spv[i] >> 16) {
@@ -2186,7 +2443,7 @@ static void test_ftz_modes(const char* dir) {
         ShaderInfo si = {0};
         size_t count = 0;
         int mode, tests;
-        u32* spv = sm86_to_spirv_ftz(code, n * 16, ST_CS, NULL, &si, &count, cases[k].can_flush);
+        u32* spv = sm86_to_spirv_ftz(code, n * 16, ST_CS, NULL, &si, &count, cases[k].can_flush, SM86_LANES_WARP);
         CHECK(spv != NULL);
         if (!spv) continue;
         spv_ftz_counts(spv, count, &mode, &tests);
@@ -2212,7 +2469,7 @@ static void test_ftz_modes(const char* dir) {
         ShaderInfo si = {0};
         size_t count = 0;
         int mode, tests;
-        u32* spv = sm86_to_spirv_ftz(code, (n + 1) * 16, ST_CS, NULL, &si, &count, SH_FTZ_MODE);
+        u32* spv = sm86_to_spirv_ftz(code, (n + 1) * 16, ST_CS, NULL, &si, &count, SH_FTZ_MODE, SM86_LANES_WARP);
         CHECK(spv != NULL);
         if (spv) {
             spv_ftz_counts(spv, count, &mode, &tests);
@@ -2248,7 +2505,7 @@ static void test_tex_f16(const char* dir) {
     SpvEvalEnv env = {0};
     const u32 texel[4] = {f2u(0.25f), f2u(0.5f), f2u(0.75f), f2u(0.625f)};
     memcpy(env.texel[SNX_VKB_TEX], texel, sizeof texel);
-    const char* why = spv_eval(spv, count, &env);
+    const char* why = eval_draw(spv, count, &env);
     if (why) fprintf(stderr, "tex f16: the evaluator stops at %s\n", why);
     const u32* o = env.out[0];
     int ok = !why && env.out_written[0] && o[0] == f2u(0.875f) && o[1] == f2u(0.5f) && o[2] == f2u(0.75f) &&
@@ -2322,6 +2579,40 @@ static void test_fragment_depth(const char* dir) {
     (void)dir;
 }
 
+/* A fragment program whose key asks for the depth and stencil tests before it (ShaderInfo.early_fragment_tests, the
+   program's own request) gets OpExecutionMode EarlyFragmentTests, and one that doesn't has none: without it a fragment
+   the tests reject still runs the program's image stores */
+static void test_early_fragment_tests(const char* dir) {
+    u8 code[16 * 4] = {0};
+    u32 n = 0;
+    put(code, n++, mov_imm(0, f2u(1.0f)));
+    put(code, n++, exit_insn());
+    put(code, n, bra(n, n, 7, 0));
+    n++;
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    fsph[18] = 1;
+    for (u32 early = 0; early < 2; early++) {
+        ShaderInfo si = {.early_fragment_tests = early};
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(code, n * 16, ST_FS, fsph, &si, &count);
+        CHECK(spv != NULL);
+        if (!spv) {
+            fprintf(stderr, "early fragment tests: %s\n", si.first_unsupported);
+            return;
+        }
+        u32 modes[16], found = 0;
+        u32 nm = spv_find(spv, count, 16 /* OpExecutionMode */, modes, 16);
+        for (u32 i = 0; i < nm; i++)
+            if (spv[modes[i] + 2] == 9 /* EarlyFragmentTests */) found = 1;
+        CHECK(found == early);
+        if (found != early)
+            fprintf(stderr, "early fragment tests: asked %u, the module has the mode %u\n", early, found);
+        if (dir && early) CHECK(keep_module(dir, "fs_early_fragment_tests", spv, count));
+        free(spv);
+    }
+}
+
 /* the instruction that defines type id (a type's result is its word 1), 0 for none */
 static size_t spv_type_def(const u32* words, size_t count, u32 id) {
     for (size_t i = 5; i < count && words[i] >> 16; i += words[i] >> 16)
@@ -2383,7 +2674,7 @@ static void test_integer_targets(const char* dir) {
                     kind ? kind : '0', kinds[rt]);
     }
     SpvEvalEnv env = {0};
-    const char* why = spv_eval(spv, count, &env);
+    const char* why = eval_draw(spv, count, &env);
     if (why) fprintf(stderr, "integer targets: the evaluator stops at %s\n", why);
     CHECK(!why);
     for (u32 i = 0; !why && i < 12; i++) {
@@ -3203,13 +3494,96 @@ static void test_global_indirect(const char* dir) {
         env.ubo_words[SNX_VKB_SSBO + 2] = 64;
         env.ubo[SNX_VKB_WPAGES] = log;
         env.ubo_words[SNX_VKB_WPAGES] = 2 * SH_WLOG_PART;
-        const char* why = spv_eval(spv, count, &env);
+        const char* why = eval_draw(spv, count, &env);
         int ok = !why && b[1] == (pick_b ? 0xdefu : 0xabcu) && b[2] == 0x777 && a[1] == 0;
         CHECK(ok);
         if (!ok)
             fprintf(stderr, "global indirect (%s): %s, B words %x %x\n", pick_b ? "B" : "A", why ? why : "ran", b[1],
                     b[2]);
         CHECK(keep_module(dir, pick_b ? "global_indirect_b" : "global_indirect_a", spv, count));
+        free(spv);
+    }
+}
+
+static Word mov_cbuf(u32 dst, u32 bank, u32 off);
+/* IADD3 dst, a, c[bank][off], RZ */
+static Word iadd3_cb(u32 dst, u32 a, u32 bank, u32 off) {
+    Word x = alu(0x010, 5, dst, a);
+    cbuf(&x, bank, off);
+    set(&x, 64, 8, 255);
+    set(&x, 81, 3, 7);
+    set(&x, 84, 3, 7);
+    set(&x, 87, 4, 7);
+    set(&x, 77, 4, 7);
+    return x;
+}
+/* Two paths that meet at an LDG with an address in a different storage buffer on each, as one game's instanced
+   vertex programs fetch their matrices: where P0 holds, R6:R7 is buffer B's base (c[0][0x120]) plus an index the
+   program loads from buffer A (c[0][0x110]), and @P0 BRA skips the other path, where it is buffer C's base
+   (c[0][0x130]) plus R2. The loaded index makes the address a value from memory, so the LDG compares it with the
+   program's buffers as it runs (global_dynamic): B and C must be among them, and each path reads its own word. The
+   word goes to buffer D (c[0][0x140]). With only A and D compared, the load read 0 on both paths */
+static void test_global_join_bases(const char* dir) {
+    for (u32 pick = 0; pick < 2; pick++) {
+        u8 code[16 * 16] = {0};
+        u32 n = 0;
+        put(code, n++, setp_const(0, pick ? 0 : 1)); /* P0 = pick */
+        put(code, n++, mov_imm(2, 8));
+        put(code, n++, predicated(mov_cbuf(0, 0, 0x110), 0));
+        put(code, n++, predicated(mov_cbuf(1, 0, 0x114), 0));
+        put(code, n++, predicated(ldg_nou(3, 0, 0, 4), 0)); /* @P0 LDG R3, [R0]: the index, A's word 0 */
+        put(code, n++, predicated(iadd3_cb(6, 3, 0, 0x120), 0));
+        put(code, n++, predicated(mov_cbuf(7, 0, 0x124), 0));
+        put(code, n, bra(n, 10, 0, 0));
+        n++;
+        put(code, n++, iadd3_cb(6, 2, 0, 0x130));
+        put(code, n++, mov_cbuf(7, 0, 0x134));
+        put(code, n++, ldg_nou(8, 6, 0, 4)); /* LDG R8, [R6]: B's or C's */
+        put(code, n++, mov_cbuf(10, 0, 0x140));
+        put(code, n++, mov_cbuf(11, 0, 0x144));
+        put(code, n++, stg_nou(10, 0, 8));
+        put(code, n++, exit_insn());
+        put(code, n, bra(n, n, 7, 0));
+        n++;
+        ShaderInfo si = {0};
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(code, n * 16, ST_CS, NULL, &si, &count);
+        CHECK(spv != NULL);
+        if (!spv) {
+            fprintf(stderr, "global join bases: %s\n", si.first_unsupported);
+            continue;
+        }
+        static u32 bank0[1024], a[16], b[16], cbuf_c[16], d[16], log[2 * SH_WLOG_PART];
+        static const u32 bases[4] = {0x110, 0x120, 0x130, 0x140};
+        u32* data[4] = {a, b, cbuf_c, d};
+        memset(bank0, 0, sizeof bank0);
+        memset(a, 0, sizeof a), memset(b, 0, sizeof b), memset(cbuf_c, 0, sizeof cbuf_c), memset(d, 0, sizeof d);
+        a[0] = 4;
+        b[1] = 0xbbb;
+        cbuf_c[2] = 0xccc;
+        SpvEvalEnv env = {0};
+        env.ubo[SNX_VKB_CB] = bank0;
+        env.ubo_words[SNX_VKB_CB] = 1024;
+        env.ubo[SNX_VKB_WPAGES] = log; /* the store's write log, a compute program's */
+        env.ubo_words[SNX_VKB_WPAGES] = 2 * SH_WLOG_PART;
+        int bound = 0;
+        for (u32 k = 0; k < 4; k++) {
+            bank0[bases[k] / 4] = 0, bank0[bases[k] / 4 + 1] = k + 1, bank0[bases[k] / 4 + 2] = 64;
+            for (int slot = 0; slot < si.ngbuf; slot++)
+                if (si.gbuf_cbuf_off[slot] == bases[k]) {
+                    env.ubo[SNX_VKB_SSBO + slot] = data[k];
+                    env.ubo_words[SNX_VKB_SSBO + slot] = 16;
+                    bound++;
+                }
+        }
+        CHECK(bound == 4 && si.ngbuf == 4);
+        const char* why = spv_eval(spv, count, &env);
+        int ok = !why && d[0] == (pick ? 0xbbbu : 0xcccu);
+        CHECK(ok);
+        if (!ok)
+            fprintf(stderr, "global join bases (%s): %s, %d buffers, D word 0 %x\n", pick ? "B" : "C",
+                    why ? why : "ran", si.ngbuf, d[0]);
+        CHECK(keep_module(dir, pick ? "global_join_bases_b" : "global_join_bases_c", spv, count));
         free(spv);
     }
 }
@@ -3271,7 +3645,7 @@ static void test_global_table(const char* dir) {
     env.ubo_words[SNX_VKB_SSBO + 1] = 64;
     env.ubo[SNX_VKB_WPAGES] = log;
     env.ubo_words[SNX_VKB_WPAGES] = 16 * SH_WLOG_PART;
-    const char* why = spv_eval(spv, count, &env);
+    const char* why = eval_draw(spv, count, &env);
     int ok = !why && a[0x42] == 0xabc && a[0x43] == 13 && a[0x44] == 10;
     for (u32 k = 0; k < 64; k++) ok &= !b[k];
     CHECK(ok);
@@ -3288,7 +3662,7 @@ static void test_global_table(const char* dir) {
     if (spv) {
         memset(log, 0, sizeof log);
         a[0x43] = 10, a[0x44] = 0;
-        why = spv_eval(spv, count, &env);
+        why = eval_draw(spv, count, &env);
         ok = !why && a[0x43] == 13 && a[0x44] == 10;
         CHECK(ok);
         if (!ok)
@@ -3352,7 +3726,7 @@ static void test_global_table_cells(const char* dir) {
     env.ubo_words[SNX_VKB_SSBO + 1] = 64;
     env.ubo[SNX_VKB_WPAGES] = log;
     env.ubo_words[SNX_VKB_WPAGES] = 16 * SH_WLOG_PART;
-    const char* why = spv_eval(spv, count, &env);
+    const char* why = eval_draw(spv, count, &env);
     CHECK(!why && a[0x42] == 0xdef);
     if (why || a[0x42] != 0xdef) fprintf(stderr, "global table cells: %s, word %x\n", why ? why : "ran", a[0x42]);
     CHECK(keep_module(dir, "global_table_cells", spv, count));
@@ -3823,6 +4197,18 @@ static void test_memory_eval(void) {
     set(&imad, 64, 8, 6);
     Word mul[] = {wide, prmt, imad};
     mh_cross("sm86_eval: IMAD and PRMT", mul, 3, cb1);
+    /* IMAD.WIDE R0:R1 = R4 * R6 (signed) + c[1][4] (8 bytes), and .U32 R2:R3 = R4 * R5 + c[1][0] */
+    Word wcb = alu(0x025, 3, 0, 4);
+    set(&wcb, 64, 8, 6);
+    cbuf(&wcb, 1, 4);
+    set(&wcb, 73, 1, 1);
+    set(&wcb, 81, 3, 7);
+    Word wcb2 = alu(0x025, 3, 2, 4);
+    set(&wcb2, 64, 8, 5);
+    cbuf(&wcb2, 1, 0);
+    set(&wcb2, 81, 3, 7);
+    Word wcbs[] = {wcb, wcb2};
+    mh_cross("sm86_eval: IMAD.WIDE of a constant buffer pair", wcbs, 2, cb1);
     /* P0 = R4 < R5 (unsigned), P1 = R4 > R6 (signed) and P0; R0 = P0 ? R4 : R5, R1 = signed min of R4 and R6, P2 =
        P0 ^ P1 (PLOP3), R2 = P2 ? R5 : R6, R3 = R4 ^ R5 ^ R6 */
     Word mnmx = alu(0x017, 1, 1, 4);
@@ -3902,7 +4288,7 @@ static void test_atomic_fadd(const char* dir) {
         env.ubo_words[SNX_VKB_SSBO] = 16;
         env.ubo[SNX_VKB_WPAGES] = log;
         env.ubo_words[SNX_VKB_WPAGES] = SH_WLOG_PART;
-        const char* why = spv_eval(spv, count, &env);
+        const char* why = eval_draw(spv, count, &env);
         int ok = !why && buffer[1] == f2u(2.0f) && buffer[2] == f2u(3.25f) && buffer[3] == f2u(1.0f);
         CHECK(ok);
         if (!ok)
@@ -3991,7 +4377,7 @@ static void test_global_two_bases(const char* dir) {
         env.ubo_words[SNX_VKB_SSBO + at_c1] = 4;
         env.ubo[SNX_VKB_WPAGES] = log;
         env.ubo_words[SNX_VKB_WPAGES] = 2 * SH_WLOG_PART;
-        const char* why = spv_eval(spv, count, &env);
+        const char* why = eval_draw(spv, count, &env);
         int ok = !why && buffer[4] == f2u(offset ? 1.0f : 3.5f) && !other[0] && !other[1] && !other[2] && !other[3];
         CHECK(ok);
         if (!ok) fprintf(stderr, "global two bases (offset %x): %s, word %08x\n", offset, why ? why : "ran", buffer[4]);
@@ -4055,7 +4441,7 @@ static void test_global_atomic_same_register(const char* dir) {
     env.ubo_words[SNX_VKB_SSBO + at_c1] = 4;
     env.ubo[SNX_VKB_WPAGES] = log;
     env.ubo_words[SNX_VKB_WPAGES] = 2 * SH_WLOG_PART;
-    const char* why = spv_eval(spv, count, &env);
+    const char* why = eval_draw(spv, count, &env);
     int ok = !why && buffer[4] == 8 && buffer[5] == 5 && !other[0];
     CHECK(ok);
     if (!ok)
@@ -4144,7 +4530,7 @@ static ShaderInfo mesh_info(u32 sph[32]) {
     ShaderInfo si = {0};
     sph[0] = sph0(1, 1);
     sph[13] = 0xfu << 12 | 1u << 21; /* the output map: the position (bits 428-431) and generic 1.y (bit 437) */
-    si.mesh = (ShMesh){1, 0x80, 40, 2, 0, 3, 0, {0}};
+    si.mesh = (ShMesh){.threads = 1, .payload = 0x80, .max_vertices = 40, .max_primitives = 2, .primitive_vertices = 3};
     si.mesh.prim_sph[0] = 0x010c1081u; /* a geometry SPH with passthrough on, generic 0.x (bit 432) */
     si.mesh.prim_sph[13] = 1u << 16;
     return si;
@@ -4169,14 +4555,15 @@ static void test_mesh(const char* dir) {
         SpvEvalEnv env = {0};
         static u32 first_ubo[4]; /* SNX_VKB_RS, which only an indirect draw's flag reads (test_task) */
         env.builtin[26][0] = 2; /* WorkgroupId.x, after the draw's first group 5 */
-        env.push[0] = 5;
-        env.push[1] = fix_depth ? f2u(1.0f) : 0;
+        u32 window[2 * SNX_DRAW_WORDS], *pc = draw_block(&env, window);
+        pc[0] = 5;                         /* the first workgroup */
+        pc[1] = fix_depth ? f2u(1.0f) : 0; /* the depth fix */
         env.ubo[SNX_VKB_RS] = first_ubo, env.ubo_words[SNX_VKB_RS] = 4;
         env.arrays[32] = position, env.array_words[32] = 40 * 4;
         env.arrays[1] = generic1, env.array_words[1] = 40 * 4;
         env.arrays[0] = generic0, env.array_words[0] = 2 * 4;
         env.arrays[33] = indices, env.array_words[33] = 2 * 3;
-        const char* why = spv_eval(spv, count, &env);
+        const char* why = eval_draw(spv, count, &env);
         free(spv);
         if (why) fprintf(stderr, "mesh: the evaluator stops at %s\n", why);
         CHECK(!why && env.set_outputs == 1 && env.mesh_outputs[0] == 40 && env.mesh_outputs[1] == 2);
@@ -4230,11 +4617,12 @@ static void test_task(const char* dir) {
         SpvEvalEnv env = {0};
         u32 first_ubo[4] = {variant == 2 ? first : 0x777, 0, 0, 0};
         env.builtin[26][0] = 2;
-        env.push[0] = variant == 2 ? 99 : first;
-        env.push[2] = variant == 2 ? SH_PUSH_GPU_MESH_FIRST : 0;
+        u32 window[2 * SNX_DRAW_WORDS], *pc = draw_block(&env, window);
+        pc[0] = variant == 2 ? 99 : first;                 /* the first workgroup */
+        pc[2] = variant == 2 ? SH_PUSH_GPU_MESH_FIRST : 0; /* the flags */
         env.ubo[SNX_VKB_RS] = first_ubo, env.ubo_words[SNX_VKB_RS] = 4;
         env.payload[1] = 77;
-        const char* why = spv_eval(spv, count, &env);
+        const char* why = eval_draw(spv, count, &env);
         free(spv);
         if (why) fprintf(stderr, "task: the evaluator stops at %s\n", why);
         /* index 2: 3 groups; index 7: the EXIT leaves the count at 0 */
@@ -4264,7 +4652,7 @@ static void test_mesh_after_task(const char* dir) {
     sph[0] = 0x020c0c81u;          /* a tessellation evaluation SPH, as the hardware runs it */
     sph[13] = 1u << 12 | 1u << 16; /* position.x and generic 0.x */
     ShaderInfo si = {0};
-    si.mesh = (ShMesh){1, 0x20, 1, 1, 1, 3, 0, {0}};
+    si.mesh = (ShMesh){.threads = 1, .payload = 0x20, .max_vertices = 1, .max_primitives = 1, .has_task = 1, .primitive_vertices = 3};
     size_t count = 0;
     u32* spv = sm86_to_spirv(code, n * 16, ST_MS, sph, &si, &count);
     CHECK(spv != NULL);
@@ -4276,16 +4664,136 @@ static void test_mesh_after_task(const char* dir) {
     static u32 position[4], generic0[4];
     SpvEvalEnv env = {0};
     env.builtin[26][0] = 2;
-    env.push[0] = 5;
+    u32 window[2 * SNX_DRAW_WORDS];
+    draw_block(&env, window)[0] = 5; /* the first workgroup, which a mesh after a task does not add */
     env.payload[5] = f2u(3.0f);
     env.arrays[32] = position, env.array_words[32] = 4;
     env.arrays[0] = generic0, env.array_words[0] = 4;
-    const char* why = spv_eval(spv, count, &env);
+    const char* why = eval_draw(spv, count, &env);
     free(spv);
     if (why) fprintf(stderr, "mesh after a task: the evaluator stops at %s\n", why);
     CHECK(!why && env.set_outputs == 1 && env.mesh_outputs[0] == 1 && env.mesh_outputs[1] == 1);
     CHECK(position[0] == f2u(3.0f) && position[1] == 0 && position[2] == 0 && position[3] == f2u(1.0f));
     CHECK(generic0[0] == 2);
+}
+
+/* The compute-task path (sm86.h): the task program is a compute program that writes the payload into a storage
+   buffer, and the mesh program reads it from there, both with the buffer's slots given by the push constant and the
+   groups the task stores in the draw's record. The evaluator runs the modules as they are, which is where the record,
+   the counts and a slot's payload are checked */
+static void test_mesh_task_compute(const char* dir) {
+    const u32 stride = 8, cap = 4, groups_asked = 5, first = 0;
+    u32 buffer[256];
+    u8 code[16 * 10] = {0};
+    u32 n = 0;
+    /* the task program: its workgroup index into the payload's word 4, and the groups it launches */
+    put(code, n++, isbe_insn(0, 0, 255, 0, ISBE_B32, ISBE_ATTR, 1, 0));
+    put(code, n++, isbe_insn(1, 0, 255, 0x10, ISBE_B32, ISBE_ATTR, 0, 1));
+    put(code, n++, isbe_insn(1, 0, 255, 4, ISBE_B32, ISBE_ATTR, 0, 1));
+    put(code, n++, exit_insn());
+    put(code, n, bra(n, n, 7, 0));
+    n++;
+    u32 sph[32] = {0};
+    sph[0] = 0x000c0481u; /* a task program's */
+    ShaderInfo si = {0};
+    si.mesh = (ShMesh){.threads = 1, .payload = stride * 4, .payload_buf = 1, .payload_stride = stride};
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, n * 16, ST_TS, sph, &si, &count);
+    CHECK(spv != NULL);
+    if (!spv) {
+        fprintf(stderr, "task compute: %s\n", si.first_unsupported);
+        return;
+    }
+    CHECK(!si.unsupported && keep_module(dir, "ts_compute", spv, count));
+    u32 first_word[4] = {first, 0, 0, 0};
+    for (u32 group = 0; group < 3; group++) { /* workgroup 0 stores the record's groups, 2 a slot's payload */
+        memset(buffer, 0, sizeof buffer);
+        SpvEvalEnv env = {0};
+        env.builtin[26][0] = group, env.builtin[24][0] = groups_asked;
+        env.push[0] = first;
+        env.push[2] = SH_PUSH_GPU_MESH_FIRST | cap << 8;
+        env.ubo[SNX_VKB_RS] = first_word, env.ubo_words[SNX_VKB_RS] = 4;
+        env.ubo[SNX_VKB_MESHBUF] = buffer, env.ubo_words[SNX_VKB_MESHBUF] = 256;
+        const char* why = eval_draw(spv, count, &env);
+        free(spv);
+        if (why) fprintf(stderr, "task compute: the evaluator stops at %s\n", why);
+        CHECK(!why);
+        u32 groups = groups_asked < cap ? groups_asked : cap;
+        u32 slot = group < groups ? group : groups - 1;
+        u32 base = 4 + groups + slot * stride;
+        CHECK(buffer[base + 4] == group);         /* the payload's word 4 */
+        CHECK(buffer[4 + slot] == group);         /* the groups this task workgroup launched */
+        CHECK(buffer[0] == (group ? group : 0));  /* the record's x: the most one launched */
+        if (!group) CHECK(buffer[1] == groups && buffer[2] == 1);
+        /* the mesh program's evaluation below uses the whole buffer as one task workgroup's slots only: remake it */
+        if (group == 2) break;
+        /* translate again for the next workgroup: the module was freed */
+        si = (ShaderInfo){0};
+        si.mesh = (ShMesh){.threads = 1, .payload = stride * 4, .payload_buf = 1, .payload_stride = stride};
+        spv = sm86_to_spirv(code, n * 16, ST_TS, sph, &si, &count);
+    }
+    /* The mesh program after the task, in the same buffer: its slot is WorkgroupId.y's, the groups are the record's
+       word 1, and its payload's word 5 is position.x. A workgroup at or past its task's count produces nothing */
+    u8 mesh_code[16 * 10] = {0};
+    n = 0;
+    put(mesh_code, n++, isbe_insn(0, 0, 255, 0, ISBE_B32, ISBE_ATTR, 0, 0));
+    put(mesh_code, n++, isbe_insn(0, 1, 255, 0x14, ISBE_B32, ISBE_ATTR, 0, 0));
+    put(mesh_code, n++, isbe_insn(1, 1, 255, 0, ISBE_B32, ISBE_ATTR, 1, 1));
+    put(mesh_code, n++, isbe_insn(1, 0, 255, 0x80, ISBE_B32, ISBE_ATTR, 1, 1));
+    put(mesh_code, n++, mov_imm(2, 1));
+    put(mesh_code, n++, isbe_insn(1, 2, 255, 3, ISBE_B32, ISBE_MAP, 0, 1));
+    put(mesh_code, n++, exit_insn());
+    put(mesh_code, n, bra(n, n, 7, 0));
+    n++;
+    u32 msph[32] = {0};
+    msph[0] = 0x020c0c81u;
+    msph[13] = 1u << 12 | 1u << 16;
+    for (u32 culled = 0; culled < 2; culled++) {
+        ShaderInfo msi = {0};
+        msi.mesh = (ShMesh){.threads = 1,
+                            .payload = stride * 4,
+                            .payload_buf = 1,
+                            .payload_stride = stride,
+                            .max_vertices = 1,
+                            .max_primitives = 1,
+                            .has_task = 1,
+                            .primitive_vertices = 3};
+        size_t mcount = 0;
+        u32* mspv = sm86_to_spirv(mesh_code, n * 16, ST_MS, msph, &msi, &mcount);
+        CHECK(mspv != NULL);
+        if (!mspv) {
+            fprintf(stderr, "mesh compute: %s\n", msi.first_unsupported);
+            return;
+        }
+        if (!culled) CHECK(keep_module(dir, "ms_compute", mspv, mcount));
+        memset(buffer, 0, sizeof buffer);
+        u32 groups = 2, y = 1, x = culled ? 3 : 1;
+        buffer[1] = groups;
+        buffer[4 + y] = 2; /* the task workgroup 1 launched two groups */
+        u32 base = 4 + groups + y * stride;
+        buffer[base + 5] = f2u(7.0f);
+        static u32 position[4], generic0[4];
+        memset(position, 0, sizeof position);
+        SpvEvalEnv env = {0};
+        env.builtin[26][0] = x, env.builtin[26][1] = y;
+        env.push[2] = SH_PUSH_GPU_MESH_FIRST | cap << 8;
+        env.ubo[SNX_VKB_RS] = first_word, env.ubo_words[SNX_VKB_RS] = 4;
+        env.ubo[SNX_VKB_MESHBUF] = buffer, env.ubo_words[SNX_VKB_MESHBUF] = 256;
+        env.arrays[32] = position, env.array_words[32] = 4;
+        env.arrays[0] = generic0, env.array_words[0] = 4;
+        const char* why = eval_draw(mspv, mcount, &env);
+        free(mspv);
+        if (why) fprintf(stderr, "mesh compute: the evaluator stops at %s\n", why);
+        CHECK(!why && env.set_outputs == 1);
+        if (culled) {
+            CHECK(env.mesh_outputs[0] == 0 && env.mesh_outputs[1] == 0); /* it says so before it returns */
+            CHECK(position[0] == 0);
+        } else {
+            CHECK(env.mesh_outputs[0] == 1 && env.mesh_outputs[1] == 1);
+            CHECK(position[0] == f2u(7.0f) && position[1] == 0 && position[3] == f2u(1.0f));
+            CHECK(generic0[0] == x); /* the index within the task's launch, read from the record's slot */
+        }
+    }
 }
 
 /* sm86_mesh_output_bytes against the outputs that the translation declares: four scalars for each Output location,
@@ -4453,7 +4961,7 @@ static void test_geometry(const char* dir) {
                 env.gs_in[0][4 * v + k] = f2u(10.0f * (float)(v + 1) + (float)k);
             }
         env.builtin[7][0] = 42; /* PrimitiveId */
-        const char* why = spv_eval(spv, count, &env);
+        const char* why = eval_draw(spv, count, &env);
         if (why) fprintf(stderr, "geometry: the evaluator stops at %s\n", why);
         CHECK(!why);
         if (culled) {
@@ -4590,8 +5098,9 @@ static void test_geometry_emit(const char* dir) {
                 env.gs_in[32][4 * v + k] = gs_position(v, k, 0);
                 env.gs_in[0][4 * v + k] = f2u(10.0f * (float)(v + 1) + (float)k);
             }
-        env.push[1] = f2u(1.0f);
-        const char* why = spv_eval(spv, count, &env);
+        u32 window[2 * SNX_DRAW_WORDS];
+        draw_block(&env, window)[1] = f2u(1.0f); /* the depth fix, in the per-draw block of every graphics stage */
+        const char* why = eval_draw(spv, count, &env);
         free(spv);
         if (why) fprintf(stderr, "geometry emit: the evaluator stops at %s\n", why);
         CHECK(!why);
@@ -4639,8 +5148,9 @@ static void test_geometry_adjacency(void) {
                 env.gs_in[32][4 * v + k] = gs_position(v, k, 0);
                 env.gs_in[0][4 * v + k] = f2u(10.0f * (float)(v + 1) + (float)k);
             }
-        env.push[1] = f2u(1.0f);
-        const char* why = spv_eval(spv, count, &env);
+        u32 window[2 * SNX_DRAW_WORDS];
+        draw_block(&env, window)[1] = f2u(1.0f); /* the depth fix, in the per-draw block of every graphics stage */
+        const char* why = eval_draw(spv, count, &env);
         free(spv);
         if (why) fprintf(stderr, "geometry adjacency: the evaluator stops at %s\n", why);
         CHECK(!why);
@@ -4721,7 +5231,7 @@ static void test_fragment_unfed(const char* dir) {
         SpvEvalEnv env = {0};
         env.in[0][0] = f2u(0.75f);
         env.builtin[15][3] = f2u(1.0f); /* FragCoord.w, which IPA's perspective divides by */
-        const char* why = spv_eval(spv, count, &env);
+        const char* why = eval_draw(spv, count, &env);
         free(spv);
         if (why) fprintf(stderr, "fragment unfed: the evaluator stops at %s\n", why);
         CHECK(!why && env.out[0][0] == (unfed ? 0 : f2u(0.75f)));
@@ -4812,7 +5322,7 @@ static int fold_run(const Word* insns, u32 n, float x, float w, u32* r0) {
     env.in[0][0] = f2u(x);
     for (u32 k = 0; k < 3; k++) env.builtin[15][k] = f2u(1.0f); /* FragCoord */
     env.builtin[15][3] = f2u(w);
-    const char* why = spv_eval(spv, count, &env);
+    const char* why = eval_draw(spv, count, &env);
     free(spv);
     if (why) fprintf(stderr, "perspective fold: the evaluator stops at %s\n", why);
     *r0 = env.out[0][0];
@@ -5040,6 +5550,76 @@ static int spv_has_builtin(const u32* words, size_t count, u32 builtin) {
         if ((words[i] & 0xffff) == 71 && words[i] >> 16 == 4 && words[i + 2] == 11 && words[i + 3] == builtin) return 1;
     return 0;
 }
+/* AST a[0x64], the layer: BuiltIn Layer, which a geometry program writes with the Geometry capability it has and a
+   vertex program with ShaderLayer where the device has it (g_spirv_translate.output_layer); without it a vertex
+   program's store is dropped, as the Maxwell translator drops it. writes_layer says it is written. Before, the
+   translator refused the store */
+static void test_layer_store(const char* dir) {
+    u8 code[16 * 4] = {0};
+    put(code, 0, mov_imm(1, 3));
+    put(code, 1, ast(0x64, 1, 1));
+    put(code, 2, exit_insn());
+    put(code, 3, bra(3, 3, 7, 0));
+    u32 sph[32] = {0};
+    sph[0] = sph0(1, 4) | 1u << 24; /* passthrough */
+    sph[3] = 7u << 24;              /* a triangle strip */
+    sph[4] = 1;
+    ShaderInfo si = {0};
+    si.rt_int_mask = 3; /* a triangle's vertices */
+    for (u32 w = 0; w < 8; w++) si.gp_skip_mask[w] = 0xffffffffu;
+    si.gp_skip_mask[0] = 0x0fffffffu; /* the position */
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, 4 * 16, ST_GS, sph, &si, &count);
+    CHECK(spv && si.writes_layer && spv_has_builtin(spv, count, 9 /* Layer */));
+    if (!spv) fprintf(stderr, "layer store: %s\n", si.first_unsupported);
+    if (spv) {
+        CHECK(keep_module(dir, "gs_layer", spv, count));
+        /* the passthrough's three vertices each carry layer 3, though each EmitVertex leaves the outputs undefined */
+        static SpvEvalEnv env;
+        memset(&env, 0, sizeof env);
+        const char* why = eval_draw(spv, count, &env);
+        if (why) fprintf(stderr, "layer store: the evaluator stops at %s\n", why);
+        CHECK(!why && env.emitted == 3 && env.vertex_layer[0] == 3 && env.vertex_layer[1] == 3 &&
+              env.vertex_layer[2] == 3);
+    }
+    free(spv);
+    u32 vsph[32] = {0};
+    vsph[0] = sph0(1, 1);
+    int had = g_spirv_translate.output_layer;
+    for (int feature = 0; feature < 2; feature++) {
+        g_spirv_translate.output_layer = feature;
+        ShaderInfo v = {0};
+        spv = sm86_to_spirv(code, 4 * 16, ST_VS, vsph, &v, &count);
+        CHECK(spv && v.writes_layer == feature && spv_has_builtin(spv, count, 9 /* Layer */) == feature &&
+              spv_declares(spv, count, 69 /* ShaderLayer */) == feature);
+        if (spv && feature) CHECK(keep_module(dir, "vs_layer", spv, count));
+        free(spv);
+    }
+    /* IPA a[0x64] in a fragment program, the layer: BuiltIn Layer with the Geometry capability, else with
+       ShaderLayer, else 0 with no input at all. Before, the translator refused it */
+    u8 fs[16 * 3] = {0};
+    put(fs, 0, fold_ipa(0, 0x64));
+    put(fs, 1, exit_insn());
+    put(fs, 2, bra(2, 2, 7, 0));
+    u32 fsph[32] = {0};
+    fsph[0] = sph0(2, 5);
+    const int had_geometry = g_spirv_translate.geometry;
+    for (int way = 0; way < 3; way++) { /* Geometry, ShaderLayer, neither */
+        g_spirv_translate.geometry = way == 0;
+        g_spirv_translate.output_layer = way == 1;
+        ShaderInfo f = {0};
+        spv = sm86_to_spirv(fs, 3 * 16, ST_FS, fsph, &f, &count);
+        CHECK(spv && spv_has_builtin(spv, count, 9 /* Layer */) == (way < 2) &&
+              spv_declares(spv, count, 2 /* Geometry */) == (way == 0) &&
+              spv_declares(spv, count, 69 /* ShaderLayer */) == (way == 1));
+        if (!spv) fprintf(stderr, "layer input: %s\n", f.first_unsupported);
+        static const char* const names[2] = {"fs_layer_geometry", "fs_layer_shader_layer"};
+        if (spv && way < 2) CHECK(keep_module(dir, names[way], spv, count));
+        free(spv);
+    }
+    g_spirv_translate.geometry = had_geometry;
+    g_spirv_translate.output_layer = had;
+}
 /* AST a[0x2c0] of two words, ClipDistance0 = 0.5 and ClipDistance1 = 0.25. A vertex program before the rasterizer
    writes only the planes that SetUserClipEnable enables (ShaderInfo.clip_enable's low bits) into an 8-plane
    ClipDistance output that it names in uses_clip_mask, and the other planes are 0, as the program starts them: the
@@ -5069,7 +5649,7 @@ static void test_clip_distances(const char* dir) {
         int has = cases[i].mask != 0;
         int ok = spv && si.uses_clip_mask == cases[i].mask && spv_has_builtin(spv, count, 3 /* ClipDistance */) == has;
         memset(&env, 0, sizeof env);
-        const char* why = spv ? spv_eval(spv, count, &env) : "not translated";
+        const char* why = spv ? eval_draw(spv, count, &env) : "not translated";
         ok &= !why;
         for (u32 plane = 0; plane < 8 && has; plane++) {
             u32 want = plane == 0 && (cases[i].mask & 1)   ? f2u(0.5f)
@@ -5105,7 +5685,7 @@ static void test_clip_distances(const char* dir) {
     memset(&env, 0, sizeof env);
     for (u32 v = 0; v < 3; v++)
         for (u32 k = 0; k < 4; k++) env.gs_in[32][4 * v + k] = f2u((float)(v + 1) + 0.25f * (float)k);
-    const char* why = spv ? spv_eval(spv, count, &env) : "not translated";
+    const char* why = spv ? eval_draw(spv, count, &env) : "not translated";
     int ok = !why && si.uses_clip_mask == 1 && env.emitted == 3;
     for (u32 v = 0; v < 3 && v < env.emitted; v++)
         for (u32 plane = 0; plane < 8; plane++) ok &= env.vertex_clip[v][plane] == (plane ? 0 : f2u(0.75f));
@@ -5831,7 +6411,7 @@ static void test_hfma2_once(const char* dir) {
         SpvEvalEnv env = {0};
         env.ubo[SNX_VKB_CB + 1] = bank1;
         env.ubo_words[SNX_VKB_CB + 1] = 4;
-        const char* why = spv_eval(spv, count, &env);
+        const char* why = eval_draw(spv, count, &env);
         u32 got = env.out[0][0], wanted = want[0] | want[1] << 16;
         tried++;
         if ((why || got != wanted) && bad++ < 6)
@@ -6063,6 +6643,100 @@ static void test_coop_fused_only(const char* dir) {
     static const u32 insns[1][5] = {{20, COOP_LDSM | 24, 12, 255, 0x18}};
     static const u32 outs[4] = {20, 21, 22, 23};
     CHECK(coop_case(dir, "coop_fused_only", insns, 1, outs, 4));
+}
+
+/* the matrix loads of a program on the cooperative matrices of one shape, 0 when it does not translate */
+static u32 coop_loads(const u8* code, u32 n, u32 bit) {
+    int coop_was = g_spirv_translate.hmma_coop, f16_was = g_spirv_translate.float16;
+    u32 shapes_was = g_spirv_translate.hmma_coop_shapes;
+    g_spirv_translate.hmma_coop = 65536, g_spirv_translate.hmma_coop_shapes = bit;
+    g_spirv_translate.float16 = 1;
+    ShaderInfo si = {0};
+    si.cs_local[0] = 32, si.cs_local[1] = si.cs_local[2] = 1;
+    si.shared_size = 1024;
+    size_t count = 0;
+    u32* spv = sm86_to_spirv(code, n * 16, ST_CS, NULL, &si, &count);
+    const u32 loads = spv ? spv_count(spv, count, 4457) : 0;
+    free(spv);
+    g_spirv_translate.hmma_coop = coop_was, g_spirv_translate.hmma_coop_shapes = shapes_was;
+    g_spirv_translate.float16 = f16_was;
+    return loads;
+}
+/* A straight-line block that stages more fragments than the cooperative matrix cache holds (COOP_FRAGS): each step
+   writes an A register, then multiplies that A with the same two Bs. The A of one step is dead at the next one's write
+   and leaves the cache as room is needed, so a step's second HMMA takes its A from the first's matrices at every step,
+   and the matrix loads grow by the same count a step, before the cache is full and after. A full cache that dropped
+   none kept the first steps' dead As, and both HMMAs of every later step staged their A */
+static u32 coop_cache_loads(u32 steps, u32 bit) {
+    u8 code[16 * 64] = {0};
+    u32 n = 0;
+    for (u32 k = 0; k < steps; k++) {
+        put(code, n++, alu(0x002, 5, 8, 0)); /* MOV R8, c[0x0][0x0] */
+        for (u32 b = 0; b < 2; b++)          /* HMMA.16816.F16 R16 or R20, R8, R12 or R14, RZ */
+            put(code, n++, hmma_insn(16 + 4 * b, 8, 12 + 2 * b, 255, 0x08));
+    }
+    put(code, n++, exit_insn());
+    put(code, n, bra(n, n, 7, 0));
+    return coop_loads(code, n + 1, bit);
+}
+static void test_coop_cache(void) {
+    static const u32 bits[4] = {SH_COOP_16x16x16, SH_COOP_16x8x16, SH_COOP_16x8x8, SH_COOP_8x8x8};
+    for (u32 s = 0; s < 4; s++) {
+        const u32 l2 = coop_cache_loads(2, bits[s]), l3 = coop_cache_loads(3, bits[s]),
+                  l16 = coop_cache_loads(16, bits[s]);
+        if (!l2 || l16 != l3 + 13 * (l3 - l2))
+            fprintf(stderr, "matrix shape %u: %u matrix loads for 2 steps, %u for 3 and %u for 16, expected %u\n", s,
+                    l2, l3, l16, l3 + 13 * (l3 - l2));
+        CHECK(l2 && l3 > l2 && l16 == l3 + 13 * (l3 - l2));
+    }
+}
+/* Runs of 32 steps that fill the cache many times over. A step writes a register of two A tuples (R32-R39) or of two B
+   ones (R40-R43) from the lane's inputs, then multiplies an A and a B of them, .16816 (4 and 2 registers) or .1688 (2
+   and 1 of them), into one of two f32 Ds, chained or not, or of two f16 ones, with a C or none. That is 8 fragments, the
+   cache's bound, so a full one always has a dead entry for a new one, and a fragment is staged again only once one of
+   its own registers is written: one matrix load for each of them where the device's shape is 16x16x16. And the values
+   are the gathers': a fragment the cache moves, or keeps past a write, gives another's matrix or words no longer there */
+static u32 coop_rand(u32* seed, u32 n) {
+    *seed = *seed * 1664525u + 1013904223u;
+    return (*seed >> 16) % n;
+}
+static Word mov_reg(u32 d, u32 a) {
+    Word x = alu(0x002, 1, d, 255);
+    set(&x, 32, 8, a);
+    return x;
+}
+static void test_coop_cache_values(const char* dir) {
+    static const u32 outs[12] = {20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31};
+    for (u32 run = 0; run < 4; run++) {
+        u8 code[16 * 128] = {0};
+        u32 n = coop_prologue(code), seed = 0x2545f491u + run, want = 0;
+        /* [A or B][its tuple][.1688 or .16816]: staged since the last write of its registers; and the f32 Ds that hold
+           a product of the run */
+        int live[2][2][2] = {0}, chain[2] = {0};
+        for (u32 k = 0; k < 12; k++) put(code, n++, mov_reg(32 + k, 8 + coop_rand(&seed, 8)));
+        for (u32 k = 0; k < 32; k++) {
+            u32 r = coop_rand(&seed, 12), of_b = r >= 8, size = of_b ? 2 : 4, at = of_b ? r - 8 : r;
+            put(code, n++, mov_reg(32 + r, 8 + coop_rand(&seed, 8)));
+            live[of_b][at / size][1] = 0;
+            if (at % size < size / 2) live[of_b][at / size][0] = 0;
+            u32 k16 = coop_rand(&seed, 2), f32 = coop_rand(&seed, 2), a = coop_rand(&seed, 2);
+            u32 b = coop_rand(&seed, 2), d = coop_rand(&seed, 2), with_c = coop_rand(&seed, 2);
+            want += !live[0][a][k16] + !live[1][b][k16];
+            live[0][a][k16] = live[1][b][k16] = 1;
+            u32 dst = f32 ? 20 + 4 * d : 28 + 2 * d, cr = 255;
+            if (with_c && !f32) cr = 14;
+            if (with_c && f32 && chain[d]) cr = dst;
+            if (f32) chain[d] = 1;
+            put(code, n++, hmma_insn(dst, 32 + 4 * a, 40 + 2 * b, cr, k16 << 3 | f32 << 4));
+        }
+        n = coop_epilogue(code, n, outs, 12);
+        char name[32];
+        snprintf(name, sizeof name, "coop_cache_values%u", run);
+        const u32 loads = coop_loads(code, n, SH_COOP_16x16x16);
+        if (loads != want) fprintf(stderr, "%s: %u matrix loads, %u fragments staged\n", name, loads, want);
+        CHECK(want > 16 && loads == want);
+        CHECK(coop_agrees(code, n, 12, dir, name));
+    }
 }
 
 /* Jumps around a fused LDSM and HMMA (fuse.c), on the evaluator's 32 lanes with the gathers, against the same program
@@ -6556,6 +7230,45 @@ static void test_complementary_pair(const char* dir) {
                             reader, first_negated, p0, env.out[0][0], want0, env.out[0][1], want1, merges);
             }
     (void)dir;
+}
+
+/* IABS R0, R5 is x < 0 ? -x : x without GLSL.std.450's SAbs (instruction 5 of the program's one extended set): R0 is
+   |R5| for positive, zero and negative values, and the most negative value stays as it is */
+static void test_iabs_select(void) {
+    static const u32 values[5][2] = {{5, 5}, {0xfffffffbu, 5}, {0, 0}, {0xffffffffu, 1}, {0x80000000u, 0x80000000u}};
+    for (u32 k = 0; k < 5; k++) {
+        u8 code[16 * 8] = {0};
+        u32 n = 0;
+        for (u32 r = 0; r < 4; r++) put(code, n++, mov_imm(r, f2u(0.25f)));
+        put(code, n++, mov_imm(5, values[k][0]));
+        Word x = alu(0x013, 1, 0, 255); /* IABS R0, R5 */
+        set(&x, 32, 8, 5);
+        put(code, n++, x);
+        put(code, n++, exit_insn());
+        put(code, n, bra(n, n, 7, 0));
+        n++;
+        u32 fsph[32] = {0};
+        fsph[0] = sph0(2, 5);
+        fsph[18] = 0xf;
+        ShaderInfo si = {0};
+        size_t count = 0;
+        u32* spv = sm86_to_spirv(code, n * 16, ST_FS, fsph, &si, &count);
+        CHECK(spv != NULL);
+        if (!spv) {
+            fprintf(stderr, "iabs: %s\n", si.first_unsupported);
+            continue;
+        }
+        u32 at[256], sabs = 0;
+        u32 ext = spv_find(spv, count, 12 /* OpExtInst */, at, 256);
+        for (u32 i = 0; i < ext; i++) sabs += spv[at[i] + 4] == 5;
+        free(spv);
+        CHECK(sabs == 0);
+        SpvEvalEnv env = {0};
+        int ran = run_stage(ST_FS, code, n, fsph, &env);
+        CHECK(ran && env.out[0][0] == values[k][1]);
+        if (!ran || env.out[0][0] != values[k][1] || sabs)
+            fprintf(stderr, "iabs of %08x: %08x (%08x), %u SAbs\n", values[k][0], env.out[0][0], values[k][1], sabs);
+    }
 }
 
 /* the fuse of an LDSM and the HMMA that reads its fragments (fuse.c): one instruction where the two were, with the
@@ -7319,6 +8032,8 @@ static void test_brx_two_tables(const char* dir) {
     (void)dir;
 }
 
+#include "shader_sm86_lone.inc"
+
 int main(int argc, char** argv) {
     const char* dir = argc > 1 ? argv[1] : ".";
     test_alu_forms();
@@ -7329,16 +8044,20 @@ int main(int argc, char** argv) {
     test_tcs_empty();
     test_programs(dir);
     test_game_forms(dir);
+    test_loop_exit_call();
     test_brx(dir);
     test_warp_base_blocks(dir);
     test_brx_bounded(dir);
     test_alu_group(dir);
     test_compute_forms(dir);
     test_image_kinds(dir);
+    test_buffer_images(dir);
+    test_thread_kill(dir);
     test_kill_discard();
     test_root_tables(dir);
     test_texel_offsets(dir);
     test_minmax_samples(dir);
+    test_pool_map(dir);
     test_global_flow(dir);
     test_fswzadd(dir);
     test_lane_masks(dir);
@@ -7369,6 +8088,7 @@ int main(int argc, char** argv) {
     test_tex_f16(dir);
     test_output_defaults(dir);
     test_fragment_depth(dir);
+    test_early_fragment_tests(dir);
     test_integer_targets(dir);
     test_clip_distances(dir);
     test_float64_fallback_scale(dir);
@@ -7380,6 +8100,7 @@ int main(int argc, char** argv) {
     test_base_instance_word(dir);
     test_u64_conversions();
     test_global_indirect(dir);
+    test_global_join_bases(dir);
     test_global_table(dir);
     test_global_table_cells(dir);
     test_f2ip(dir);
@@ -7397,9 +8118,11 @@ int main(int argc, char** argv) {
     test_mesh(dir);
     test_task(dir);
     test_mesh_after_task(dir);
+    test_mesh_task_compute(dir);
     test_mesh_output_bytes();
     test_mesh_refused();
     test_geometry(dir);
+    test_layer_store(dir);
     test_geometry_emit(dir);
     test_geometry_adjacency();
     test_fragment_per_primitive(dir);
@@ -7416,6 +8139,12 @@ int main(int argc, char** argv) {
     test_coop_overlap(dir);
     test_coop_flow(dir);
     test_coop_fused_only(dir);
+    test_coop_cache();
+    test_coop_cache_values(dir);
+    test_lone_lanes(dir);
+    test_lone_lanes_refused();
+    test_lone_length();
+    test_lone_stages();
     test_warp_matrix_flush(dir);
     test_hmma_way();
     test_hmma_rule();
@@ -7426,6 +8155,7 @@ int main(int argc, char** argv) {
     test_ftz_modes(dir);
     test_ffma_fused();
     test_complementary_pair(dir);
+    test_iabs_select();
     test_fuse_pairs();
     test_fuse_branch();
     test_fuse_ldsm_hmma(dir);
