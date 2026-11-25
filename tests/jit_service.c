@@ -810,22 +810,22 @@ static void test_invalidated_callee(void) {
     snx_jit_service_free(service);
 }
 
-/* an invalidation of another range while a pc compiles: the batch read code that may be stale, so it publishes nothing
-   and its pcs go back to their queue. Before, they were left GONE with their pending bit set, which snx_jit_resolve's
-   fast path reads as "queued, wait for it": nothing queued them again, and the pc was never compiled (rt_miss's fatal,
-   a game's at 98f1fc4). Each batch is held from its epoch until the invalidation: without that the batch may end
-   before it however long the function is, when the host runs that thread first */
+/* an invalidation of another range while a pc compiles: with code_fingerprint the batch found the code it read
+   unchanged, so it publishes, and the pc never goes back to its queue. Each batch is held from its epoch until the
+   invalidation: without that the batch may end before it however long the function is, when the host runs that
+   thread first */
 #define IN_FLIGHT_PC 0x10000
-/* whether the batch queued for pc, held as it begins while memory elsewhere changes, is dropped, with nothing published
-   by its end (its thread is held in its report) */
-static int dropped_in_flight(u64 pc) {
-    int dropped = in_flight_wait(&in_flight.begun);
+/* whether the batch queued for pc, held as it begins while memory elsewhere changes, still publishes: the invalidation
+   touched code the batch never read, and code_fingerprint finds the code it did read unchanged, so the batch stands
+   (what a game does all the time elsewhere in memory must not cost a batch its second of the game's time) */
+static int kept_in_flight(u64 pc) {
+    int kept = in_flight_wait(&in_flight.begun);
     snx_jit_invalidate(service, 0x8000, 0x10);
     hold(1);
     in_flight_release();
-    dropped = dropped && in_flight_wait(&in_flight.ended) && in_flight.dropped && get(pc) == NULL;
+    kept = kept && in_flight_wait(&in_flight.ended) && !in_flight.dropped && get(pc) != NULL;
     hold(0);
-    return dropped;
+    return kept;
 }
 static void test_invalidate_in_flight(void) {
     static const u32 words[] = {0x91000400, 0xD65F03C0}; /* add x0, x0, #1; ret */
@@ -846,17 +846,17 @@ static void test_invalidate_in_flight(void) {
         snx_jit_invalidate(service, IN_FLIGHT_PC, 4); /* the pc is new to the service again */
         in_flight_hold(IN_FLIGHT_PC);
         CHECK(snx_jit_resolve(service, IN_FLIGHT_PC) == NULL);
-        ok = dropped_in_flight(IN_FLIGHT_PC);
+        ok = kept_in_flight(IN_FLIGHT_PC);
         CHECK(ok);
-        CHECK(snx_jit_wait(service, IN_FLIGHT_PC) != NULL); /* queued again, and compiled once nothing changes */
+        CHECK(snx_jit_wait(service, IN_FLIGHT_PC) != NULL); /* published once nothing changes */
         snx_jit_stats(service, &stats);
-        CHECK(stats.dropped == dropped + round + 1);
+        CHECK(stats.dropped == dropped);
     }
     /* a warm pc goes back to the warm queue, and is compiled from there */
     put(0x4800, words, 2);
     in_flight_hold(0x4800);
     CHECK(snx_jit_warm(service, warm_pc, 1) == 1);
-    CHECK(dropped_in_flight(0x4800));
+    CHECK(kept_in_flight(0x4800));
     snx_jit_drain(service);
     CHECK(get(0x4800) != NULL);
     snx_jit_stats(service, &stats);
