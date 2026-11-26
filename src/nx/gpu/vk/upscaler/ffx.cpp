@@ -207,16 +207,21 @@ int snx_ffx_available(const char** why) {
     return 0;
 }
 
-/* the major number in a provider's name (FidelityFX Super Resolution 4.1.2: 4), 0 when it has no number */
-static int provider_major(const char* name) {
-    if (!name) return 0;
-    for (; *name; name++) {
-        if (*name < '0' || *name > '9') continue;
-        int v = 0;
-        while (*name >= '0' && *name <= '9') v = v * 10 + (*name++ - '0');
-        return v;
+/* 4.1 in a provider's name (FidelityFX Super Resolution 4.1.2, FSR 4.1.6): this runs 4.1 and nothing else */
+static int is_41(const char* name) { return name && strstr(name, "4.1") != NULL; }
+
+/* a colour format the API calls perceptual sRGB, for the dispatch's flag */
+static int srgb(const VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8_SRGB:
+        case VK_FORMAT_R8G8_SRGB:
+        case VK_FORMAT_R8G8B8_SRGB:
+        case VK_FORMAT_B8G8R8_SRGB:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+        case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return 1;
+        default: return 0;
     }
-    return 0;
 }
 
 SnxFfx* snx_ffx_create(const SnxUpscalerInfo* info, const char** why) {
@@ -268,18 +273,18 @@ SnxFfx* snx_ffx_create(const SnxUpscalerInfo* info, const char** why) {
                 const char* name = names[i] ? names[i] : "";
                 size_t at = strlen(seen);
                 if (at + 1 < sizeof seen) snprintf(seen + at, sizeof seen - at, "%s%s", at ? ", " : "", name);
-                if (!forced && provider_major(name) == 4) {
+                if (!forced && is_41(name)) {
                     over.versionId = ids[i];
                     forced = 1;
                 }
             }
             if (!forced) {
-                g.failed = 1;
+                /* not off for good: the next setup asks the runtime again, in case a driver update or a device
+                   change brought 4.1 since */
                 snprintf(g.why, sizeof g.why,
-                         "AMD's runtime for this GPU has no FSR 4.1, only %.150s. FSR 4.1 needs a driver with it, and "
-                         "this game leaves it off",
+                         "AMD's runtime for this GPU has no FSR 4.1, only %s. FSR 4.1 needs a driver with it and this "
+                         "game leaves it to FSR 2",
                          seen);
-                snprintf(g.fail_reason, sizeof g.fail_reason, "%s", g.why);
                 say(2, "FSR 4.1: %s", g.why);
                 free(f);
                 *why = g.why;
@@ -313,6 +318,7 @@ SnxFfx* snx_ffx_create(const SnxUpscalerInfo* info, const char** why) {
     if (rc != FFX_API_RETURN_OK) rc = attempt(0, 0);
     if (rc != FFX_API_RETURN_OK) {
         snprintf(g.why, sizeof g.why, "AMD's FidelityFX API made no FSR 4.1 context (%s)", code_name(rc));
+        say(2, "FSR 4.1: %s", g.why);
         free(f);
         *why = g.why;
         return NULL;
@@ -321,14 +327,12 @@ SnxFfx* snx_ffx_create(const SnxUpscalerInfo* info, const char** why) {
     ffxQueryGetProviderVersion pv = {};
     pv.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
     ffxReturnCode_t qrc = g.api.query(&f->ctx, &pv.header);
-    if (qrc != FFX_API_RETURN_OK || !pv.versionName || provider_major(pv.versionName) != 4) {
+    if (qrc != FFX_API_RETURN_OK || !pv.versionName || !is_41(pv.versionName)) {
         if (pv.versionName)
-            snprintf(g.why, sizeof g.why, "AMD's FidelityFX API gave %.120s, not FSR 4.1", pv.versionName);
+            snprintf(g.why, sizeof g.why, "AMD's FidelityFX API gave %s, not FSR 4.1", pv.versionName);
         else
             snprintf(g.why, sizeof g.why, "AMD's FidelityFX API did not name the FSR it gave: not used");
         g.api.destroy(&f->ctx, NULL);
-        g.failed = 1;
-        snprintf(g.fail_reason, sizeof g.fail_reason, "%s", g.why);
         say(2, "FSR 4.1: %s", g.why);
         free(f);
         *why = g.why;
@@ -366,8 +370,11 @@ int snx_ffx_evaluate(SnxFfx* f, const SnxUpscaleEval* e, const char** why) {
     if (e->reactive.image)
         d.reactive = image(e->reactive, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY);
     d.output = image(e->output, FFX_API_RESOURCE_STATE_UNORDERED_ACCESS, FFX_API_RESOURCE_USAGE_UAV);
-    /* the API wants the camera's jitter, as the game gives it: the picture moved by -jitter, and a jitter that is
-       dropped or given the other way shows as a soft or a shimmering picture */
+    /* the input's colours are display-referred: the API has a flag that says sRGB (the provider ignores it today,
+       and a version that reads it should be told) */
+    if (srgb(e->color.format)) d.flags |= FFX_UPSCALE_FLAG_NON_LINEAR_COLOR_SRGB;
+    /* the API wants the camera's jitter, as the game gives it: the picture moved by +jitter, the same value FSR 2
+       takes (fsr2.cpp), and one that is dropped or given the other way shows as a soft or a shimmering picture */
     d.jitterOffset = {e->jitter[0], e->jitter[1]};
     d.motionVectorScale = {e->motion_scale[0], e->motion_scale[1]};
     d.renderSize = {e->render[0], e->render[1]};

@@ -159,8 +159,8 @@ static int ready(SnxUpscalerId id, const u32 render[2], const u32 out[2], u32 fl
     u64 started = plat_ns();
     g_upscale.up = snx_upscaler_create(id, &info, &why);
     if (!g_upscale.up) {
-        LOG_LIMIT(4, "vulkan: %s can't be set up for %ux%u to %ux%u (%s): %s stand in\n", caps->name, render[0],
-                  render[1], out[0], out[1], why, fallback);
+        LOG_LIMIT(4, "vulkan: %s can't be set up for %ux%u to %ux%u (%s), so %s\n", caps->name, render[0], render[1],
+                  out[0], out[1], why, fallback);
         vkDestroyImageView(g_vk.dev, g_upscale.view, NULL);
         vk_image_destroy(g_upscale.image, g_upscale.memory);
         g_upscale.image = VK_NULL_HANDLE;
@@ -332,8 +332,8 @@ int vk_upscale(const GpuUpscale* u) {
                              {u->out[0], u->out[1]},
                              cf,
                              format};
-    SnxUpscalerId id = snx_upscaler_choose(none ? SNX_UPSCALER_COPY : (SnxUpscalerId)(g_settings.render_upscaler - 1),
-                                           g_vk.phys, &needs, &why);
+    SnxUpscalerId preferred = none ? SNX_UPSCALER_COPY : (SnxUpscalerId)(g_settings.render_upscaler - 1);
+    SnxUpscalerId id = snx_upscaler_choose(preferred, g_vk.phys, &needs, &why);
     if (id == SNX_UPSCALERS) {
         LOG_LIMIT(4, "vulkan: no upscaler takes %s's %ux%u to %ux%u (%s): %s\n",
                   module ? "a hook module" : "a DLSS evaluation", u->render[0], u->render[1], u->out[0], u->out[1], why,
@@ -343,7 +343,21 @@ int vk_upscale(const GpuUpscale* u) {
     if (why)
         LOG_LIMIT(2, "vulkan: %s stands in for the upscaler the settings ask for: %s\n", snx_upscaler_caps(id)->name,
                   why);
-    if (!ready(id, render_max, u->out, flags, cf, format, who, "filtered copies")) return 0;
+    /* one whose context can't be made here (an AMD runtime that refuses this GPU or its driver, say) doesn't end the
+       frame's upscale: the next one that can stands in for this setup, and the next setup tries it again */
+    SnxUpscalerId skip[SNX_UPSCALERS];
+    uint32_t skipped = 1;
+    skip[0] = id;
+    while (!ready(id, render_max, u->out, flags, cf, format, who,
+                  "the next upscaler that can stands in, else the front end's copy")) {
+        if (skipped == SNX_UPSCALERS) return 0;
+        SnxUpscalerId next = snx_upscaler_choose_except(preferred, g_vk.phys, &needs, skip, skipped, &why);
+        if (next == SNX_UPSCALERS) return 0;
+        LOG_LIMIT(2, "vulkan: %s stands in for %s, which can't be set up here\n", snx_upscaler_caps(next)->name,
+                  snx_upscaler_caps(id)->name);
+        id = next;
+        skip[skipped++] = next;
+    }
 
     VkCommandBuffer cb = vk_cmd(); /* after the inputs' read checks (input) and the context's setup */
     Surf* reads[5] = {color, depth, motion, exposure, reactive};

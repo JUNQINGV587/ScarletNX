@@ -120,6 +120,11 @@ static const char* refusal(SnxUpscalerId id, VkPhysicalDevice physical, const Sn
 
 SnxUpscalerId snx_upscaler_choose(SnxUpscalerId preferred, VkPhysicalDevice physical, const SnxUpscaleNeeds* n,
                                   const char** why) {
+    return snx_upscaler_choose_except(preferred, physical, n, NULL, 0, why);
+}
+
+SnxUpscalerId snx_upscaler_choose_except(SnxUpscalerId preferred, VkPhysicalDevice physical, const SnxUpscaleNeeds* n,
+                                         const SnxUpscalerId* skip, uint32_t count, const char** why) {
     static const SnxUpscalerId best[] = {SNX_UPSCALER_DLSS, SNX_UPSCALER_FSR_NEW, SNX_UPSCALER_XESS,
                                          SNX_UPSCALER_FSR2, SNX_UPSCALER_SPATIAL, SNX_UPSCALER_COPY};
     const char *none, *first = NULL, *accepted = NULL;
@@ -128,6 +133,10 @@ SnxUpscalerId snx_upscaler_choose(SnxUpscalerId preferred, VkPhysicalDevice phys
     for (int i = -1; i < (int)(sizeof best / sizeof *best); i++) {
         SnxUpscalerId id = i < 0 ? preferred : best[i];
         if (id < 0 || id >= SNX_UPSCALERS || (i >= 0 && id == preferred)) continue;
+        int left_out = 0;
+        for (uint32_t k = 0; k < count; k++)
+            if (skip[k] == id) left_out = 1;
+        if (left_out) continue;
         const char* r = refusal(id, physical, n);
         if (!r) {
             *why = first; /* the preferred one's reason, when another stands in */

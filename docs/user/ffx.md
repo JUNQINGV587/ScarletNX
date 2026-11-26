@@ -24,7 +24,8 @@ Nothing is installed: the program loads the loader from that folder when the gam
 
 FSR 4.1 runs on a Radeon RX 6000, 7000 or 9000, or a Ryzen AI APU whose driver has it, and it needs a recent driver
 (SDK 2.4's notes name Adrenalin 26.10.1). The program asks the runtime for its FSR 4.1 provider by name and refuses
-any other, so a driver with FSR 3.1 alone does not run it: FSR 2.2 stands in. The log says which upscaler started.
+any other, so a driver with FSR 3.1 alone does not run it: FSR 2.2 stands in for that setup, and the next setup
+asks the runtime again. The log says which upscaler started.
 
 ## Settings
 
@@ -40,6 +41,8 @@ any other, so a driver with FSR 3.1 alone does not run it: FSR 2.2 stands in. Th
 - `vulkan: FSR 4.1: FidelityFX Super Resolution 4.1.2, from D:\fsr (1280x720 to 2560x1440)`: the files were found,
   their signature is AMD's, and a context was made for the game's sizes.
 - `vulkan: no FSR 4.1: ...` says why it can't run (no folder, a file missing or not signed, a parameter the API
-  refuses), and FSR 2 runs instead. A runtime whose GPU has only FSR 3.1 says so there too, and FSR 4.1 stays off.
-- A failure during the game turns FSR 4.1 off until the next start, and the next upscaler takes over from the next
-  evaluation.
+  refuses), and FSR 2 runs instead. A runtime whose GPU has only FSR 3.1 says so there too: FSR 4.1 stays off for
+  that setup, and the next setup asks again.
+- A dispatch that fails turns FSR 4.1 off until the next start, and the next upscaler takes over from the next
+  evaluation. A context that can't be made does not: the next upscaler takes that frame, and the next setup tries
+  FSR 4.1 again.

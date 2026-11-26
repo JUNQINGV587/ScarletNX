@@ -150,10 +150,11 @@ A context goes round its descriptors over `SNX_UPSCALER_IN_FLIGHT` (4) evaluatio
   makes one context for the game's sizes and records one dispatch per evaluation. The API takes each image as its own
   resource description (the `VkImage` itself) with the input states and the output as a UAV. It takes the jitter as
   the game gives it, the motion vectors' scale as the renderer states it, and the camera's planes for its depth
-  weights. It asks the runtime for its 4.x provider by id (`ffxOverrideVersion`) and refuses a context whose
-  provider is anything else, so a driver with FSR 3.1 alone leaves FSR 4.1 off and FSR 2 stands in. A failure of the
-  dispatch makes FSR 4.1 unavailable from then on, so the next evaluation chooses FSR 2 too. It needs Windows and an
-  AMD driver with FSR 4.1.
+  weights. It asks the runtime for its 4.1 provider by id (`ffxOverrideVersion`) and refuses a context whose
+  provider is anything else, so a driver with FSR 3.1 alone leaves FSR 4.1 off and FSR 2 stands in for that setup.
+  A context that can't be made is tried again at the next setup, with the next upscaler taking that frame. A failure
+  of the dispatch makes FSR 4.1 unavailable from then on, so the next evaluation chooses FSR 2 too. It needs Windows
+  and an AMD driver with FSR 4.1.
 - The XeSS stub describes its backend so that the setting and the choice know it, and says why it is not available.
   It would be a backend file and a case in `upscaler.c`, with the runtime loaded at run time and only MIT headers in
   the tree.
@@ -168,7 +169,8 @@ that onto the game's output target.
 - One context at a time. It takes any render size up to the one it was made for, so a game's dynamic resolution
   doesn't make another. Another backend, output size, output format or convention makes a new one, after the device is
   done with the old one's commands. The color's format doesn't: the choice checks it at each call, and no backend
-  keeps it. A setup that failed is not tried again until one of those changes.
+  keeps it. A setup that failed is not tried again until one of those changes, and the frame falls to the next
+  upscaler that can, so one backend's refusal doesn't take the frame's upscale with it.
 - The color's range is the caller's when it says (`GPU_UPSCALE_RANGE_GIVEN`), else its format's: a float format is
   HDR.
 - At a resolution multiplier other than 1 (the `resolution` setting, or a hook module's from the internal resolution

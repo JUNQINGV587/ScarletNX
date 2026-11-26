@@ -66,6 +66,10 @@ typedef struct {
    none: the caller's own fallback runs, and why says what the preferred one (or the last tried) lacked */
 SnxUpscalerId snx_upscaler_choose(SnxUpscalerId preferred, VkPhysicalDevice physical, const SnxUpscaleNeeds* n,
                                   const char** why);
+/* as above, leaving out the backends in skip: the next best that can stands in for a setup one of them could not be
+   made for, and a later setup tries it again */
+SnxUpscalerId snx_upscaler_choose_except(SnxUpscalerId preferred, VkPhysicalDevice physical, const SnxUpscaleNeeds* n,
+                                         const SnxUpscalerId* skip, uint32_t count, const char** why);
 
 /* conventions a context is made for (fsr2.h's bits, the same values) */
 enum {
