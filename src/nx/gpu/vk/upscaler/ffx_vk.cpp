@@ -113,13 +113,23 @@ FfxApiSurfaceFormat surface(VkFormat f) {
     }
 }
 
-/* the provider's backend description, before the FFX API's own backend structure: the provider reads the device,
-   the physical device and the loader's vkGetDeviceProcAddr from it */
+/* the FidelityFX SDK's Vulkan backend description: the device, the physical device and the loader's
+   vkGetDeviceProcAddr, nested in a VkDeviceContext as SDK 2.x has it */
+/* FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK = FFX_API_MAKE_BACKEND_SUB_ID(FFX_API_BACKEND_ID_VK, 0x03), from
+   the SDK's vk/ffx_api_vk.h, which this build does not vendor */
+#ifndef FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK
+#define FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK 0x01000003u
+#endif
+
+struct VkDeviceContext {
+    VkDevice vkDevice;
+    VkPhysicalDevice vkPhysicalDevice;
+    PFN_vkGetDeviceProcAddr vkDeviceProcAddr;
+};
+
 struct CreateBackendVkDesc {
     ffxCreateContextDescHeader header;
-    VkDevice device;
-    VkPhysicalDevice physicalDevice;
-    PFN_vkGetDeviceProcAddr getDeviceProcAddr;
+    VkDeviceContext deviceContext;
 };
 
 struct Fsr4VulkanApiVersionDesc {
@@ -264,10 +274,10 @@ extern "C" SnxFfx* snx_ffx_create(const SnxUpscalerInfo* info, const char** why)
     apiver.header.type = 0x46535234564b4150ull;
     apiver.apiVersion = VK_API_VERSION_1_3;
     CreateBackendVkDesc back = {};
-    back.header.type = 3u;
-    back.device = info->device;
-    back.physicalDevice = info->physical;
-    back.getDeviceProcAddr = vkGetDeviceProcAddr;
+    back.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
+    back.deviceContext.vkDevice = info->device;
+    back.deviceContext.vkPhysicalDevice = info->physical;
+    back.deviceContext.vkDeviceProcAddr = vkGetDeviceProcAddr;
     ffxCreateContextDescUpscale up = {};
     up.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
     up.maxRenderSize.width = info->render_max[0];

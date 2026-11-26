@@ -37,10 +37,29 @@
 
 namespace {
 constexpr ffxStructType_t kBackendVkDescType = 3u;
+// FFX_API_MAKE_BACKEND_SUB_ID(FFX_API_BACKEND_ID_VK, 0x03), the FidelityFX SDK 2.x form: a VkDeviceContext inside.
+constexpr ffxStructType_t kBackendVkDescTypeNew = 0x01000003u;
 constexpr ffxStructType_t kFsr4VulkanApiVersionDescType =
     0x46535234564b4150ull;
 struct CreateBackendVkDesc {
     ffxCreateContextDescHeader header;
+    VkDevice device;
+    VkPhysicalDevice physicalDevice;
+    PFN_vkGetDeviceProcAddr getDeviceProcAddr;
+};
+
+struct VkDeviceContext {
+    VkDevice vkDevice;
+    VkPhysicalDevice vkPhysicalDevice;
+    PFN_vkGetDeviceProcAddr vkDeviceProcAddr;
+};
+
+struct CreateBackendVkDescNew {
+    ffxCreateContextDescHeader header;
+    VkDeviceContext deviceContext;
+};
+
+struct Backend {
     VkDevice device;
     VkPhysicalDevice physicalDevice;
     PFN_vkGetDeviceProcAddr getDeviceProcAddr;
@@ -216,13 +235,24 @@ void validateApiChain(const ffxApiHeader* header) {
     }
 }
 
-const CreateBackendVkDesc* findBackend(const ffxApiHeader* header) {
+bool findBackend(const ffxApiHeader* header, Backend* out) {
     for (auto* current = header; current; current = current->pNext) {
+        if (current->type == kBackendVkDescTypeNew) {
+            const auto* desc = reinterpret_cast<const CreateBackendVkDescNew*>(current);
+            out->device = desc->deviceContext.vkDevice;
+            out->physicalDevice = desc->deviceContext.vkPhysicalDevice;
+            out->getDeviceProcAddr = desc->deviceContext.vkDeviceProcAddr;
+            return true;
+        }
         if (current->type == kBackendVkDescType) {
-            return reinterpret_cast<const CreateBackendVkDesc*>(current);
+            const auto* desc = reinterpret_cast<const CreateBackendVkDesc*>(current);
+            out->device = desc->device;
+            out->physicalDevice = desc->physicalDevice;
+            out->getDeviceProcAddr = desc->getDeviceProcAddr;
+            return true;
         }
     }
-    return nullptr;
+    return false;
 }
 
 std::uint32_t findVulkanApiVersion(const ffxApiHeader* header) {
@@ -459,9 +489,9 @@ static ffxReturnCode_t createContextImpl(
         version != kFsr314CompatibilityVersionId) {
         return FFX_API_RETURN_NO_PROVIDER;
     }
-    const auto* backend = findBackend(header);
-    if (!backend || !backend->device || !backend->physicalDevice ||
-        !backend->getDeviceProcAddr) {
+    Backend backend{};
+    if (!findBackend(header, &backend) || !backend.device || !backend.physicalDevice ||
+        !backend.getDeviceProcAddr) {
         return FFX_API_RETURN_ERROR_PARAMETER;
     }
     const auto* create = reinterpret_cast<const ffxCreateContextDescUpscale*>(header);
@@ -471,9 +501,9 @@ static ffxReturnCode_t createContextImpl(
     try { provider=new (storage) ProviderContext{}; }
     catch (...) { deallocate(callbacks,storage); throw; }
     provider->version = version==kVersion411Id ? kVersion411Id : kVersionId;
-    provider->device = backend->device;
-    provider->physicalDevice = backend->physicalDevice;
-    provider->getDeviceProcAddr = backend->getDeviceProcAddr;
+    provider->device = backend.device;
+    provider->physicalDevice = backend.physicalDevice;
+    provider->getDeviceProcAddr = backend.getDeviceProcAddr;
     provider->apiVersion = findVulkanApiVersion(header);
     for(auto* node=header;node;node=node->pNext) if(node->type==FSR4VK_CREATE_DESC_TYPE_DEVICE_FEATURES) {
         const auto& info=*reinterpret_cast<const Fsr4VkCreateDeviceFeatures*>(node);
@@ -518,8 +548,8 @@ static ffxReturnCode_t createContextImpl(
                                  create->maxUpscaleSize.width,create->maxUpscaleSize.height);
         if(permutation!=required_flags)
             throw std::invalid_argument("provider requires inverted depth and low-resolution non-jittered motion vectors");
-        fsr4vk::validate_descriptor_commands(backend->device,backend->getDeviceProcAddr);
-        (void)fsr4vk::DeviceDispatch(backend->device,backend->getDeviceProcAddr,provider->apiVersion,false);
+        fsr4vk::validate_descriptor_commands(backend.device,backend.getDeviceProcAddr);
+        (void)fsr4vk::DeviceDispatch(backend.device,backend.getDeviceProcAddr,provider->apiVersion,false);
         diagnostic(*provider,"context created flags="+std::to_string(create->flags)+
                    " api="+std::to_string(VK_API_VERSION_MAJOR(provider->apiVersion))+"."+
                    std::to_string(VK_API_VERSION_MINOR(provider->apiVersion)));
