@@ -1018,6 +1018,105 @@ static void global_buffers(void) {
         save_fixture(global_dynamic_path, code, words);
     }
     free(code);
+    for (u32 k = 0; k < 3; k++) {
+        u32 index = k == 1 ? 8 : 0, immediate = k == 2 ? 8 : 0;
+        const u64 indexed_ldc[] = {
+            0xEF9500005107FF02ull, /* LDC.64 R2, c[0][0x510]: output descriptor */
+            mov32i(28, index),
+            0xEF95010000071C1Cull | (u64)immediate << 20, /* LDC.ISL.64 R28, c[16][R28 + immediate] */
+            0xEED4200000071C00ull, /* LDG.E R0, [R28] */
+            0xEEDC200000070200ull, /* STG.E [R2], R0 */
+        };
+        code = translate(indexed_ldc, 5, ST_VS, &info, &words, 1);
+        if (!code || info.unsupported) fprintf(stderr, "indexed LDC global base: %s\n", info.first_unsupported);
+        int output_slot = -1, tables = 1;
+        u32 table_rmask = 0, seen_windows = 0;
+        for (int slot = 0; code && slot < info.ngbuf; slot++) {
+            if (info.gbuf_cbuf_off[slot] == 0x510) output_slot = slot;
+            if (!SH_GBUF_TABLE(info.gbuf_cbuf_off[slot])) continue;
+            tables &= SH_GBUF_BANK(info.gbuf_cbuf_off[slot]) == 16;
+            seen_windows |= 1u << SH_GBUF_TABLE_WINDOW(info.gbuf_cbuf_off[slot]);
+            table_rmask |= 1u << slot;
+        }
+        tables &= seen_windows == 0x7fff;
+        check(code && !info.unsupported && info.ngbuf == 16 && output_slot >= 0,
+              "the output stays fixed and constant bank 16's table fills the remaining windows");
+        check(code && tables && (info.gbuf_rmask & table_rmask) == table_rmask,
+              "every dynamic table window is readable");
+        check(code && info.cbuf_max[16] == 65536, "an indexed constant table binds its whole bank");
+        if (code)
+            check(count_opcode(code, words, 247, 0xffffffffu) > 0,
+                  "an indexed LDC base selects its global buffer at run time");
+        if (code) {
+            u32 bank0[0x51c / 4] = {0}, bank16[16] = {0}, output[4] = {0};
+            u32 first[4] = {0x12345678}, second[4] = {0x89abcdef}, mbase[64] = {0}, smap[48];
+            memset(smap, 0xff, sizeof smap);
+            bank0[0x510 / 4] = 0x3000;
+            bank16[0] = 0x1000, bank16[8 / 4] = 0x2000;
+            for (int slot = 0; slot < info.ngbuf; slot++) {
+                if (!SH_GBUF_TABLE(info.gbuf_cbuf_off[slot])) continue;
+                u32 window = SH_GBUF_TABLE_WINDOW(info.gbuf_cbuf_off[slot]);
+                mbase[4 * slot] = window == 0 ? 0x1000 : window == 1 ? 0x2000 : 0;
+                mbase[4 * slot + 2] = window < 2 ? 4 : 0;
+            }
+            SpvEvalEnv env = {0};
+            env.ubo[0] = bank0, env.ubo_words[0] = sizeof bank0 / 4;
+            env.ubo[16] = bank16, env.ubo_words[16] = sizeof bank16 / 4;
+            env.ubo[SNX_VKB_SSBO + output_slot] = output, env.ubo_words[SNX_VKB_SSBO + output_slot] = 4;
+            for (int slot = 0; slot < info.ngbuf; slot++) {
+                if (!SH_GBUF_TABLE(info.gbuf_cbuf_off[slot])) continue;
+                u32 window = SH_GBUF_TABLE_WINDOW(info.gbuf_cbuf_off[slot]);
+                env.ubo[SNX_VKB_SSBO + slot] = window == 0 ? first : second;
+                env.ubo_words[SNX_VKB_SSBO + slot] = 4;
+            }
+            env.ubo[SNX_VKB_MBASE] = mbase, env.ubo_words[SNX_VKB_MBASE] = 64;
+            env.ubo[SNX_VKB_SMAP] = smap, env.ubo_words[SNX_VKB_SMAP] = 48;
+            const char* why = spv_eval(code, words, &env);
+            u32 expected = k ? 0x89abcdef : 0x12345678;
+            if (why || output[0] != expected)
+                fprintf(stderr, "indexed LDC execution at offset %u index %u: %s, output %08x (expected %08x)\n",
+                        immediate, index, why ? why : "ran", output[0], expected);
+            check(!why && output[0] == expected, "indexed LDC execution selects the buffer its register names");
+        }
+        free(code);
+    }
+    /* A dynamic table base has no dynamic atomic emitter yet: refuse it instead of indexing slot GB_DYNAMIC - 1. */
+    const u64 indexed_atomic[] = {
+        mov32i(28, 0),
+        0xEF95010000071C1Cull, /* LDC.ISL.64 R28, c[16][R28] */
+        0xEBF9000000071C00ull, /* RED.E.ADD [R28], R0 */
+    };
+    code = translate(indexed_atomic, 3, ST_VS, &info, &words, 1);
+    check_refused(code, &info, "dynamic global atomic", "an indexed table base is not sent to the fixed-slot atomic path");
+    free(code);
+    /* A bank-0 descriptor table has a 16-byte stride, and a fragment's MBASE binding is already its resolution scale.
+       Until those forms have their own dynamic paths, they must not silently use the immediate slot's base. */
+    const u64 indexed_bank0[] = {
+        mov32i(28, 0),
+        0xEF95000011071C1Cull, /* LDC.ISL.64 R28, c[0][R28 + 0x110] */
+        0xEED4200000071C00ull, /* LDG.E R0, [R28] */
+    };
+    code = translate(indexed_bank0, 3, ST_VS, &info, &words, 1);
+    check_refused(code, &info, "register-indexed global base", "an indexed bank-0 descriptor is not treated as fixed");
+    free(code);
+    /* A fragment program's pointer tables read their windows at SNX_VKB_MBASEFS: SNX_VKB_RS is its resolution scale.
+       A table's first entry may sit at a byte offset that is not a multiple of 8, which the key carries. */
+    const u64 indexed_fragment[] = {
+        mov32i(28, 0),
+        0xEF95010000071C1Cull, /* LDC.ISL.64 R28, c[16][R28] */
+        0xEED4200000071C00ull, /* LDG.E R0, [R28] */
+    };
+    code = translate(indexed_fragment, 3, ST_FS, &info, &words, 1);
+    check(code != NULL, "a fragment table reads its windows at its own binding");
+    free(code);
+    const u64 indexed_fragment_unaligned[] = {
+        mov32i(28, 0),
+        0xEF95010000C71C1Cull, /* LDC.ISL.64 R28, c[16][R28 + 0xc] */
+        0xEED4200000071C00ull, /* LDG.E R0, [R28] */
+    };
+    code = translate(indexed_fragment_unaligned, 3, ST_FS, &info, &words, 1);
+    check(code != NULL, "a fragment table whose first entry is not 8-byte aligned");
+    free(code);
     /* an atomic, or an access with no tracked buffer to be in, is still refused */
     const u64 dynamic_atomic[] = {0x4C98078014470002ull, 0xEED4200000070200ull, FMUL_KEEP | 6, 0xED03000000600606ull};
     code = translate(dynamic_atomic, 4, ST_FS, &info, &words, 1);
