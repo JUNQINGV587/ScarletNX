@@ -211,7 +211,7 @@ target_link_libraries(snx_fsr2 PUBLIC snx_vk_common)
 add_library(snx_upscaler STATIC gpu/vk/upscaler/upscaler.c gpu/vk/upscaler/passes.c gpu/vk/upscaler/reproject.c
                           gpu/vk/upscaler/dlss.cpp gpu/vk/upscaler/ffx.cpp)
 target_link_libraries(snx_upscaler PUBLIC snx_fsr2 snx_vk_common)
-# DLSS through NVIDIA Streamline (gpu/vk/upscaler/dlss.cpp) and FSR 3.1 or 4 through AMD's FidelityFX API
+# DLSS through NVIDIA Streamline (gpu/vk/upscaler/dlss.cpp) and FSR 4.1 through AMD's FidelityFX API
 # (gpu/vk/upscaler/ffx.cpp) in a Windows build: their MIT headers only, their runtimes taken from the user's folders at
 # run time. Windows' own libraries check the signature of each
 if(WIN32)

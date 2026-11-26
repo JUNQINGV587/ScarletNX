@@ -24,7 +24,7 @@ typedef enum {
     SNX_UPSCALER_SPATIAL, /* AMD FidelityFX Super Resolution 1's EASU, then its RCAS when sharpening, one frame */
     SNX_UPSCALER_COPY,    /* a bilinear filtered copy of the picture */
     SNX_UPSCALER_DLSS,    /* NVIDIA DLSS Super Resolution through Streamline (dlss.h): Windows, NVIDIA's runtime */
-    SNX_UPSCALER_FSR_NEW, /* FSR 3.1 or 4 through AMD's FFX API (ffx.h): Windows, AMD's runtime */
+    SNX_UPSCALER_FSR_NEW, /* FSR 4.1 through AMD's FFX API (ffx.h): Windows, AMD's runtime */
     SNX_UPSCALER_XESS,    /* Intel XeSS: not built in yet, never available */
     SNX_UPSCALERS,
     SNX_UPSCALER_BEST = -1 /* no preference: Best's order */

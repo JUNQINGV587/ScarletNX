@@ -334,8 +334,8 @@ static void dlss_start(void) {
     if (!g_dlss) dlss_off(why);
 }
 /* AMD's FidelityFX API runtime (gpu/vk/upscaler/ffx.h), on while it loads: it starts before the device, when the
-   settings name the folder of AMD's runtime and the render upscaler may be FSR 3.1 or 4. Its effect contexts are made
-   when an evaluation needs one, and a failure there makes FSR 3.1 or 4 unavailable from then on */
+   settings name the folder of AMD's runtime and the render upscaler may be FSR 4.1. Its effect contexts are made
+   when an evaluation needs one, and a failure there makes FSR 4.1 unavailable from then on */
 static void ffx_log(int level, const char* text) {
     if (level)
         WARN("vulkan: %s\n", text);
@@ -346,7 +346,7 @@ static void ffx_start(void) {
     const char* why;
     int may = g_settings.render_upscaler == 0 || g_settings.render_upscaler == SNX_UPSCALER_FSR_NEW + 1;
     if (g_opt_headless || !g_settings.ffx_runtime[0] || !may) return;
-    if (!snx_ffx_start(g_settings.ffx_runtime, ffx_log, &why)) WARN("vulkan: no FSR 3.1 or 4: %s\n", why);
+    if (!snx_ffx_start(g_settings.ffx_runtime, ffx_log, &why)) WARN("vulkan: no FSR 4.1: %s\n", why);
 }
 /* the swapchain's calls through Streamline's, which does its work for each frame in the present */
 static void dlss_hook(void) {

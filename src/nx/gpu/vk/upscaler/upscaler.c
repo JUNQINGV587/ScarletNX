@@ -4,7 +4,7 @@
    gpu/vk/fsr2's (AMD FidelityFX Super Resolution 2.2.1, MIT, Copyright (c) 2022-2023 Advanced Micro Devices, Inc.), the
    copy and the spatial upscaler are passes.c's, DLSS is dlss.cpp's (NVIDIA's runtime, which the user downloads, through
    NVIDIA Streamline: available only where that runs), newer FSR is ffx.cpp's (AMD's FidelityFX API runtime, which the
-   user downloads: FSR 3.1 or 4, Windows). XeSS is described, so the choice and the settings know it, and is never
+   user downloads: FSR 4.1, Windows). XeSS is described, so the choice and the settings know it, and is never
    available: it needs a runtime that is not built in (docs/layers/gpu/upscalers.md) */
 #include "nx/gpu/vk/upscaler/upscaler.h"
 #include <stdio.h>
@@ -30,7 +30,7 @@ static const SnxUpscalerCaps g_caps[SNX_UPSCALERS] = {
     [SNX_UPSCALER_DLSS] = {"DLSS", SNX_UP_TEMPORAL, SNX_UP_DEPTH | SNX_UP_MOTION,
                            SNX_UP_DEPTH | SNX_UP_MOTION | SNX_UP_JITTER | SNX_UP_EXPOSURE | SNX_UP_REACTIVE,
                            SNX_UP_LDR | SNX_UP_HDR, 1, 3, 1, 0},
-    [SNX_UPSCALER_FSR_NEW] = {"FSR 3.1 or 4", SNX_UP_TEMPORAL, SNX_UP_DEPTH | SNX_UP_MOTION,
+    [SNX_UPSCALER_FSR_NEW] = {"FSR 4.1", SNX_UP_TEMPORAL, SNX_UP_DEPTH | SNX_UP_MOTION,
                               SNX_UP_DEPTH | SNX_UP_MOTION | SNX_UP_JITTER | SNX_UP_EXPOSURE | SNX_UP_REACTIVE,
                               SNX_UP_LDR | SNX_UP_HDR, 1, 3, 1, 0},
     [SNX_UPSCALER_XESS] = {"XeSS", SNX_UP_TEMPORAL, SNX_UP_DEPTH | SNX_UP_MOTION,

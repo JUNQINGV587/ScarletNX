@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* ffx.h: AMD FidelityFX Super Resolution 3.1 and 4 through AMD's FidelityFX API (the FFX API). The API's headers are
+/* ffx.h: AMD FidelityFX Super Resolution 4.1 through AMD's FidelityFX API (the FFX API). The API's headers are
    MIT (Copyright (c) 2026 Advanced Micro Devices, Inc., GPUOpen-LibrariesAndSDKs/FidelityFX-SDK v2.4.0, fetched by
-   cmake/dependencies.cmake), and only a Windows build with them (SNX_FFX) has FSR 3.1 and 4. Their runtime is AMD's,
-   the user's download, loaded from the folder they name: nothing of it is linked or shipped */
+   cmake/dependencies.cmake), and only a Windows build with them (SNX_FFX) runs FSR 4.1. Its runtime is AMD's, the
+   user's download, loaded from the folder they name: nothing of it is linked or shipped. The context asks for the 4.x
+   provider by id and refuses any other, so a driver with 3.1 alone leaves FSR 4.1 off rather than running 3.1 */
 #include "nx/gpu/vk/upscaler/ffx.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -201,8 +202,20 @@ int snx_ffx_available(const char** why) {
     }
     if (g.started) return 1;
     *why = g.why[0] ? g.why
-                     : "FSR 3.1 and 4 are off: name the folder of AMD's FidelityFX API runtime in the ffx_runtime "
+                     : "FSR 4.1 is off: name the folder of AMD's FidelityFX API runtime in the ffx_runtime "
                        "setting";
+    return 0;
+}
+
+/* the major number in a provider's name (FidelityFX Super Resolution 4.1.2: 4), 0 when it has no number */
+static int provider_major(const char* name) {
+    if (!name) return 0;
+    for (; *name; name++) {
+        if (*name < '0' || *name > '9') continue;
+        int v = 0;
+        while (*name >= '0' && *name <= '9') v = v * 10 + (*name++ - '0');
+        return v;
+    }
     return 0;
 }
 
@@ -230,6 +243,51 @@ SnxFfx* snx_ffx_create(const SnxUpscalerInfo* info, const char** why) {
     if (info->flags & SNX_UP_FLAG_AUTO_EXPOSURE) flags |= FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
 
     VkDeviceContext vk = {info->device, info->physical, vkGetDeviceProcAddr};
+
+    /* 4.1 is the only FSR this runs: ask the runtime which providers this GPU has, and take the 4.x one's id to say
+       so to ffxCreateContext. A 3.1 provider would be a different upscaler under the setting that names FSR 4.1 */
+    ffxOverrideVersion over = {};
+    over.header.type = FFX_API_DESC_TYPE_OVERRIDE_VERSION;
+    int forced = 0;
+    uint64_t ids[32] = {0};
+    const char* names[32] = {0};
+    char seen[200] = "";
+    uint64_t count = 0;
+    ffxQueryDescGetVersions list = {};
+    list.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+    list.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE;
+    list.device = &vk;
+    list.outputCount = &count;
+    if (g.api.query(NULL, &list.header) == FFX_API_RETURN_OK && count > 0) {
+        uint64_t got = count < 32 ? count : 32;
+        list.outputCount = &got;
+        list.versionIds = ids;
+        list.versionNames = names;
+        if (g.api.query(NULL, &list.header) == FFX_API_RETURN_OK) {
+            for (uint64_t i = 0; i < got; i++) {
+                const char* name = names[i] ? names[i] : "";
+                size_t at = strlen(seen);
+                if (at + 1 < sizeof seen) snprintf(seen + at, sizeof seen - at, "%s%s", at ? ", " : "", name);
+                if (!forced && provider_major(name) == 4) {
+                    over.versionId = ids[i];
+                    forced = 1;
+                }
+            }
+            if (!forced) {
+                g.failed = 1;
+                snprintf(g.why, sizeof g.why,
+                         "AMD's runtime for this GPU has no FSR 4.1, only %.150s. FSR 4.1 needs a driver with it, and "
+                         "this game leaves it off",
+                         seen);
+                snprintf(g.fail_reason, sizeof g.fail_reason, "%s", g.why);
+                say(2, "FSR 4.1: %s", g.why);
+                free(f);
+                *why = g.why;
+                return NULL;
+            }
+        }
+    }
+
     ffxCreateBackendVKDesc backend = {};
     backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_VK;
     backend.deviceContext = vk;
@@ -241,7 +299,8 @@ SnxFfx* snx_ffx_create(const SnxUpscalerInfo* info, const char** why) {
     ffxCreateContextDescUpscaleVersion ver = {};
     ver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
     ver.version = FFX_UPSCALER_VERSION;
-    backend.header.pNext = &up.header;
+    backend.header.pNext = forced ? &over.header : &up.header;
+    if (forced) over.header.pNext = &up.header;
     /* the effect's API version first (its provider may be older), then no dynamic resolution: a driver that refuses
        either still runs the upscaler, at a fixed size in the last case */
     auto attempt = [&](int dynamic_resolution, int with_version) {
@@ -253,19 +312,30 @@ SnxFfx* snx_ffx_create(const SnxUpscalerInfo* info, const char** why) {
     if (rc != FFX_API_RETURN_OK) rc = attempt(1, 0);
     if (rc != FFX_API_RETURN_OK) rc = attempt(0, 0);
     if (rc != FFX_API_RETURN_OK) {
-        snprintf(g.why, sizeof g.why, "AMD's FidelityFX API made no FSR context (%s)", code_name(rc));
+        snprintf(g.why, sizeof g.why, "AMD's FidelityFX API made no FSR 4.1 context (%s)", code_name(rc));
         free(f);
         *why = g.why;
         return NULL;
     }
+    /* the context says which provider it runs: anything but 4.1 is refused here rather than quietly used */
     ffxQueryGetProviderVersion pv = {};
     pv.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
-    if (g.api.query(&f->ctx, &pv.header) == FFX_API_RETURN_OK && pv.versionName)
-        say(0, "FSR 3.1 or 4: %s, from %s (%ux%u to %ux%u)", pv.versionName, g.folder, info->render_max[0],
-            info->render_max[1], info->output[0], info->output[1]);
-    else
-        say(0, "FSR 3.1 or 4: a context from %s (%ux%u to %ux%u)", g.folder, info->render_max[0], info->render_max[1],
-            info->output[0], info->output[1]);
+    ffxReturnCode_t qrc = g.api.query(&f->ctx, &pv.header);
+    if (qrc != FFX_API_RETURN_OK || !pv.versionName || provider_major(pv.versionName) != 4) {
+        if (pv.versionName)
+            snprintf(g.why, sizeof g.why, "AMD's FidelityFX API gave %.120s, not FSR 4.1", pv.versionName);
+        else
+            snprintf(g.why, sizeof g.why, "AMD's FidelityFX API did not name the FSR it gave: not used");
+        g.api.destroy(&f->ctx, NULL);
+        g.failed = 1;
+        snprintf(g.fail_reason, sizeof g.fail_reason, "%s", g.why);
+        say(2, "FSR 4.1: %s", g.why);
+        free(f);
+        *why = g.why;
+        return NULL;
+    }
+    say(0, "FSR 4.1: %s, from %s (%ux%u to %ux%u)", pv.versionName, g.folder, info->render_max[0],
+        info->render_max[1], info->output[0], info->output[1]);
     return f;
 }
 
@@ -274,7 +344,7 @@ int snx_ffx_evaluate(SnxFfx* f, const SnxUpscaleEval* e, const char** why) {
     if (!why) why = &none;
     *why = NULL;
     if (!f) {
-        *why = "FSR 3.1 and 4 are not available";
+        *why = "FSR 4.1 is not available";
         return 0;
     }
     if (f->failed) {
@@ -282,7 +352,7 @@ int snx_ffx_evaluate(SnxFfx* f, const SnxUpscaleEval* e, const char** why) {
         return 0;
     }
     if (!e->depth.image || !e->motion.image) {
-        *why = "FSR 3.1 and 4 need depth and motion vectors";
+        *why = "FSR 4.1 needs depth and motion vectors";
         return 0;
     }
     ffxDispatchDescUpscale d = {};
@@ -313,12 +383,12 @@ int snx_ffx_evaluate(SnxFfx* f, const SnxUpscaleEval* e, const char** why) {
     ffxReturnCode_t rc = g.api.dispatch(&f->ctx, &d.header);
     if (rc != FFX_API_RETURN_OK) {
         f->failed = 1;
-        snprintf(f->fail_reason, sizeof f->fail_reason, "FSR 3.1 or 4 failed to record (%s), and is off from now on",
+        snprintf(f->fail_reason, sizeof f->fail_reason, "FSR 4.1 failed to record (%s), and is off from now on",
                  code_name(rc));
         /* the next setup falls back: available() says no for every context after this one */
         g.failed = 1;
         snprintf(g.fail_reason, sizeof g.fail_reason, "%s", f->fail_reason);
-        say(2, "FSR 3.1 or 4: %s", f->fail_reason);
+        say(2, "FSR 4.1: %s", f->fail_reason);
         *why = f->fail_reason;
         return 0;
     }
@@ -337,7 +407,7 @@ void snx_ffx_destroy(SnxFfx* f) {
 
 extern "C" {
 static const char* const g_none =
-    "FSR 3.1 and 4 run through AMD's FidelityFX API runtime, which is Windows only";
+    "FSR 4.1 runs through AMD's FidelityFX API runtime, which is Windows only";
 int snx_ffx_start(const char* folder, SnxFfxLog log, const char** why) {
     (void)folder, (void)log;
     if (why) *why = g_none;

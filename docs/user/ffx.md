@@ -1,13 +1,14 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
 <!-- Copyright 2026 the ScarletNX contributors -->
-# AMD FSR 3.1 and 4
+# AMD FSR 4.1
 
 On Windows with a recent AMD graphics driver, a game's upscale (a Switch 2 game's DLSS evaluations, and any other
-upscale the [upscalers](../layers/gpu/upscalers.md) run) can run AMD FidelityFX Super Resolution 3.1 or 4, the latest
-of AMD's temporal upscalers. Elsewhere, or without the files below, it runs AMD FSR 2.2 as before.
+upscale the [upscalers](../layers/gpu/upscalers.md) run) can run AMD FidelityFX Super Resolution 4.1, AMD's
+machine-learning temporal upscaler. Elsewhere, or without the files below, or with a driver whose FSR is 3.1 alone, it
+runs AMD FSR 2.2 as before.
 
-ScarletNX does not include FSR 3.1 or 4. It is AMD's software under AMD's licence, which you download from AMD and keep
-in a folder of your own. Only AMD's FidelityFX API headers, which are MIT, are built into the program.
+ScarletNX does not include FSR 4.1. It is AMD's software under AMD's licence, which you download from AMD and keep in
+a folder of your own. Only AMD's FidelityFX API headers, which are MIT, are built into the program.
 
 ## Getting the files
 
@@ -21,24 +22,24 @@ in a folder of your own. Only AMD's FidelityFX API headers, which are MIT, are b
 Nothing is installed: the program loads the loader from that folder when the game starts, after checking that
 `amd_fidelityfx_loader_vk.dll` is signed by AMD. The loader is AMD's and it looks for the upscaler beside it.
 
-FSR 4 is a machine-learning upscaler: it runs on a Radeon RX 6000, 7000 or 9000, or a Ryzen AI APU whose driver has it,
-and it needs a recent driver (SDK 2.4's notes name Adrenalin 26.10.1). Where the driver has FSR 3.1 alone, FSR 3.1
-runs. The log says which one started.
+FSR 4.1 runs on a Radeon RX 6000, 7000 or 9000, or a Ryzen AI APU whose driver has it, and it needs a recent driver
+(SDK 2.4's notes name Adrenalin 26.10.1). The program asks the runtime for its FSR 4.1 provider by name and refuses
+any other, so a driver with FSR 3.1 alone does not run it: FSR 2.2 stands in. The log says which upscaler started.
 
 ## Settings
 
 | Key | Default | What it does |
 | --- | --- | --- |
-| `ffx_runtime` | empty | The folder above. Empty = no FSR 3.1 or 4 |
-| `render_upscaler` | `0` | `0` (Best) takes FSR 3.1 or 4 when it can run, `5` asks for it. `1` asks for FSR 2 even with the files there, `3` (None) a filtered copy |
+| `ffx_runtime` | empty | The folder above. Empty = no FSR 4.1 |
+| `render_upscaler` | `0` | `0` (Best) takes FSR 4.1 when it can run, `5` asks for it. `1` asks for FSR 2 even with the files there, `3` (None) a filtered copy |
 | `internal_resolution` | `0` | The size the game renders at before the upscale: `0` the game's choice, `1` the output's size, `2` to `5` Quality to Ultra Performance |
 | `fsr_sharpness` | `0` | The sharpening FSR applies after upscaling, `0` to `1` |
 
 ## What the log says
 
-- `vulkan: FSR 3.1 or 4: FidelityFX Super Resolution 4.1.2, from D:\fsr (1280x720 to 2560x1440)`: the files were
-  found, their signature is AMD's, and a context was made for the game's sizes.
-- `vulkan: no FSR 3.1 or 4: ...` says why it can't run (no folder, a file missing or not signed, a driver without
-  FSR 4, a parameter the API refuses), and FSR 2 runs instead.
-- A failure during the game turns FSR 3.1 or 4 off until the next start, and the next upscaler takes over from the next
+- `vulkan: FSR 4.1: FidelityFX Super Resolution 4.1.2, from D:\fsr (1280x720 to 2560x1440)`: the files were found,
+  their signature is AMD's, and a context was made for the game's sizes.
+- `vulkan: no FSR 4.1: ...` says why it can't run (no folder, a file missing or not signed, a parameter the API
+  refuses), and FSR 2 runs instead. A runtime whose GPU has only FSR 3.1 says so there too, and FSR 4.1 stays off.
+- A failure during the game turns FSR 4.1 off until the next start, and the next upscaler takes over from the next
   evaluation.
