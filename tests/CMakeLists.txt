@@ -2943,6 +2943,11 @@ if(Python3_Interpreter_FOUND)
     # (scripts/frostpunk-assets.py)
     add_test(NAME frostpunk_inventory
              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_inventory_test.py")
+    # the alignment of the Switch and the PC package by id, and the replacement plan: the three counts, the readable
+    # PC blocks per group, a whitelist that leaves a texture out, a plan read back with a line deleted, a
+    # non-power-of-two source and an over-budget refusal (scripts/frostpunk-assets.py)
+    add_test(NAME frostpunk_plan
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_plan_test.py")
     # which GitHub Actions caches the cleanup workflow deletes (scripts/trim-caches.py)
     add_test(NAME trim_caches COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/trim_caches_test.py")
     # build.yml's LLVM builds, each saved by the step right after it: a later failure or a cancelled run keeps it;
