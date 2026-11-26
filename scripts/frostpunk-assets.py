@@ -1345,6 +1345,29 @@ def _dxt5_alphas(block):
         [((5 - i) * first + i * second) // 5 for i in range(1, 5)] + [0, 255]
 
 
+def _pillow_image():
+    """Pillow's Image module, or None when it is not installed."""
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    return Image
+
+
+def _dds_bytes(pixels, width, height, kind):
+    """Wrap BC1/BC2/BC3 level 0 pixels in a DDS header, for Pillow to read."""
+    block = {"dxt1": (b"DXT1", 8), "dxt3": (b"DXT3", 16),
+             "dxt5": (b"DXT5", 16)}[kind]
+    fourcc, block_bytes = block
+    linear = max(1, (width + 3) // 4) * max(1, (height + 3) // 4) * block_bytes
+    header = b"DDS " + struct.pack("<7I", 124, 0x1007, height, width,
+                                   linear, 0, 1)
+    header += struct.pack("<11I", *([0] * 11))
+    header += struct.pack("<2I4s5I", 32, 0x4, fourcc, 0, 0, 0, 0, 0)
+    header += struct.pack("<5I", 0x1000, 0, 0, 0, 0)
+    return header + pixels
+
+
 def _decode_dxt(payload, width, height, kind):
     """Decode DXT1, DXT3 or DXT5 blocks to RGBA8.
 
@@ -1355,6 +1378,15 @@ def _decode_dxt(payload, width, height, kind):
     anything else installed.  A block inside the image is written as four
     rows of packed pixels, which is much faster than 16 pixel stores.
     """
+    Image = _pillow_image()
+    if Image is not None:
+        try:
+            from io import BytesIO
+            picture = Image.open(BytesIO(_dds_bytes(payload, width, height,
+                                                    kind)))
+            return bytearray(picture.convert("RGBA").tobytes())
+        except Exception:
+            pass
     table = _rgb565()
     block_bytes = 8 if kind == "dxt1" else 16
     width_blocks = (width + 3) // 4
@@ -1624,7 +1656,18 @@ def resample_box(pixels, width, height, out_width, out_height):
                              % (out_width, out_height))
     if out_width <= width and out_height <= height:
         if width == 2 * out_width and height == 2 * out_height:
+            # The exact mean keeps every bit of the average, so the halving
+            # path stays on it rather than on a rounding resampler.
             return _box_two(pixels, width, height)
+        Image = _pillow_image()
+        if Image is not None:
+            try:
+                picture = Image.frombuffer("RGBA", (width, height),
+                                           bytes(pixels), "raw", "RGBA", 0, 1)
+                small = picture.resize((out_width, out_height), Image.BOX)
+                return bytearray(small.tobytes())
+            except Exception:
+                pass
         return _box_python(pixels, width, height, out_width, out_height)
     raise ContainerError("resample", "%dx%d is larger than %dx%d; scaling up "
                          "is not part of a replacement"
