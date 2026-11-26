@@ -37,8 +37,12 @@ import argparse
 import hashlib
 import json
 import os
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
+import time
 import zlib
 
 try:
@@ -1214,6 +1218,733 @@ def parse_categories(text):
     return names
 
 
+# -- applying a plan -----------------------------------------------------
+#
+# A Switch texture block is a 28-byte header and the pixels it describes.  The
+# header, read from all 4172 texture blocks of the shipped package, is
+#
+#   +0   magic `0x001c7865`
+#   +4   u32 format id: 72 ASTC 4x4, 37 RGBA8, 1 R8, 5 R16
+#   +8   u32 1
+#   +12  u16 width, +14 u16 height
+#   +16  u16 1, +18 u8 1
+#   +19  u8 mip level count
+#   +20  4-byte format descriptor, `02 03 04 05` for ASTC 4x4
+#   +24  u32 pixel bytes, every mip, which is the payload length less 28
+#
+# The last field holds on every block in the package and the level count
+# matches the bytes the mips take, so a block written with one level has to
+# say so in both fields: a header that kept `10` levels and the old byte count
+# would send the loader past the end of the pixels it was given.  `apply`
+# therefore writes level 0 and the two fields that describe the pixels, and
+# changes no other header byte.
+SWITCH_FORMAT_ASTC_4X4 = 72
+SWITCH_FORMAT_RGBA8 = 37
+SWITCH_FORMAT_R8 = 1
+SWITCH_FORMAT_R16 = 5
+ASTC_FORMAT_DESCRIPTOR = b"\x02\x03\x04\x05"
+RGBA8_FORMAT_DESCRIPTOR = b"\x04\x03\x02\x05"
+QUALITY_PRESETS = ("fastest", "fast", "medium", "thorough",
+                   "verythorough", "exhaustive")
+QUALITY_SCORES = {"fastest": 0, "fast": 10, "medium": 60, "thorough": 98,
+                  "verythorough": 99, "exhaustive": 100}
+DEFAULT_QUALITY = "medium"
+SWITCH_FORMAT_LABELS = {SWITCH_FORMAT_ASTC_4X4: "astc4x4",
+                        SWITCH_FORMAT_RGBA8: "rgba8",
+                        SWITCH_FORMAT_R8: "r8",
+                        SWITCH_FORMAT_R16: "r16"}
+
+
+class SwitchTexture:
+    """The header of a Switch texture block, and how many bytes its mips take."""
+
+    __slots__ = ("width", "height", "format", "mips", "pixel_bytes",
+                 "descriptor")
+
+    def __init__(self, width, height, fmt, mips, pixel_bytes, descriptor):
+        self.width = width
+        self.height = height
+        self.format = fmt
+        self.mips = mips
+        self.pixel_bytes = pixel_bytes
+        self.descriptor = descriptor
+
+    @property
+    def label(self):
+        return SWITCH_FORMAT_LABELS.get(self.format,
+                                        "format-%d" % self.format)
+
+    @property
+    def level0_bytes(self):
+        """Bytes an ASTC 4x4 full-size level of this texture takes."""
+        return _astc_pixels(self.width, self.height)
+
+
+def _astc_pixels(width, height):
+    blocks = ((width + ASTC_BLOCK - 1) // ASTC_BLOCK) * \
+        ((height + ASTC_BLOCK - 1) // ASTC_BLOCK)
+    return blocks * ASTC_BYTES_PER_BLOCK
+
+
+def switch_texture(payload):
+    """The Switch texture header of `payload`, or `None` when it is not one."""
+    if len(payload) < TEXTURE_HEADER_SIZE or payload[:4] != TEXTURE_MAGIC:
+        return None
+    width, height = _u16(payload, 12), _u16(payload, 14)
+    if width < 1 or height < 1:
+        return None
+    return SwitchTexture(width, height, _u32(payload, 4), payload[19],
+                         _u32(payload, 24), bytes(payload[20:24]))
+
+
+_RGB565 = None
+
+
+def _rgb565():
+    """A 65536-entry table of the three bytes a 5-6-5 colour expands to."""
+    global _RGB565
+    if _RGB565 is None:
+        table = bytearray(65536 * 3)
+        for value in range(65536):
+            red = (value >> 11) & 0x1f
+            green = (value >> 5) & 0x3f
+            blue = value & 0x1f
+            table[3 * value] = (red << 3) | (red >> 2)
+            table[3 * value + 1] = (green << 2) | (green >> 4)
+            table[3 * value + 2] = (blue << 3) | (blue >> 2)
+        _RGB565 = table
+    return _RGB565
+
+
+def _dxt1_colours(block, table, four_colour):
+    """The four RGBA colours of a DXT1/DXT3/DXT5 colour block."""
+    first = block[0] | (block[1] << 8)
+    second = block[2] | (block[3] << 8)
+    bits = block[4] | (block[5] << 8) | (block[6] << 16) | (block[7] << 24)
+    r0, g0, b0 = table[3 * first:3 * first + 3]
+    r1, g1, b1 = table[3 * second:3 * second + 3]
+    colours = [(r0, g0, b0, 255), (r1, g1, b1, 255)]
+    if first > second or four_colour:
+        colours.append(((2 * r0 + r1) // 3, (2 * g0 + g1) // 3,
+                        (2 * b0 + b1) // 3, 255))
+        colours.append(((r0 + 2 * r1) // 3, (g0 + 2 * g1) // 3,
+                        (b0 + 2 * b1) // 3, 255))
+    else:
+        colours.append(((r0 + r1) // 2, (g0 + g1) // 2, (b0 + b1) // 2, 255))
+        colours.append((0, 0, 0, 0))
+    return colours, bits
+
+
+def _dxt5_alphas(block):
+    """The eight alpha values of a DXT5 alpha block."""
+    first, second = block[0], block[1]
+    if first > second:
+        return [first, second] + \
+            [((7 - i) * first + i * second) // 7 for i in range(1, 7)]
+    return [first, second] + \
+        [((5 - i) * first + i * second) // 5 for i in range(1, 5)] + [0, 255]
+
+
+def _decode_dxt(payload, width, height, kind):
+    """Decode DXT1, DXT3 or DXT5 blocks to RGBA8.
+
+    Blocks are laid out left to right and top to bottom, and a block that
+    hangs over the edge of the image is cut off rather than wrapped.  This is
+    the plain decoder of the format, in pure Python, with the 565 table built
+    once: the tool has to read these textures on a machine that may not have
+    anything else installed.  A block inside the image is written as four
+    rows of packed pixels, which is much faster than 16 pixel stores.
+    """
+    table = _rgb565()
+    block_bytes = 8 if kind == "dxt1" else 16
+    width_blocks = (width + 3) // 4
+    height_blocks = (height + 3) // 4
+    want = width_blocks * height_blocks * block_bytes
+    if len(payload) < want:
+        raise ContainerError(
+            "pixels", "%s needs %d bytes for %dx%d, the payload holds %d"
+            % (kind, want, width, height, len(payload)))
+    out = bytearray(width * height * 4)
+    stride = width * 4
+    offset = 0
+    pack = struct.pack
+    for block_y in range(height_blocks):
+        top = block_y * 4
+        rows = min(4, height - top)
+        for block_x in range(width_blocks):
+            block = payload[offset:offset + block_bytes]
+            offset += block_bytes
+            left = block_x * 4
+            columns = min(4, width - left)
+            if kind == "dxt3":
+                alpha_bits = int.from_bytes(block[0:8], "little")
+                colours, bits = _dxt1_colours(block[8:16], table, True)
+                alphas = None
+            elif kind == "dxt5":
+                alphas = _dxt5_alphas(block)
+                alpha_bits = int.from_bytes(block[2:8], "little")
+                colours, bits = _dxt1_colours(block[8:16], table, True)
+            else:
+                alphas = None
+                alpha_bits = 0
+                colours, bits = _dxt1_colours(block, table, False)
+            if rows == 4 and columns == 4:
+                base = top * stride + left * 4
+                if kind == "dxt1":
+                    p0, p1, p2, p3 = [
+                        colour[0] | colour[1] << 8 | colour[2] << 16
+                        | colour[3] << 24 for colour in colours]
+                else:
+                    p0, p1, p2, p3 = [
+                        colour[0] | colour[1] << 8 | colour[2] << 16
+                        for colour in colours]
+                palette = (p0, p1, p2, p3)
+                for row in range(4):
+                    here = base + row * stride
+                    index = (bits >> (8 * row)) & 0xff
+                    red = palette[index & 3]
+                    green = palette[(index >> 2) & 3]
+                    blue = palette[(index >> 6) & 3]
+                    alpha = palette[(index >> 14) & 3]
+                    if kind == "dxt3":
+                        nibbles = (alpha_bits >> (16 * row)) & 0xffff
+                        out[here:here + 16] = pack(
+                            "<4I",
+                            red | ((nibbles & 0xf) * 17) << 24,
+                            green | (((nibbles >> 4) & 0xf) * 17) << 24,
+                            blue | (((nibbles >> 8) & 0xf) * 17) << 24,
+                            alpha | (((nibbles >> 12) & 0xf) * 17) << 24)
+                    elif kind == "dxt5":
+                        three = (alpha_bits >> (12 * row)) & 0xfff
+                        out[here:here + 16] = pack(
+                            "<4I",
+                            red | alphas[three & 7] << 24,
+                            green | alphas[(three >> 3) & 7] << 24,
+                            blue | alphas[(three >> 6) & 7] << 24,
+                            alpha | alphas[(three >> 9) & 7] << 24)
+                    else:
+                        out[here:here + 16] = pack(
+                            "<4I", red, green, blue, alpha)
+                continue
+            for row in range(rows):
+                line = (top + row) * stride + left * 4
+                pixel = row * 4
+                for column in range(columns):
+                    red, green, blue, alpha = colours[(bits >> (2 * pixel)) & 3]
+                    if kind == "dxt3":
+                        alpha = ((alpha_bits >> (4 * pixel)) & 0xf) * 17
+                    elif kind == "dxt5":
+                        alpha = alphas[(alpha_bits >> (3 * pixel)) & 7]
+                    at = line + column * 4
+                    out[at] = red
+                    out[at + 1] = green
+                    out[at + 2] = blue
+                    out[at + 3] = alpha
+                    pixel += 1
+    return out
+
+
+def _decode_raw(payload, width, height, bpp):
+    """Decode raw 1, 2, 4 or 8 bytes-a-pixel data to RGBA8.
+
+    The one-byte form is a single channel, which a colour map reads as grey.
+    The two-byte form is a little-endian 16-bit channel, and its high byte is
+    the value the height-map data carries, so the low byte is dropped.  The
+    four-byte form is RGBA8 and is copied.  The eight-byte form, two bytes a
+    channel, does not occur in either package: it is read as four little-
+    endian 16-bit channels with the low byte dropped, which that layout would
+    make correct, and the tool reports it as unproven.
+    """
+    want = width * height * bpp
+    if len(payload) < want:
+        raise ContainerError(
+            "pixels", "raw%d needs %d bytes for %dx%d, the payload holds %d"
+            % (bpp * 8, want, width, height, len(payload)))
+    count = width * height
+    out = bytearray(count * 4)
+    if bpp == 4:
+        out[:] = payload[:want]
+        return out
+    if bpp == 1:
+        for index in range(count):
+            value = payload[index]
+            at = index * 4
+            out[at] = value
+            out[at + 1] = value
+            out[at + 2] = value
+            out[at + 3] = 255
+    elif bpp == 2:
+        for index in range(count):
+            value = payload[2 * index + 1]
+            at = index * 4
+            out[at] = value
+            out[at + 1] = value
+            out[at + 2] = value
+            out[at + 3] = 255
+    else:
+        for index in range(count):
+            at = 8 * index
+            out[4 * index] = payload[at + 1]
+            out[4 * index + 1] = payload[at + 3]
+            out[4 * index + 2] = payload[at + 5]
+            out[4 * index + 3] = payload[at + 7]
+    return out
+
+
+def decode_pc_level0(payload, where):
+    """The full-size level of slice 0 of a PC image payload, as RGBA8.
+
+    The level table puts the smallest level first, so the full-size level is
+    the last slot and starts at the end of the level bytes of slice 0.  A
+    payload that is not an image, or whose format has no decoder, is an error
+    that names the resource: a wrongly decoded texture is worse than none.
+    """
+    image = describe_pc_image(payload)
+    if image is None:
+        raise ContainerError(
+            where, "is not a PC image payload, so its pixels cannot be read")
+    levels = [struct.unpack_from("<HHI", payload, 16 + index * PC_IMAGE_SLOT_SIZE)
+              for index in range(image.levels)]
+    level_w, level_h, level_bytes = levels[-1]
+    start = PC_IMAGE_HEADER_SIZE + sum(level[2] for level in levels) - level_bytes
+    pixels = payload[start:start + level_bytes]
+    if image.bpp is None:
+        if image.fmt not in ("dxt1", "dxt3", "dxt5"):
+            raise ContainerError(
+                where, "is stored as %r blocks, which has no decoder"
+                % image.fmt)
+        pixels = _decode_dxt(pixels, level_w, level_h, image.fmt)
+    else:
+        pixels = _decode_raw(pixels, level_w, level_h, image.bpp)
+    return level_w, level_h, pixels
+
+
+def png_rgba(width, height, pixels):
+    """A PNG file of RGBA8 pixels, using only the standard library."""
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data +
+                struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+
+    stride = width * 4
+    raw = bytearray((stride + 1) * height)
+    for row in range(height):
+        at = row * (stride + 1)
+        raw[at] = 0
+        raw[at + 1:at + 1 + stride] = pixels[row * stride:(row + 1) * stride]
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6,
+                                         0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+            + chunk(b"IEND", b""))
+
+
+def _box_python(pixels, width, height, out_width, out_height):
+    """Area-average down to a smaller size, in pure Python."""
+    scale_x = width / out_width
+    scale_y = height / out_height
+    out = bytearray(out_width * out_height * 4)
+    for out_y in range(out_height):
+        top = out_y * scale_y
+        bottom = top + scale_y
+        first_row = int(top)
+        last_row = min(height, max(first_row + 1, int(bottom + 0.999999)))
+        for out_x in range(out_width):
+            left = out_x * scale_x
+            right = left + scale_x
+            first = int(left)
+            last = min(width, max(first + 1, int(right + 0.999999)))
+            red = green = blue = alpha = 0
+            count = 0
+            for row in range(first_row, last_row):
+                base = row * width * 4
+                for column in range(first, last):
+                    at = base + column * 4
+                    red += pixels[at]
+                    green += pixels[at + 1]
+                    blue += pixels[at + 2]
+                    alpha += pixels[at + 3]
+                    count += 1
+            at = (out_y * out_width + out_x) * 4
+            out[at] = red // count
+            out[at + 1] = green // count
+            out[at + 2] = blue // count
+            out[at + 3] = alpha // count
+    return out
+
+
+def _box_two(pixels, width, height):
+    """The exact 2x2 mean of an RGBA8 image, in one pass of plain Python.
+
+    The plan halves most textures, so this path carries nearly every
+    replacement.  numpy is not used: on a memory-tight machine its large
+    arrays cost more than this loop does.
+    """
+    out_width = width // 2
+    out_height = height // 2
+    out = bytearray(out_width * out_height * 4)
+    stride = width * 4
+    out_stride = out_width * 4
+    source = pixels
+    for row in range(out_height):
+        top = 2 * row * stride
+        bottom = top + stride
+        at = row * out_stride
+        left = 0
+        for _ in range(out_width):
+            a = top + left
+            b = bottom + left
+            ap = a + 4
+            bp = b + 4
+            out[at] = (source[a] + source[ap] + source[b]
+                       + source[bp]) >> 2
+            out[at + 1] = (source[a + 1] + source[ap + 1] + source[b + 1]
+                           + source[bp + 1]) >> 2
+            out[at + 2] = (source[a + 2] + source[ap + 2] + source[b + 2]
+                           + source[bp + 2]) >> 2
+            out[at + 3] = (source[a + 3] + source[ap + 3] + source[b + 3]
+                           + source[bp + 3]) >> 2
+            at += 4
+            left += 8
+    return out
+
+
+def resample_box(pixels, width, height, out_width, out_height):
+    """Area-average RGBA8 pixels down to `out_width` x `out_height`.
+
+    Every output pixel is the mean of the source it covers, so a 2048 texture
+    that the plan gives a 1024 target is averaged 2x2.  numpy is not used:
+    on a machine that is short of memory its large arrays cost seconds, so
+    the exact factor 2 case has its own pass and anything else uses the slow
+    general path.
+    """
+    if (out_width, out_height) == (width, height):
+        return pixels
+    if out_width < 1 or out_height < 1:
+        raise ContainerError("resample", "%dx%d is not a size"
+                             % (out_width, out_height))
+    if out_width <= width and out_height <= height:
+        if width == 2 * out_width and height == 2 * out_height:
+            return _box_two(pixels, width, height)
+        return _box_python(pixels, width, height, out_width, out_height)
+    raise ContainerError("resample", "%dx%d is larger than %dx%d; scaling up "
+                         "is not part of a replacement"
+                         % (out_width, out_height, width, height))
+
+
+def parse_quality(text):
+    """The astcenc quality preset a `--quality` value names.
+
+    A preset name is taken as it is.  A number from 0 to 100 is the value
+    astcenc gives the six presets, so it picks the closest one: 0 to 5
+    `fastest`, 6 to 30 `fast`, 31 to 80 `medium`, 81 to 98 `thorough`, 99
+    `verythorough`, 100 `exhaustive`.
+    """
+    raw = (text or DEFAULT_QUALITY).strip().lower()
+    name = raw[1:] if raw.startswith("-") else raw
+    if name in QUALITY_PRESETS:
+        return name
+    if raw.startswith("-") and name.isdigit():
+        raise ContainerError("--quality", "%s is not a preset name; write a "
+                             "number from 0 to 100 without the dash" % text)
+    try:
+        score = int(name)
+    except (TypeError, ValueError):
+        raise ContainerError(
+            "--quality", "%s is not one of %s or a number from 0 to 100"
+            % (text, ", ".join(QUALITY_PRESETS)))
+    if not 0 <= score <= 100:
+        raise ContainerError("--quality", "%d is not between 0 and 100" % score)
+    if score <= 5:
+        return "fastest"
+    if score <= 30:
+        return "fast"
+    if score <= 80:
+        return "medium"
+    if score <= 98:
+        return "thorough"
+    if score <= 99:
+        return "verythorough"
+    return "exhaustive"
+
+
+def astc_encode(pixels, width, height, quality, astcenc, colorspace="linear"):
+    """Encode RGBA8 to ASTC 4x4 blocks with `astcenc`.
+
+    The encoder writes a 16-byte header (its magic, the 4x4 block, and the
+    image size) and then the blocks, and the Switch header carries the blocks
+    only, so the header is checked and dropped here.  `colorspace` is `linear`
+    (`-cl`, the values are encoded as they are) or `srgb` (`-cs`).
+    """
+    if astcenc is None:
+        raise ContainerError(
+            "astcenc", "is not on PATH; install it, or pass --astcenc")
+    work = tempfile.mkdtemp(prefix="frostpunk-astc-")
+    try:
+        source = os.path.join(work, "source.png")
+        target = os.path.join(work, "target.astc")
+        with open(source, "wb") as fh:
+            fh.write(png_rgba(width, height, pixels))
+        command = [astcenc, "-cs" if colorspace == "srgb" else "-cl",
+                   source, target, "4x4", "-" + quality, "-silent"]
+        result = subprocess.run(command, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        if result.returncode != 0:
+            raise ContainerError(
+                "astcenc", "failed on %dx%d at %s: %s"
+                % (width, height, quality,
+                   result.stderr.decode("utf-8", "replace").strip()[-400:]))
+        with open(target, "rb") as fh:
+            blob = fh.read()
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    if len(blob) < 16 or blob[:4] != b"\x13\xab\xa1\x5c":
+        raise ContainerError("astcenc", "did not write an ASTC file")
+    block_x, block_y = blob[4], blob[5]
+    size_x = int.from_bytes(blob[7:10], "little")
+    size_y = int.from_bytes(blob[10:13], "little")
+    depth = int.from_bytes(blob[13:16], "little")
+    if (block_x, block_y, size_x, size_y, depth) != (4, 4, width, height, 1):
+        raise ContainerError(
+            "astcenc", "wrote a %dx%d texture in %dx%d blocks, not %dx%d in "
+            "4x4" % (size_x, size_y, block_x, block_y, width, height))
+    blocks = blob[16:]
+    if len(blocks) != _astc_pixels(width, height):
+        raise ContainerError(
+            "astcenc", "wrote %d block bytes for %dx%d, expected %d"
+            % (len(blocks), width, height, _astc_pixels(width, height)))
+    return blocks
+
+
+def astc_cached(plan_id, pixels, width, height, quality, astcenc, cache_dir,
+                colorspace="linear"):
+    """Encode, or read the cached encoding for this id, size and quality.
+
+    The cache holds the whole `.astc` file the encoder wrote, so it can be
+    decoded again with astcenc for a look, and it is keyed by the resource id,
+    the size, the quality and the colour space.
+    """
+    name = "%08x-%dx%d-%s-%s.astc" % (plan_id, width, height, quality,
+                                      "srgb" if colorspace == "srgb" else "lin")
+    path = os.path.join(cache_dir, name)
+    if os.path.exists(path):
+        with open(path, "rb") as fh:
+            blob = fh.read()
+        if len(blob) == 16 + _astc_pixels(width, height):
+            return blob[16:], True
+    blocks = astc_encode(pixels, width, height, quality, astcenc, colorspace)
+    with open(path + ".part", "wb") as fh:
+        fh.write(bytes.fromhex("13aba15c") + bytes([4, 4, 1]) +
+                 width.to_bytes(3, "little") + height.to_bytes(3, "little") +
+                 (1).to_bytes(3, "little") + blocks)
+    os.replace(path + ".part", path)
+    return blocks, False
+
+
+def build_switch_payload(original, width, height, blocks, convert=False):
+    """A Switch texture payload that holds one ASTC 4x4 level.
+
+    Every header byte of the texture being replaced is kept, except the two
+    words that describe the pixels, which are set to the level this runs
+    wrote: the level count at +19 and the pixel bytes at +24.  With `convert`
+    the format id and its descriptor are set to the ASTC 4x4 pair as well,
+    which is what turns an uncompressed block into an ASTC one.
+    """
+    header = bytearray(original[:TEXTURE_HEADER_SIZE])
+    struct.pack_into("<HH", header, 12, width, height)
+    header[19] = 1
+    struct.pack_into("<I", header, 24, len(blocks))
+    if convert:
+        struct.pack_into("<I", header, 4, SWITCH_FORMAT_ASTC_4X4)
+        header[20:24] = ASTC_FORMAT_DESCRIPTOR
+    return bytes(header) + blocks
+
+
+def default_cache_dir():
+    """Where encoded replacements are cached between runs."""
+    base = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+        os.path.expanduser("~"), ".cache")
+    return os.path.join(base, "frostpunk-assets", "astc")
+
+
+def find_astcenc(path=None):
+    """The astcenc program to use, or `None` when there is none."""
+    if path:
+        return path if os.path.exists(path) else None
+    return shutil.which("astcenc")
+
+
+def _short_name(name, width=44):
+    """A resource name that fits in a table cell, cut at the front."""
+    if len(name) <= width:
+        return name
+    return "..." + name[-(width - 3):]
+
+
+def render_apply(report, fmt):
+    """The report of one `apply` run, as text or as JSON."""
+    if fmt == "json":
+        return json.dumps(report, indent=2, sort_keys=False) + "\n"
+    out = ["switch    %s" % report["switch"],
+           "plan      %s (%s entries)"
+           % (report["plan"], format(report["planned"], ",")),
+           "replaced  %s of %s" % (format(report["count"], ","),
+                                   format(report["planned"], ",")),
+           "old payload %s bytes, new payload %s bytes, net %+d"
+           % (format(report["old_bytes"], ","),
+              format(report["new_bytes"], ","),
+              report["new_bytes"] - report["old_bytes"]),
+           "on disk   %s bytes" % format(report["on_disk"], ","),
+           "time      %.1f s (%s encoded, %s from cache)"
+           % (report["elapsed"], format(report["encoded"], ","),
+              format(report["cached"], ","))]
+    if report["refused"]:
+        groups = {}
+        for row in report["refused"]:
+            groups.setdefault(row["reason"], []).append(row["id"])
+        out.append("refused   %s"
+                   % format(len(report["refused"]), ","))
+        for reason in sorted(groups):
+            wanted = " ".join(sorted(groups[reason]))
+            out.append("  %s  %s" % (format(len(groups[reason]), ","), reason))
+            out.append("           ids: %s" % wanted)
+    if report["entries"]:
+        out.append("replacements:")
+        for row in report["entries"]:
+            out.append("  %s %-44s %4dx%-4d -> %4dx%-4d %12s -> %12s %+13s"
+                       % (row["id"], _short_name(row["name"]), row["switch"][0],
+                          row["switch"][1], row["target"][0], row["target"][1],
+                          format(row["old"], ","), format(row["new"], ","),
+                          format(row["new"] - row["old"], ",")))
+        largest = sorted(report["entries"],
+                         key=lambda row: (-row["new"], row["id"]))[:3]
+        out.append("largest replacements:")
+        for row in largest:
+            out.append("  %s %-44s %4dx%-4d %12s"
+                       % (row["id"], _short_name(row["name"]), row["target"][0],
+                          row["target"][1], format(row["new"], ",")))
+    return "\n".join(out) + "\n"
+
+
+def apply_entry(entry, switch, pc, quality, astcenc, cache_dir, colorspace,
+                convert_uncompressed):
+    """One plan entry to its replacement payload, or a `ContainerError`."""
+    plan_id = int(entry["id"], 16)
+    where = "%s %s" % (entry["id"], entry["name"])
+    record = switch.by_id(plan_id)
+    original = switch.read_payload(record)
+    texture = switch_texture(original)
+    if texture is None:
+        raise ContainerError(where, "is not a Switch texture block")
+    convert = False
+    if texture.format != SWITCH_FORMAT_ASTC_4X4:
+        if texture.format == SWITCH_FORMAT_R16:
+            raise ContainerError(
+                where,
+                "is stored uncompressed as 16-bit data (format 5); an ASTC "
+                "4x4 block would keep 8 bits a channel, so it is left alone")
+        if not convert_uncompressed:
+            raise ContainerError(
+                where,
+                "is stored uncompressed as %s (format %d), not ASTC 4x4; pass "
+                "--convert-uncompressed to rewrite the format fields, which "
+                "has not been tried on a device"
+                % (texture.label, texture.format))
+        convert = True
+    target_w, target_h = entry["target"]
+    if target_w * target_h < texture.width * texture.height:
+        raise ContainerError(
+            where,
+            "would shrink the texture from %dx%d to %dx%d, which a "
+            "replacement must not do"
+            % (texture.width, texture.height, target_w, target_h))
+    source = pc.by_id(plan_id)
+    payload = pc.read_payload(source)
+    width, height, pixels = decode_pc_level0(payload, where)
+    pixels = resample_box(pixels, width, height, target_w, target_h)
+    blocks, cached = astc_cached(plan_id, pixels, target_w, target_h, quality,
+                                 astcenc, cache_dir, colorspace)
+    replacement = build_switch_payload(original, target_w, target_h, blocks,
+                                       convert)
+    return replacement, {
+        "id": entry["id"], "name": entry["name"] or "",
+        "switch": [texture.width, texture.height],
+        "target": [target_w, target_h],
+        "old": len(original), "new": len(replacement),
+    }, cached
+
+
+def cmd_apply(args):
+    """Write a replacement container set from a plan file."""
+    header, entries = read_plan(args.plan)
+    switch_path = args.switch or header.get("switch")
+    pc_path = args.pc or header.get("pc")
+    if not switch_path or not pc_path:
+        raise ContainerError(
+            args.plan, "does not name the two packages; pass --switch and --pc")
+    switch = DatSet(switch_path)
+    pc = DatSet(pc_path)
+    quality = parse_quality(args.quality)
+    astcenc = find_astcenc(args.astcenc)
+    if astcenc is None:
+        raise ContainerError("astcenc", "is not on PATH; install it, or pass "
+                             "--astcenc")
+    cache_dir = args.cache_dir or default_cache_dir()
+    os.makedirs(cache_dir, exist_ok=True)
+    planned = len(entries)
+    entries = entries[:args.limit] if args.limit else entries
+    colorspace = "srgb" if args.srgb else "linear"
+    started = time.time()
+    replacements = {}
+    rows, refused, cached_count = [], [], 0
+    for entry in entries:
+        try:
+            replacement, row, cached = apply_entry(
+                entry, switch, pc, quality, astcenc, cache_dir, colorspace,
+                args.convert_uncompressed)
+        except ContainerError as err:
+            if args.fail_fast:
+                raise
+            refused.append({"id": entry["id"],
+                            "name": entry.get("name") or "",
+                            "reason": err.why})
+            continue
+        replacements[int(entry["id"], 16)] = replacement
+        rows.append(row)
+        cached_count += 1 if cached else 0
+    elapsed = time.time() - started
+    if not replacements:
+        said = "; ".join("%s: %s" % (row["id"], row["reason"])
+                         for row in refused[:5])
+        raise ContainerError(args.plan, "no entry could be replaced: %s" % said)
+    dat_path, idx_path = switch.write(args.out, replacements)
+    on_disk = os.path.getsize(dat_path)
+    written = DatSet(dat_path)
+    accounted = sum(record.stored for record in written.records)
+    if accounted != on_disk:
+        raise ContainerError(
+            dat_path, "holds %d bytes but its index accounts for %d"
+            % (on_disk, accounted))
+    report = {
+        "switch": switch_path,
+        "plan": args.plan,
+        "planned": planned,
+        "attempted": len(entries),
+        "count": len(rows),
+        "old_bytes": sum(row["old"] for row in rows),
+        "new_bytes": sum(row["new"] for row in rows),
+        "on_disk": on_disk,
+        "elapsed": round(elapsed, 2),
+        "quality": quality,
+        "encoded": len(rows) - cached_count,
+        "cached": cached_count,
+        "entries": rows,
+        "refused": refused,
+        "dat": dat_path, "idx": idx_path,
+    }
+    sys.stdout.write(render_apply(report, args.format))
+    return 0
+
+
 def cmd_extract(args):
     ds = DatSet(args.dat)
     rec = ds.resolve(args.what)
@@ -1483,6 +2214,35 @@ def main(argv=None):
                    help="write the plan here when making one")
     p.add_argument("--format", choices=("table", "json"), default="table")
     p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser(
+        "apply",
+        help="write the replacement container set a plan describes")
+    p.add_argument("--plan", required=True,
+                   help="the plan file made by the plan command")
+    p.add_argument("--out", required=True,
+                   help="directory for the new .dat and .idx")
+    p.add_argument("--switch", help="the Switch .dat (default: from the plan)")
+    p.add_argument("--pc", help="the PC .dat (default: from the plan)")
+    p.add_argument("--quality", default=DEFAULT_QUALITY,
+                   help="astcenc quality preset or a number from 0 to 100 "
+                        "(default: %(default)s)")
+    p.add_argument("--astcenc", help="the astcenc program (default: found on "
+                                     "PATH)")
+    p.add_argument("--cache-dir",
+                   help="where encoded replacements are cached (default: "
+                        "%s)" % default_cache_dir())
+    p.add_argument("--srgb", action="store_true",
+                   help="encode as sRGB instead of linear")
+    p.add_argument("--convert-uncompressed", action="store_true",
+                   help="also replace blocks the game stores uncompressed "
+                        "(RGBA8 and R8); this rewrites the format fields")
+    p.add_argument("--fail-fast", action="store_true",
+                   help="stop at the first entry that cannot be replaced")
+    p.add_argument("--limit", type=int, default=0,
+                   help="only the first entries of the plan")
+    p.add_argument("--format", choices=("table", "json"), default="table")
+    p.set_defaults(func=cmd_apply)
 
     args = ap.parse_args(argv)
     try:

@@ -2948,6 +2948,12 @@ if(Python3_Interpreter_FOUND)
     # non-power-of-two source and an over-budget refusal (scripts/frostpunk-assets.py)
     add_test(NAME frostpunk_plan
              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_plan_test.py")
+    # a plan turned into a replacement container: a PC texture decoded (DXT5 at 4 by 4 and 8 by 8, raw
+    # RGBA8, a chain whose full-size level is last), encoded to ASTC 4x4, put under the header of the block it
+    # replaces with only the words that describe the pixels changed, and a size report that matches the file
+    # (scripts/frostpunk-assets.py)
+    add_test(NAME frostpunk_apply
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_apply_test.py")
     # which GitHub Actions caches the cleanup workflow deletes (scripts/trim-caches.py)
     add_test(NAME trim_caches COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/trim_caches_test.py")
     # build.yml's LLVM builds, each saved by the step right after it: a later failure or a cancelled run keeps it;
