@@ -8,8 +8,10 @@
    Without it, FSR 4.1 is not available and the choice of upscaler goes on to the next.
 
    The FFX API is one interface for FSR 3.1 and 4: the loader picks the effect that the GPU and the driver take.
-   This asks it for the providers the GPU has, takes the 4.x one by id (ffxOverrideVersion) and refuses the context
+   This asks it for the providers the GPU has, takes the 4.1 one by id (ffxOverrideVersion) and refuses the context
    when the provider it gets is not 4.1, so a driver with 3.1 alone leaves FSR 4.1 off instead of running 3.1 here.
+   On Linux (SNX_FSR4_VK) the same API is reached through the FSR4 Vulkan provider (third_party/fsr4vk) instead of
+   AMD's loader DLL, and it also names what the Vulkan device must be made with (snx_ffx_prepare_device).
    Unlike Streamline the API needs neither the instance nor a hook of the swapchain's calls: an evaluation gives it the
    images as resources, and it records into the caller's command buffer. Like the rest of the interface it knows
    neither the renderer nor the settings: the caller passes the folder once, and a function for the API's messages */
@@ -34,6 +36,17 @@ SnxFfx* snx_ffx_create(const SnxUpscalerInfo* info, const char** why);
    unavailable from then on, so the next evaluation chooses another upscaler */
 int snx_ffx_evaluate(SnxFfx* f, const SnxUpscaleEval* e, const char** why);
 void snx_ffx_destroy(SnxFfx* f);
+
+/* The FSR4 Vulkan provider names the device features and extensions its shaders need, so the device is made from the
+   create info it hands back: before vkCreateDevice when the provider is running (SNX_FSR4_VK, Linux), a no-op
+   otherwise. The token is released once the device is made */
+int snx_ffx_prepare_wanted(void);
+/* 1 where this build carries the model folder (Linux: assets beside the source, SNX_FSR4_ASSETS), so an empty
+   ffx_runtime still runs */
+int snx_ffx_built_in_assets(void);
+int snx_ffx_prepare_device(VkPhysicalDevice phys, const VkDeviceCreateInfo* in, const VkDeviceCreateInfo** out,
+                           void** token, char* err, size_t n);
+void snx_ffx_device_made(void* token);
 #ifdef __cplusplus
 }
 #endif

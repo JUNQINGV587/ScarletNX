@@ -39,6 +39,7 @@ Generated modules include runtime ABI code. Game assets, keys and firmware are e
 | SMAA 1x by Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando Navarro and Diego Gutierrez (iryoku/smaa at 71c806a: its reference shader and its area and search textures, the anti-aliasing before a copy or a spatial upscale) | MIT |
 | NVIDIA Streamline 2.14.16's headers (`include/`, the DLSS backend of a Windows build. NVIDIA's runtime is not included: the user downloads it) | MIT |
 | AMD's FidelityFX API headers (FidelityFX-SDK v2.4.0's `api/include` and `upscalers/include/ffx_upscale.h`, the FSR 4.1 backend of a Windows build. AMD's runtime is not included: the user downloads it) | MIT |
+| fsr4vk by dvj5411 (`third_party/fsr4vk`, the FSR4 Vulkan provider: the FSR 4.1 model's shaders and weights for Linux, and AMD's FidelityFX API headers as that project copies them) | GPL-3.0-or-later, with AMD's FidelityFX-SDK MIT licence for its headers and model files ([text](../third_party/fsr4vk/LICENSES/GPL-3.0.txt), [AMD's](../third_party/fsr4vk/LICENSES/AMD-FidelityFX-SDK-MIT.md)) |
 | KosmicKrisp (Mesa's Vulkan driver on Metal, which the macOS app carries with `SNX_KOSMICKRISP`) | MIT |
 | The Vulkan Loader (the macOS app carries it for KosmicKrisp) | Apache 2.0 |
 | AMD FidelityFX Super Resolution 1.0 (`src/common/gpu/vk/fx/ffx_a.h`, `ffx_fsr1.h`, and the EASU and RCAS shaders' constants) | MIT |

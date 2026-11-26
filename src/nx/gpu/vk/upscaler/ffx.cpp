@@ -407,10 +407,11 @@ void snx_ffx_destroy(SnxFfx* f) {
     if (f->ctx) g.api.destroy(&f->ctx, NULL);
     free(f);
 }
+int snx_ffx_built_in_assets(void) { return 0; }
 
 } // extern "C"
 
-#else /* no FidelityFX API headers: a build for another system, or without them */
+#elif !defined(SNX_FSR4_VK) /* no FidelityFX API headers: a build for another system, or without them */
 
 extern "C" {
 static const char* const g_none =
@@ -420,6 +421,7 @@ int snx_ffx_start(const char* folder, SnxFfxLog log, const char** why) {
     if (why) *why = g_none;
     return 0;
 }
+int snx_ffx_built_in_assets(void) { return 0; }
 int snx_ffx_available(const char** why) {
     if (why) *why = g_none;
     return 0;

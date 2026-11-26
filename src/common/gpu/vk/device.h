@@ -24,7 +24,7 @@
 /* A physical device and queue family a renderer may make its device on, and what it chose there. choose reads phys,
    family, properties and again, list where a helper reads it whole, may set api, and does the rest through the
    functions below */
-typedef struct {
+typedef struct SnxVkChoice {
     VkPhysicalDevice phys;
     uint32_t family; /* of the request's queues, presenting to its surface */
     VkPhysicalDeviceProperties properties;
@@ -39,6 +39,13 @@ typedef struct {
     const char* asked[SNX_VK_CHOICE_ASKED];
     uint32_t asked_count;
     VkDevice device;
+    /* where given, the device's create info is handed to another library before it is made (the FSR4 Vulkan provider
+       names the features and extensions its shaders need): in, then the one vkCreateDevice takes, a token and user for
+       it; false where it refuses, which why says */
+    bool (*prepare)(struct SnxVkChoice* c, const VkDeviceCreateInfo* in, const VkDeviceCreateInfo** out, void** token,
+                    void* user);
+    void (*prepared)(void* token, void* user);
+    void* prepare_user;
     char why[512];   /* why choose passed this one over (snx_vk_choice_refuse) */
     char error[512]; /* what the renderer asked that no device can give it: the build's fault */
 } SnxVkChoice;

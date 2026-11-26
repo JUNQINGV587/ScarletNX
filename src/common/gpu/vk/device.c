@@ -75,7 +75,14 @@ bool snx_vk_choice_create(SnxVkChoice* c, const void* features, const VkPhysical
                              .enabledExtensionCount = c->extension_count,
                              .ppEnabledExtensionNames = c->extensions,
                              .pEnabledFeatures = enabled};
-    VkResult result = vkCreateDevice(c->phys, &di, NULL, &c->device);
+    const VkDeviceCreateInfo* use = &di;
+    void* token = NULL;
+    if (c->prepare && !c->prepare(c, &di, &use, &token, c->prepare_user)) {
+        if (!c->why[0]) snprintf(c->why, sizeof c->why, "refuses the device: its provider would not prepare it");
+        return false;
+    }
+    VkResult result = vkCreateDevice(c->phys, use, NULL, &c->device);
+    if (c->prepared) c->prepared(token, c->prepare_user);
     if (result == VK_SUCCESS) return true;
     c->device = VK_NULL_HANDLE;
     snprintf(c->why, sizeof c->why, "refuses the device: vkCreateDevice gave %s (%d)", snx_vk_result_str(result),

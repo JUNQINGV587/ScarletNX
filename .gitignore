@@ -34,6 +34,8 @@ romfs/
 # caches (in the user's cache folder, kept out wherever a copy lands)
 *.snxs
 *.spv
+# the FSR4 Vulkan provider's model shaders are AMD's model files, not a game's SPIR-V dumps
+!third_party/fsr4vk/assets/**/*.spv
 *.ppm
 *.vkshaders
 *.vkshipped

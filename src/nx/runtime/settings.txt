@@ -384,12 +384,11 @@ setting FFX runtime
     label FidelityFX runtime
     text 2048
     startup
-    only windows
-    help The folder that holds AMD's FidelityFX API runtime, which the user downloads from AMD and which is not part of
-    help ScarletNX: amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll from AMD's FidelityFX SDK 2.4
-    help (docs/user/ffx.md). Empty = no FSR 4.1. With it, render_upscaler 0 (Best) or 5 runs FSR 4.1 on an
-    help AMD GPU whose driver has it. Elsewhere, or where the files are missing or not signed by AMD, the next
-    help upscaler stands in
+    help The folder that holds FSR 4.1's runtime, which is not part of ScarletNX (docs/user/ffx.md). On Windows:
+    help amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll from AMD's FidelityFX SDK 2.4. On Linux: the
+    help FSR4 Vulkan provider's model folder (fsr4-vulkan-assets, or the assets it ships with, with general/ and
+    help fsr411/). Empty = no FSR 4.1. With it, render_upscaler 0 (Best) or 5 runs FSR 4.1 where the GPU and driver
+    help have it; elsewhere, or where the files are missing or refused, the next upscaler stands in
 setting Shadows
     key shadows
     int 0 1

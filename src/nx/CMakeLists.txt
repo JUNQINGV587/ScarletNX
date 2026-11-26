@@ -180,6 +180,9 @@ include("${PROJECT_SOURCE_DIR}/cmake/glsl.cmake")
 # vk_hash (gpu/vk/cmd.c); the device setup the 3DS and the Vita share (src/common/gpu/vk); the shader file's units
 # (gpu/vk/pipeline_file.c)
 target_link_libraries(snx_vk PUBLIC snx_xxhash snx_vk_common snx_fsr2 snx_upscaler PRIVATE snx_zstd)
+if(UNIX AND NOT APPLE AND NOT ANDROID)
+    target_compile_definitions(snx_vk PRIVATE SNX_FSR4_VK)
+endif()
 # the vk_ext_* table (g_vk_extension_settings) its device takes (gpu/vk/device.c, common/gpu/vk/device_settings.h)
 target_link_libraries(snx_vk PUBLIC snx_settings_runtime)
 # AMD FidelityFX Super Resolution 2.2.1 (cmake/dependencies.cmake): AMD's library and Vulkan backend as they are
@@ -204,16 +207,37 @@ target_include_directories(snx_fsr2 PRIVATE "${snx_fsr2_api_dir}" "${PROJECT_SOU
 set_source_files_properties(${snx_fsr2_amd} PROPERTIES COMPILE_OPTIONS
                             "${snx_third_party_flags};-include;${CMAKE_CURRENT_SOURCE_DIR}/gpu/vk/fsr2/fsr2_compat.h")
 target_link_libraries(snx_fsr2 PUBLIC snx_vk_common)
+# FSR 4.1 on Linux through the FSR4 Vulkan provider (third_party/fsr4vk, GPL-3.0-or-later): AMD's FidelityFX API
+# headers (MIT) are its own copy. The provider runs the INT8 FSR 4.1 model from AMD's files (MIT), read from the
+# ffx_runtime folder or from assets beside the source, and names what the Vulkan device is made with
+set(snx_fsr4_dir "${PROJECT_SOURCE_DIR}/third_party/fsr4vk")
+if(UNIX AND NOT APPLE AND NOT ANDROID)
+    add_library(snx_fsr4vk SHARED "${snx_fsr4_dir}/provider/ffx_vk_provider.cpp")
+    set_target_properties(snx_fsr4vk PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON OUTPUT_NAME snx_fsr4vk)
+    target_include_directories(snx_fsr4vk SYSTEM PRIVATE "${snx_fsr4_dir}/provider" "${snx_fsr4_dir}/native"
+                               "${snx_fsr4_dir}/amd-fidelityfx-sdk/Kits/FidelityFX/api/include"
+                               "${snx_fsr4_dir}/amd-fidelityfx-sdk/Kits/FidelityFX/upscalers/include")
+    target_compile_options(snx_fsr4vk PRIVATE ${snx_third_party_flags})
+endif()
+
 # the runtime's upscalers behind one interface (gpu/vk/upscaler, docs/layers/gpu/upscalers.md): FSR 2 through snx_fsr2,
 # the filtered copy and the spatial upscaler. Their compute passes are compiled from GLSL at build time, the spatial
 # ones with AMD's FSR 1 header from FSR 2's package, patched (.patch/fidelityfx-fsr2/0002-fsr1-easu-glsl.patch). Like
 # snx_fsr2 it knows no renderer, so tests/vk_upscaler.c links it alone
 add_library(snx_upscaler STATIC gpu/vk/upscaler/upscaler.c gpu/vk/upscaler/passes.c gpu/vk/upscaler/reproject.c
-                          gpu/vk/upscaler/dlss.cpp gpu/vk/upscaler/ffx.cpp)
+                          gpu/vk/upscaler/dlss.cpp gpu/vk/upscaler/ffx.cpp gpu/vk/upscaler/ffx_vk.cpp)
 target_link_libraries(snx_upscaler PUBLIC snx_fsr2 snx_vk_common)
 # DLSS through NVIDIA Streamline (gpu/vk/upscaler/dlss.cpp) and FSR 4.1 through AMD's FidelityFX API
 # (gpu/vk/upscaler/ffx.cpp) in a Windows build: their MIT headers only, their runtimes taken from the user's folders at
 # run time. Windows' own libraries check the signature of each
+if(UNIX AND NOT APPLE AND NOT ANDROID)
+    target_compile_definitions(snx_upscaler PRIVATE SNX_FSR4_VK SNX_FSR4_ASSETS=\"${snx_fsr4_dir}/assets\")
+    set_source_files_properties(gpu/vk/upscaler/ffx_vk.cpp PROPERTIES COMPILE_OPTIONS "-fdeclspec")
+    target_include_directories(snx_upscaler SYSTEM PRIVATE "${snx_fsr4_dir}/provider"
+                               "${snx_fsr4_dir}/amd-fidelityfx-sdk/Kits/FidelityFX/api/include"
+                               "${snx_fsr4_dir}/amd-fidelityfx-sdk/Kits/FidelityFX/upscalers/include")
+    target_link_libraries(snx_upscaler PUBLIC snx_fsr4vk)
+endif()
 if(WIN32)
     target_include_directories(snx_upscaler SYSTEM PRIVATE "${snx_streamline_include}" "${snx_ffx_include}/api/include"
                                "${snx_ffx_include}/upscalers/include")

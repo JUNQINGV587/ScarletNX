@@ -345,7 +345,9 @@ static void ffx_log(int level, const char* text) {
 static void ffx_start(void) {
     const char* why;
     int may = g_settings.render_upscaler == 0 || g_settings.render_upscaler == SNX_UPSCALER_FSR_NEW + 1;
-    if (g_opt_headless || !g_settings.ffx_runtime[0] || !may) return;
+    /* on Linux the provider's models come with the source (SNX_FSR4_ASSETS) when no folder is named */
+    int named = g_settings.ffx_runtime[0] || snx_ffx_built_in_assets();
+    if (g_opt_headless || !named || !may) return;
     if (!snx_ffx_start(g_settings.ffx_runtime, ffx_log, &why)) WARN("vulkan: no FSR 4.1: %s\n", why);
 }
 /* the swapchain's calls through Streamline's, which does its work for each frame in the present */
@@ -921,6 +923,22 @@ static uint32_t device_needs(const VkPhysicalDeviceProperties* p, const SnxVkExt
 
 /* the Switch's device on the device device_rating rates highest (common/gpu/vk/device.h): the translator's caps, its
    features, extensions and queues, and the device made */
+#if defined(SNX_FSR4_VK)
+/* the FSR4 Vulkan provider names the device features and extensions its shaders need: it is given the create info
+   before vkCreateDevice, and its answer is the one that is made */
+static bool ffx_prepare(SnxVkChoice* c, const VkDeviceCreateInfo* in, const VkDeviceCreateInfo** out, void** token,
+                        void* user) {
+    char err[512];
+    (void)user;
+    if (!snx_ffx_prepare_device(c->phys, in, out, token, err, sizeof err)) {
+        snprintf(c->why, sizeof c->why, "%s", err);
+        return false;
+    }
+    return true;
+}
+static void ffx_prepared(void* token, void* user) { (void)user, snx_ffx_device_made(token); }
+#endif
+
 static bool choose_device(SnxVkChoice* c, void* user) {
     DeviceChoice* d = user;
     g_vk = d->vk;
@@ -2660,6 +2678,12 @@ static bool choose_device(SnxVkChoice* c, void* user) {
             dlss_off(why);
         }
     }
+#if defined(SNX_FSR4_VK)
+    if (snx_ffx_prepare_wanted()) {
+        c->prepare = ffx_prepare;
+        c->prepared = ffx_prepared;
+    }
+#endif
     if (!snx_vk_choice_create(c, chain, &g_vk.feat, qci, nq)) return false;
     g_vk.gfx_queues = second ? 2 : 1;
     g_vk.feat11 = f11;
