@@ -21,6 +21,11 @@ rules that sessions get wrong, and it points to the skills that hold the procedu
 - **A build is not a test.** To verify a runtime change, run the game (`snx-run` skill) through the scene that the
   change affects. The commit tells what you ran. If a change fixes a crash, run the game enough times to show that
   the game does not crash again. One good run does not prove the fix of an intermittent crash.
+- **A merge can drop a patch of this fork.** This fork keeps the pointer table windows of the legacy shader
+  translator, their tests, and the port packer. A merge that takes an upstream file as it is loses one of them, with
+  no build error. The merge `5a6ccccfe` did that, and one game drew no models. When you resolve a conflict in
+  `src/nx/gpu/shader/`, read each fork patch, confirm it, and run `scripts/check-port-fork.py`. The check names a
+  patch that a merge dropped, not one that changed.
 - **A change made for speed starts with a profile.** The `snx-profile` skill gives what to read before you touch code.
   It covers the runtime's own counters, a `plat_ns` timer around the phase, the GPU's timestamps where the host has
   them, and the host's sampler. Five changes here came from a mechanism that sounded right, and their own

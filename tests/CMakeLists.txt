@@ -2924,6 +2924,12 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME deprecations_check COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/check-deprecations.py")
     add_test(NAME deprecations_check_script COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/deprecations_test.py")
     set_tests_properties(deprecations_check PROPERTIES SKIP_RETURN_CODE 77)
+    # the code this fork has and origin/main does not, which a merge that takes an upstream file loses with no build
+    # error or failing test: the pointer table windows of the legacy shader translator, the tests of those windows, and
+    # the port packer's resolution keys (scripts/check-port-fork.py); then the checks on checkouts made to fail it
+    add_test(NAME port_fork_check COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/check-port-fork.py")
+    add_test(NAME port_fork_check_script
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port_fork_test.py")
     # which GitHub Actions caches the cleanup workflow deletes (scripts/trim-caches.py)
     add_test(NAME trim_caches COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/trim_caches_test.py")
     # build.yml's LLVM builds, each saved by the step right after it: a later failure or a cancelled run keeps it;
