@@ -26,6 +26,10 @@ and cross-checked against the PC package (`textures-s3.*`, 4178 resources,
   * [The target size](#the-target-size)
   * [The budget](#the-budget)
   * [The plan file](#the-plan-file)
+* [Applying a plan](#applying-a-plan)
+  * [The header it writes](#the-header-it-writes)
+  * [The cache](#the-cache)
+  * [The report](#the-report)
 * [Replacing one resource](#replacing-one-resource)
 * [Round-trip differences](#round-trip-differences)
 * [What was proven](#what-was-proven)
@@ -92,15 +96,32 @@ Most payloads are textures and start with `65 78 1c 00`. The 28-byte header is
 | 8 | u32 | 1 or 2; not yet pinned down |
 | 12 | u16 | width |
 | 14 | u16 | height |
-| 16 | 12 bytes | format, block and mip fields; not yet pinned down |
+| 16 | u16 | `1` in every block seen |
+| 18 | u8 | `1` in every block seen |
+| 19 | u8 | **mip level count** |
+| 20 | 4 bytes | format descriptor: `02 03 04 05` for ASTC 4×4, `04 03 02 05` for RGBA8, `00 00 00 02` for R8 |
+| 24 | u32 | **pixel bytes of every level**, which is the payload length less 28 |
 
-Payload sizes then follow the format id. The 1973 blocks whose size is exactly
-`28 + ceil(w/4)*ceil(h/4)*16` are one 4×4 ASTC block per tile with no mip chain.
-The rest do not follow that rule at the stated width and height (a 2048×2048
-atlas carries 5 596 160 payload bytes where 4×4 ASTC would need 4 194 304), so
-the remaining format ids and their extra bytes are still open. Replacing a
-texture means writing a payload whose own header describes it; the container
-itself does not care what the bytes are.
+Offset 24 holds on all 4172 texture blocks: it equals the payload length minus
+28. It counts the pixels, mips included, and it agrees with the level sizes the
+level count implies, so both fields describe the payload and a writer must set
+both.
+
+A block whose level count is 1 holds one level: `ceil(w/4)*ceil(h/4)*16` bytes
+of ASTC 4×4 blocks. 2629 of the 3725 ASTC blocks are like this. A block with a
+higher count holds the full size first and the mips after it, one level after
+another. Their sizes follow the `ceil` rule for each step, and every level takes
+at least 512 bytes: that explains the 2192 extra bytes of a square block (its
+256, 64, 16, 16 and 16 byte levels padded to 512) but leaves 512 to 9216 bytes
+unexplained on blocks that are not square. The tool therefore writes one level
+and never a chain. A 2048×2048 atlas with a chain carries 5 596 160 payload
+bytes where one 4×4 ASTC level needs 4 194 304.
+
+Format ids: `72` is ASTC 4×4 (3725 blocks), `37` is uncompressed RGBA8 (224),
+`1` is uncompressed R8 (172) and `5` is 16-bit uncompressed data (46, for
+example a 4096×4096 height field at 33 554 432 bytes). Replacing a texture means
+writing a payload whose own header describes it; the container itself does not
+care what the bytes are, but the game reads the pixels by the format id.
 
 Not every payload is a texture: 62 are Stingray XML `<TextureArrayDescriptor>`
 documents naming the original PC `.dds` files, and 4 are plain 32-bit TGA
@@ -353,6 +374,72 @@ The skipped 4096x4096 textures are the `--max-size` default doing its job: at
 every entry's `delta`, and a `delta` can be negative: a Switch payload that
 carries a mip chain is larger than the ASTC replacement that carries none, as
 `0x06bc77aa` shows at -1,988,085 bytes.
+
+## Applying a plan
+
+```
+scripts/frostpunk-assets.py apply --plan /tmp/plan.jsonl --out /data/repack/r6
+```
+
+`apply` reads a plan and writes a new container set to `--out`. It prints a
+report at the end.
+
+One entry is one replacement:
+
+1. Read the Switch payload and the PC payload: from the plan, or from `--switch`
+   and `--pc` when those are given.
+2. Decode the full-size level of the PC image to RGBA8. The decoder handles
+   DXT1, DXT3, DXT5 and raw 1, 2, 4 and 8 bytes a pixel. A raw 1 or 2 byte pixel
+   holds one channel, so it becomes grey. Raw 8 bytes a pixel does not occur in
+   either package, so the tool reads it as four 16-bit channels and says so.
+3. Average the image down to the target size of the entry. The plan uses a
+   factor of two, which is an exact 2x2 mean.
+4. Encode the image to ASTC 4x4 with `astcenc`.
+5. Put the blocks under the header of the Switch texture that it replaces.
+
+### The header it writes
+
+The new payload is the 28-byte header of the old texture and the new blocks. Two
+words change, because they describe the pixels: the level count at +19 becomes
+1, and the pixel bytes at +24 becomes the length of the blocks. Every other byte
+stays the same, so the format id, the descriptor and the fields that the package
+does not document keep their old values.
+
+A texture that the game stores uncompressed (format 37 RGBA8, format 1 R8) is
+refused with its id, because ASTC blocks under those fields would be read as raw
+pixels. `--convert-uncompressed` rewrites the format fields to the ASTC 4x4 pair
+as well. No device run has covered that yet.
+
+A texture of format 5 is always refused: it holds 16 bits a channel and ASTC 4x4
+keeps 8.
+
+A block that declares a mip chain gets one level. The tool does not write a
+chain, because the padding of the levels is not fully understood: for a block
+that is not square the sizes do not add up, as the section above shows. One level
+is valid, and 2629 of the shipped ASTC blocks hold one level.
+
+An entry whose target is smaller than the texture that it replaces is refused
+with its id. The planner leaves those out as well, so this guard catches a hand
+edited plan.
+
+### The cache
+
+`astcenc` writes a `.astc` file: a 16-byte header and the blocks. The Switch
+header carries the blocks only, so the header is checked and dropped. The tool
+keeps the whole file in `$XDG_CACHE_HOME/frostpunk-assets/astc`, named by
+resource id, size, quality and colour space. A second run of the same plan
+encodes nothing.
+
+`--quality` takes one of the `astcenc` presets or a number from 0 to 100, which
+picks the nearest preset. The default is `medium`. `--srgb` encodes with `-cs`;
+the default is `-cl`, which stores the values as they are.
+
+### The report
+
+The report gives the replaced count, the old and new payload bytes, the net
+change, the time, and the size of the `.dat` on disk. The last value is measured
+after the write and compared with the block sizes of the index that was written,
+so the report cannot disagree with the file.
 
 ## Replacing one resource
 
