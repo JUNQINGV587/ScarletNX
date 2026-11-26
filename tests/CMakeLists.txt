@@ -2930,6 +2930,10 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME port_fork_check COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/check-port-fork.py")
     add_test(NAME port_fork_check_script
              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port_fork_test.py")
+    # a Frostpunk asset container: the 29-byte records, the zip gaps between blocks, and the refusal of a
+    # replacement whose size or decompression does not match its record (scripts/frostpunk-assets.py)
+    add_test(NAME frostpunk_assets
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_assets_test.py")
     # which GitHub Actions caches the cleanup workflow deletes (scripts/trim-caches.py)
     add_test(NAME trim_caches COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/trim_caches_test.py")
     # build.yml's LLVM builds, each saved by the step right after it: a later failure or a cancelled run keeps it;
