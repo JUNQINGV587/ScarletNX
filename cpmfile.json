@@ -52,6 +52,26 @@
         "url": "https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz",
         "version": "9.0.2"
     },
+    "ffx_api_h": {
+        "hash": "119f8021dc38bcd1f1781c3654457c29b633b91363ddc06c1e7b1d518c57cd2a9e90d6e36bf679837990b780e3ee28afbe7b1f42a5224d1c688e4d540cacceac",
+        "url": "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v2.4.0/Kits/FidelityFX/api/include/ffx_api.h",
+        "version": "v2.4.0"
+    },
+    "ffx_api_types_h": {
+        "hash": "39a03e9f219b4da004320a8550e0d2814fb8d896f6772ab891a8607fb429477fe3f8eb7a8c5fb8e19a01ab91edc20f8b5f437e165350f991891d11c09869fc44",
+        "url": "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v2.4.0/Kits/FidelityFX/api/include/ffx_api_types.h",
+        "version": "v2.4.0"
+    },
+    "ffx_api_vk_h": {
+        "hash": "d91c618d0c067d73f69b558c8441a3ed8f91eaac1d902b00ee30e8905fbc65a6e1aeada57608bd81419e44198f1e0959bdc32c5a1c20e1ad33126c46992f8f0f",
+        "url": "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v2.4.0/Kits/FidelityFX/api/include/vk/ffx_api_vk.h",
+        "version": "v2.4.0"
+    },
+    "ffx_upscale_h": {
+        "hash": "0ec8622d382e55b3c69909a2022344897835cb31a0b7605c71e1c498fe4d2aa1c4aed57d3a90eec87e586f0591e8a3ecbf0580028eccab059ef2b03d5cb444cf",
+        "url": "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v2.4.0/Kits/FidelityFX/upscalers/include/ffx_upscale.h",
+        "version": "v2.4.0"
+    },
     "fidelityfx-fsr2": {
         "hash": "0a7401431c2c5c4f8c940089c42077e497b62d09b10bd22110e68d49c0d2d27183660a515ea4b1c58942483420c1e6a93ee9bac5f0c0fef5584f590fa238c310",
         "package": "FidelityFX-FSR2",

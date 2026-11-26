@@ -463,7 +463,7 @@ int main(void) {
         }                                                                                                              \
     } while (0)
     /* the choice, with no device needed for the stubs: DLSS without Streamline running (never on this system, nor
-       anywhere without the runtime's folder), newer FSR and XeSS never */
+       anywhere without the runtime's folder), newer FSR without AMD's runtime, and XeSS never */
     {
         const char* why;
         uint64_t evaluated = 1, failed = 1;

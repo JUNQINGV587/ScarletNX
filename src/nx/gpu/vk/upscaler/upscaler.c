@@ -3,13 +3,15 @@
 /* upscaler.h: each backend's capabilities, the choice among them, and the calls each context goes through. FSR 2 is
    gpu/vk/fsr2's (AMD FidelityFX Super Resolution 2.2.1, MIT, Copyright (c) 2022-2023 Advanced Micro Devices, Inc.), the
    copy and the spatial upscaler are passes.c's, DLSS is dlss.cpp's (NVIDIA's runtime, which the user downloads, through
-   NVIDIA Streamline: available only where that runs). Newer FSR and XeSS are described, so the choice and the settings
-   know them, and are never available: each needs a runtime that is not built in (docs/layers/gpu/upscalers.md) */
+   NVIDIA Streamline: available only where that runs), newer FSR is ffx.cpp's (AMD's FidelityFX API runtime, which the
+   user downloads: FSR 3.1 or 4, Windows). XeSS is described, so the choice and the settings know it, and is never
+   available: it needs a runtime that is not built in (docs/layers/gpu/upscalers.md) */
 #include "nx/gpu/vk/upscaler/upscaler.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include "nx/gpu/vk/fsr2/fsr2.h"
 #include "nx/gpu/vk/upscaler/dlss.h"
+#include "nx/gpu/vk/upscaler/ffx.h"
 #include "nx/gpu/vk/upscaler/passes.h"
 
 /* a reason made of values, for the calling thread until its next call */
@@ -58,9 +60,7 @@ int snx_upscaler_available(SnxUpscalerId id, VkPhysicalDevice physical, const ch
         case SNX_UPSCALER_SPATIAL:
         case SNX_UPSCALER_COPY: return formatless(physical, 0, why);
         case SNX_UPSCALER_DLSS: return snx_dlss_available(why);
-        case SNX_UPSCALER_FSR_NEW:
-            *why = "FSR 3.1 and 4 are not built in: they need AMD's FidelityFX API runtime";
-            return 0;
+        case SNX_UPSCALER_FSR_NEW: return snx_ffx_available(why);
         case SNX_UPSCALER_XESS: *why = "XeSS is not built in: it needs Intel's XeSS runtime"; return 0;
         default: *why = "no such upscaler"; return 0;
     }
@@ -153,6 +153,7 @@ struct SnxUpscaler {
     SnxFsr2* fsr;
     SnxUpPasses* passes;
     SnxDlss* dlss;
+    SnxFfx* ffx;
 };
 
 SnxUpscaler* snx_upscaler_create(SnxUpscalerId id, const SnxUpscalerInfo* info, const char** why) {
@@ -179,9 +180,11 @@ SnxUpscaler* snx_upscaler_create(SnxUpscalerId id, const SnxUpscalerInfo* info, 
         }
     } else if (id == SNX_UPSCALER_DLSS)
         u->dlss = snx_dlss_create(info, why);
+    else if (id == SNX_UPSCALER_FSR_NEW)
+        u->ffx = snx_ffx_create(info, why);
     else
         u->passes = snx_up_passes_create(info, id == SNX_UPSCALER_SPATIAL, why);
-    if (!u->fsr && !u->passes && !u->dlss) {
+    if (!u->fsr && !u->passes && !u->dlss && !u->ffx) {
         free(u);
         return NULL;
     }
@@ -193,6 +196,7 @@ int snx_upscaler_evaluate(SnxUpscaler* u, const SnxUpscaleEval* e, const char** 
     if (!why) why = &none;
     *why = NULL;
     if (u->dlss) return snx_dlss_evaluate(u->dlss, e, why);
+    if (u->ffx) return snx_ffx_evaluate(u->ffx, e, why);
     if (!u->fsr) return snx_up_passes_record(u->passes, e, why);
     if (!e->depth.image || !e->motion.image) {
         *why = "FSR 2 needs depth and motion vectors";
@@ -228,6 +232,7 @@ void snx_upscaler_destroy(SnxUpscaler* u) {
     snx_fsr2_destroy(u->fsr);
     snx_up_passes_destroy(u->passes);
     snx_dlss_destroy(u->dlss);
+    snx_ffx_destroy(u->ffx);
     free(u);
 }
 

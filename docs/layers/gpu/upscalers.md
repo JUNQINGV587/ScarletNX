@@ -123,7 +123,7 @@ A context goes round its descriptors over `SNX_UPSCALER_IN_FLIGHT` (4) evaluatio
 | FSR 1 (EASU, RCAS) | spatial | none | LDR | 1 to 4 | FSR 1's `ffx_fsr1.h` from the FSR 2.2.1 archive (MIT), `up_easu.comp` and `up_rcas.comp` |
 | filtered copy | copy | none | LDR, HDR | 1/8 to 16 | `up_copy.comp`: a bilinear sample at each output pixel's centre, kept half a texel inside the picture |
 | DLSS | temporal | depth, motion vectors | LDR, HDR | 1 to 3 | NVIDIA DLSS Super Resolution through NVIDIA Streamline (`dlss.cpp`): Streamline's MIT headers in a Windows build, NVIDIA's runtime from the user's `dlss_runtime` folder ([DLSS](../../user/dlss.md)), available once Streamline took the device |
-| FSR 3.1 or 4 | temporal | depth, motion vectors | LDR, HDR | 1 to 3 | not built in: AMD's FidelityFX API runtime |
+| FSR 3.1 or 4 | temporal | depth, motion vectors | LDR, HDR | 1 to 3 | AMD FidelityFX Super Resolution 3.1 or 4 through AMD's FidelityFX API (`ffx.cpp`): the API's MIT headers in a Windows build, AMD's runtime from the user's `ffx_runtime` folder ([FSR 3.1 and 4](../../user/ffx.md)) |
 | XeSS | temporal | depth, motion vectors | LDR, HDR | 1 to 3 | not built in: Intel's XeSS runtime |
 
 - DLSS goes through Streamline's manual hooking: `device.c` starts it before the instance (only with `dlss_runtime`
@@ -145,8 +145,15 @@ A context goes round its descriptors over `SNX_UPSCALER_IN_FLIGHT` (4) evaluatio
 - The three compute passes share one layout: the picture sampled at binding 0, the result stored at binding 1 (a
   storage image without a format, which every built-in backend needs), and the sizes and sharpness as push constants.
   They are compiled from GLSL at build time (`cmake/glsl.cmake`, its `INCLUDES` for FSR's headers).
-- The stubs describe the backends so that the setting and the choice know them, and say why each is not available.
-  Each would be a backend file and a case in `upscaler.c`, with the runtime loaded at run time and only MIT headers in
+- FSR 3.1 or 4 goes through AMD's FidelityFX API (the FFX API): `device.c` loads `amd_fidelityfx_loader_vk.dll`
+  from the user's `ffx_runtime` folder before the device, after checking that its signature is AMD's, and `ffx.cpp`
+  makes one context for the game's sizes and records one dispatch per evaluation. The API takes each image as its own
+  resource description (the `VkImage` itself) with the input states and the output as a UAV. It takes the jitter as
+  the game gives it, the motion vectors' scale as the renderer states it, and the camera's planes for its depth
+  weights. A failure of the dispatch makes FSR unavailable from then on, so the next evaluation chooses FSR 2. It
+  needs Windows and an AMD driver with FSR 3.1 or 4: a driver with FSR 4 runs that, an older one FSR 3.1.
+- The XeSS stub describes its backend so that the setting and the choice know it, and says why it is not available.
+  It would be a backend file and a case in `upscaler.c`, with the runtime loaded at run time and only MIT headers in
   the tree.
 
 ## In the renderer

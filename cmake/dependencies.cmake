@@ -283,6 +283,28 @@ if(SNX_BUILD_NX AND NOT SNX_TOOLS_ONLY)
         endforeach()
     endif()
 
+    # AMD's FidelityFX API headers (MIT, GPUOpen-LibrariesAndSDKs/FidelityFX-SDK v2.4.0), the FSR 3.1 and 4 backend's
+    # (src/nx/gpu/vk/upscaler/ffx.cpp), in a Windows build alone, as FSR 3.1 and 4's runtime runs there alone. The files
+    # keep the SDK's folders, as they include each other by their relative paths, and nothing else of the SDK is
+    # fetched. AMD's runtime (its DLLs) is never fetched or shipped: the user downloads it (docs/user/ffx.md)
+    if(WIN32)
+        set(snx_ffx_include "${PROJECT_BINARY_DIR}/ffx")
+        file(MAKE_DIRECTORY "${snx_ffx_include}/api/include/vk" "${snx_ffx_include}/upscalers/include")
+        # each pinned in cpmfile.json by its SHA-512, as ffx_api_h, ffx_api_types_h, ffx_api_vk_h and ffx_upscale_h
+        foreach(snx_ffx_pair IN ITEMS "ffx_api_h=api/include/ffx_api.h"
+                                      "ffx_api_types_h=api/include/ffx_api_types.h"
+                                      "ffx_api_vk_h=api/include/vk/ffx_api_vk.h"
+                                      "ffx_upscale_h=upscalers/include/ffx_upscale.h")
+            string(REPLACE "=" ";" snx_ffx_pair "${snx_ffx_pair}")
+            list(GET snx_ffx_pair 0 snx_ffx_id)
+            list(GET snx_ffx_pair 1 snx_ffx_rel)
+            get_filename_component(snx_ffx_name "${snx_ffx_rel}" NAME)
+            snx_package_file(${snx_ffx_id})
+            # the folder the API's own includes name, so that each header finds the others where it says
+            configure_file("${${snx_ffx_id}_SOURCE_DIR}/${snx_ffx_name}" "${snx_ffx_include}/${snx_ffx_rel}" COPYONLY)
+        endforeach()
+    endif()
+
     # AMD FidelityFX Super Resolution 2.2.1 (MIT), the temporal upscaler the Ounce's DLSS evaluations run through
     # (src/nx/gpu/vk/fsr2, gpu/nvn/nvn_dlss.c): its library and Vulkan backend's sources and its GLSL passes, which the
     # build compiles (cmake/fsr2_shaders.cmake). The archive's prebuilt tools (tools/sc, Windows programs) are not used

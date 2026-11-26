@@ -312,7 +312,8 @@ setting Render upscaler
     help that can run, 1 = AMD FidelityFX Super Resolution 2.2 (temporal), 2 = FSR 1 (spatial: one frame, no jitter or
     help motion needed), 3 = none: a filtered copy of the picture onto the output (1:1 at the native size, soft below
     help it, and the picture shakes with the game's camera jitter), 4 = NVIDIA DLSS (Windows, an NVIDIA GPU, and
-    help NVIDIA's runtime in dlss_runtime's folder). FSR 3.1 or 4 and XeSS are not built in yet. Where the one asked
+    help NVIDIA's runtime in dlss_runtime's folder). FSR 3.1 or 4 takes AMD's runtime in ffx_runtime's folder (Windows,
+    help an AMD GPU); XeSS is not built in yet. Where the one asked
     help for can't run, or its caller can't take it (a DLSS evaluation takes a temporal one or None, a hook module the
     help kinds it names), the best one that can stands in
 setting Render anti aliasing
@@ -378,6 +379,17 @@ setting DLSS preset
     only windows
     help The DLSS model: 0 = NVIDIA's choice for each mode, 1 to 4 = the presets J, K, L, M (transformer models). K
     help by default: at 2x it takes less memory than NVIDIA's choice there (M), 158 against 214 MB at 2560x1440
+setting FFX runtime
+    key ffx_runtime
+    label FidelityFX runtime
+    text 2048
+    startup
+    only windows
+    help The folder that holds AMD's FidelityFX API runtime, which the user downloads from AMD and which is not part of
+    help ScarletNX: amd_fidelityfx_loader_vk.dll and amd_fidelityfx_upscaler_vk.dll from AMD's FidelityFX SDK 2.4
+    help (docs/user/ffx.md). Empty = no FSR 3.1 or 4. With it, render_upscaler 0 (Best) or 5 runs FSR 3.1 or 4 on an
+    help AMD GPU whose driver has them. Elsewhere, or where the files are missing or not signed by AMD, the next
+    help upscaler stands in
 setting Shadows
     key shadows
     int 0 1

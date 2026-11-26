@@ -209,13 +209,15 @@ target_link_libraries(snx_fsr2 PUBLIC snx_vk_common)
 # ones with AMD's FSR 1 header from FSR 2's package, patched (.patch/fidelityfx-fsr2/0002-fsr1-easu-glsl.patch). Like
 # snx_fsr2 it knows no renderer, so tests/vk_upscaler.c links it alone
 add_library(snx_upscaler STATIC gpu/vk/upscaler/upscaler.c gpu/vk/upscaler/passes.c gpu/vk/upscaler/reproject.c
-                          gpu/vk/upscaler/dlss.cpp)
+                          gpu/vk/upscaler/dlss.cpp gpu/vk/upscaler/ffx.cpp)
 target_link_libraries(snx_upscaler PUBLIC snx_fsr2 snx_vk_common)
-# DLSS through NVIDIA Streamline (gpu/vk/upscaler/dlss.cpp) in a Windows build: Streamline's headers only, its loader
-# taken from the user's folder at run time. Windows' own libraries check NVIDIA's signature
+# DLSS through NVIDIA Streamline (gpu/vk/upscaler/dlss.cpp) and FSR 3.1 or 4 through AMD's FidelityFX API
+# (gpu/vk/upscaler/ffx.cpp) in a Windows build: their MIT headers only, their runtimes taken from the user's folders at
+# run time. Windows' own libraries check the signature of each
 if(WIN32)
-    target_include_directories(snx_upscaler SYSTEM PRIVATE "${snx_streamline_include}")
-    target_compile_definitions(snx_upscaler PRIVATE SNX_STREAMLINE)
+    target_include_directories(snx_upscaler SYSTEM PRIVATE "${snx_streamline_include}" "${snx_ffx_include}/api/include"
+                               "${snx_ffx_include}/upscalers/include")
+    target_compile_definitions(snx_upscaler PRIVATE SNX_STREAMLINE SNX_FFX)
     target_link_libraries(snx_upscaler PRIVATE wintrust crypt32)
 endif()
 foreach(snx_pass copy easu rcas)
