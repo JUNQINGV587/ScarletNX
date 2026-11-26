@@ -88,6 +88,7 @@ scripts/frostpunk-assets.py list    <dat> --name ui/tiles    # offsets, payload 
 scripts/frostpunk-assets.py extract <dat> <name|id> --out f  # payload bytes
 scripts/frostpunk-assets.py replace <dat> <name|id> <payload> --out DIR
 scripts/frostpunk-assets.py digest  <dat> --out f.json       # per-resource payload hash
+scripts/frostpunk-assets.py roundtrip <dat> --out DIR        # rewrite and compare every payload
 scripts/frostpunk-assets.py verify  <dat>                    # every block reads back
 ```
 
@@ -95,6 +96,38 @@ scripts/frostpunk-assets.py verify  <dat>                    # every block reads
 given. A malformed `.idx` (a record that runs past the end of the `.dat`, two
 records overlapping, a size that does not multiply out) is reported with the id
 of the record at fault.
+
+## Round-trip differences
+
+`roundtrip` is the self-consistency check: it reads every payload, writes the
+set to a new directory, reads that set back and compares the id set, the names,
+the payload size and the sha256 of every payload. A difference is printed with
+the resource id and the command exits 1; a corrupt block is reported the same
+way and nothing is written. A clean run prints
+`roundtrip ok: <n> records, every payload hash matches`.
+
+These differences are **allowed**, and none of them changes a resource:
+
+* unowned spans between blocks are dropped, so `.dat` gets shorter and every
+  offset after a dropped span moves;
+* the `.idx` offset field (+20) is recomputed for every record, and the stored
+  size (+4) only when a payload is replaced and recompressed;
+* a replaced payload is recompressed, so its stored bytes and stored size, and
+  the zstd frame boundaries, differ from the original;
+* the `.idx` header, the bytes at +8, +16 and +24 (zero), and the flag byte are
+  copied through, and `.str`, when the set has one, is copied byte for byte.
+
+These differences are **not allowed**; any one of them is a failed round-trip:
+
+* the set of resource ids, the record count, or a name;
+* the decompressed payload bytes of any resource (compared by sha256), which
+  includes a texture's width/height/format header;
+* the decompressed payload size of any resource (`.idx` +12), so the size the
+  game sees stays the same.
+
+The `frostpunk_roundtrip` ctest entry builds a synthetic container in a
+temporary directory and runs this check, so it needs no game data. Running it
+against the real package is the same command with that package's `.dat`.
 
 ## What was proven
 

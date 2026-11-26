@@ -333,6 +333,96 @@ def cmd_replace(args):
     return 0
 
 
+def cmd_roundtrip(args):
+    """Read every payload, rewrite the set, read it back and compare hashes.
+
+    A round-trip may legitimately change where a block sits (unowned spans are
+    dropped, the offsets are recomputed) and, for a replaced resource, how the
+    block is compressed.  It may not change which ids and names exist, nor the
+    payload bytes or payload size of any resource.  Any such change is reported
+    with the resource id and exits 1.
+    """
+    ds = DatSet(args.dat)
+    source = {}
+    bad = 0
+    for rec in ds.records:
+        label = "%08x" % rec.rid
+        try:
+            payload = ds.read_payload(rec)
+        except ContainerError as err:
+            print("FAIL %s: %s" % (label, err))
+            bad += 1
+            continue
+        source[rec.rid] = (rec.name, len(payload),
+                           hashlib.sha256(payload).hexdigest())
+    if bad:
+        print("%d of %d records do not read back; nothing written"
+              % (bad, len(ds.records)))
+        return 1
+
+    out_dat, _ = ds.write(args.out)
+    try:
+        again = DatSet(out_dat)
+    except ContainerError as err:
+        print("FAIL rewritten set: %s" % err)
+        return 1
+    reread = {}
+    for rec in again.records:
+        label = "%08x" % rec.rid
+        try:
+            payload = again.read_payload(rec)
+        except ContainerError as err:
+            print("FAIL %s: rewritten set: %s" % (label, err))
+            bad += 1
+            continue
+        reread[rec.rid] = (rec.name, len(payload),
+                           hashlib.sha256(payload).hexdigest())
+
+    for rid in sorted(set(source) | set(reread)):
+        label = "%08x" % rid
+        if rid not in reread:
+            print("FAIL %s: missing from the rewritten set" % label)
+            bad += 1
+            continue
+        if rid not in source:
+            print("FAIL %s: not in the original set" % label)
+            bad += 1
+            continue
+        src_name, src_size, src_hash = source[rid]
+        dst_name, dst_size, dst_hash = reread[rid]
+        if src_name != dst_name:
+            print("FAIL %s: name %r became %r"
+                  % (label, src_name, dst_name))
+            bad += 1
+        if src_size != dst_size:
+            print("FAIL %s: payload %d bytes became %d"
+                  % (label, src_size, dst_size))
+            bad += 1
+        elif src_hash != dst_hash:
+            print("FAIL %s: payload bytes changed (sha256 %s -> %s)"
+                  % (label, src_hash, dst_hash))
+            bad += 1
+
+    if bad:
+        print("%d difference(s) across %d records"
+              % (bad, len(source)))
+        return 1
+
+    src_size = os.path.getsize(ds.dat_path)
+    dst_size = os.path.getsize(out_dat)
+    moved = sum(1 for rec in ds.records
+                if rec.offset != again.by_id(rec.rid).offset)
+    resized = sum(1 for rec in ds.records
+                  if rec.stored != again.by_id(rec.rid).stored)
+    print("roundtrip ok: %d records, every payload hash matches" % len(source))
+    print("  dat %d -> %d bytes (%d unowned spans, %d bytes dropped)"
+          % (src_size, dst_size, len(ds.gaps),
+             sum(length for _, length in ds.gaps)))
+    print("  %d offsets moved, %d stored sizes changed"
+          % (moved, resized))
+    return 0
+
+
 def cmd_verify(args):
     ds = DatSet(args.dat)
     bad = 0
@@ -396,6 +486,12 @@ def main(argv=None):
     p.add_argument("--out", required=True)
     p.add_argument("--allow-size-change", action="store_true")
     p.set_defaults(func=cmd_replace)
+
+    p = sub.add_parser("roundtrip",
+                       help="rewrite the set and compare every payload hash")
+    p.add_argument("dat")
+    p.add_argument("--out", required=True)
+    p.set_defaults(func=cmd_roundtrip)
 
     p = sub.add_parser("verify", help="read every block back")
     p.add_argument("dat")
