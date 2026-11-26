@@ -105,3 +105,8 @@ headers) and repacking moved the game's generator panel to the other atlas's
 artwork. The run stayed at 53.4 fps with no shader refused, the other 4236
 resources were untouched byte for byte, and putting the original container back
 restored the panel.
+
+Two runs of the same 300 s script, one on the repacked set and one on the
+original, differ over 36.6% of the panel's pixels, over 1.7% of the rest of the
+frame (snowfall and animation) and over 0.0% of the quest panel in the bottom
+left.
