@@ -75,6 +75,9 @@ typedef struct {
         u32 variable, block, value, part[4];
     } input_seen[64];
     u32 scale_buffer, scale_pointer;
+    /* the global buffer slots' bases, when a slot is a window of a pointer table (SH_GBUF_TABLE): the renderer
+       puts each window's actual base and length here (SNX_VKB_MBASE / SNX_VKB_MBASEFS) */
+    u32 mbase, mbase_pointer;
     u32 sampler[SH_MAXTEX], sampled_type[SH_MAXTEX];
     u32 tex_index[SH_MAXTEX], tex_map_buffer, tex_map_pointer, active_index;
     u8 tex_table[SH_MAXTEX]; /* indexed texture slot to descriptor table */

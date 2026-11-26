@@ -227,16 +227,28 @@ void shader_global_dynamic(DirectCtx* c, int stage, u64 w, int op, const u32* gb
     for (int slot = 0; slot < ngbuf; slot++) {
         u32 then_label, merge_label, base_lo, base_hi, size, relative, borrow, inside;
         u32 bank = SH_GBUF_BANK(gbuf_off[slot]), at = SH_GBUF_OFFSET(gbuf_off[slot]);
-        base_lo = shader_cbuf_read_dynamic(c, bank, shader_u32(c, at));
-        base_hi = shader_cbuf_read_dynamic(c, bank, shader_u32(c, at + 4));
-        /* a bare address has no size beside it: the cap below, of which the renderer binds what is mapped */
-        if (shader_gbuf_sized(stage, gbuf_off[slot])) {
-            size = shader_cbuf_read_dynamic(c, 0, shader_u32(c, at + 8));
-            size = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->u32_type,
-                                    spv_emit_binary(&c->emit, SPV_OP_I_EQUAL, c->bool_type, size, c->zero),
-                                    shader_u32(c, 16), size);
-        } else
-            size = shader_u32(c, 16u << 20);
+        if (SH_GBUF_TABLE(gbuf_off[slot])) {
+            /* An indexed LDC's table has no single base: the renderer binds its pointers' mapped runs and puts each
+               window's actual base and length at this slot of SNX_VKB_MBASE. */
+            u32 element = shader_u32(c, (u32)slot);
+            base_lo = spv_emit_uniform_component(&c->emit, c->mbase_pointer, c->mbase, c->zero, element, c->zero,
+                                                 c->u32_type);
+            base_hi = spv_emit_uniform_component(&c->emit, c->mbase_pointer, c->mbase, c->zero, element, one,
+                                                 c->u32_type);
+            size = spv_emit_uniform_component(&c->emit, c->mbase_pointer, c->mbase, c->zero, element, shader_u32(c, 2),
+                                              c->u32_type);
+        } else {
+            base_lo = shader_cbuf_read_dynamic(c, bank, shader_u32(c, at));
+            base_hi = shader_cbuf_read_dynamic(c, bank, shader_u32(c, at + 4));
+            /* a bare address has no size beside it: the cap below, of which the renderer binds what is mapped */
+            if (shader_gbuf_sized(stage, gbuf_off[slot])) {
+                size = shader_cbuf_read_dynamic(c, 0, shader_u32(c, at + 8));
+                size = spv_emit_ternary(&c->emit, SPV_OP_SELECT, c->u32_type,
+                                        spv_emit_binary(&c->emit, SPV_OP_I_EQUAL, c->bool_type, size, c->zero),
+                                        shader_u32(c, 16), size);
+            } else
+                size = shader_u32(c, 16u << 20);
+        }
         size = spv_emit_ternary(
             &c->emit, SPV_OP_SELECT, c->u32_type,
             spv_emit_binary(&c->emit, SPV_OP_U_LESS_THAN, c->bool_type, shader_u32(c, 16u << 20), size),
