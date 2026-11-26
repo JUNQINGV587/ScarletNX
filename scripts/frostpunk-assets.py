@@ -43,6 +43,14 @@ IDX_MAGIC_SIZE = 11
 RECORD_SIZE = 29
 ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
 TEXTURE_MAGIC = b"\x65\x78\x1c\x00"
+TEXTURE_HEADER_SIZE = 28
+DESCRIPTOR_TAG = b"<TextureArrayDescriptor"
+TGA_FOOTER = b"TRUEVISION-XFILE"
+KINDS = ("texture", "descriptor", "tga", "unknown")
+
+
+def _u16(buf, off):
+    return struct.unpack_from("<H", buf, off)[0]
 
 
 def _u32(buf, off):
@@ -278,6 +286,31 @@ def load_str(path):
     return names
 
 
+def describe_payload(payload):
+    """The block kind and, for a texture, its declared width and height.
+
+    A kind is only reported when the bytes carry evidence for it:
+
+      texture     the 28-byte header the Switch build writes, magic `0x001c7865`
+                  at +0 and width/height as u16 at +12/+14;
+      descriptor  a Stingray XML `<TextureArrayDescriptor>` document, which
+                  starts with that root element;
+      tga         an uncompressed TGA, whose 26-byte footer carries the
+                  `TRUEVISION-XFILE` signature;
+      unknown     anything else.  A block whose header is not one of the three
+                  is not guessed at.
+
+    Only texture blocks declare a size here; the other kinds return `None`.
+    """
+    if len(payload) >= TEXTURE_HEADER_SIZE and payload[:4] == TEXTURE_MAGIC:
+        return "texture", _u16(payload, 12), _u16(payload, 14)
+    if payload.startswith(DESCRIPTOR_TAG):
+        return "descriptor", None, None
+    if TGA_FOOTER in payload[-32:]:
+        return "tga", None, None
+    return "unknown", None, None
+
+
 def cmd_info(args):
     ds = DatSet(args.dat)
     info = ds.describe()
@@ -301,6 +334,119 @@ def cmd_list(args):
         if args.limit and shown >= args.limit:
             break
     return 0
+
+
+def cmd_inventory(args):
+    """Every resource with its block kind, declared size, offset and payload.
+
+    The rows are filtered before a block is read, so a name or payload-size
+    filter does not pay for decompressing the whole package.
+    """
+    ds = DatSet(args.dat)
+    rows = []
+    for rec in ds.records:
+        if args.name and args.name not in (rec.name or ""):
+            continue
+        if args.prefix and not (rec.name or "").startswith(args.prefix):
+            continue
+        if rec.payload < args.min_payload:
+            continue
+        if args.max_payload is not None and rec.payload > args.max_payload:
+            continue
+        payload = ds.read_payload(rec)
+        kind, width, height = describe_payload(payload)
+        if args.kind and kind not in args.kind:
+            continue
+        if width is not None:
+            if args.min_width is not None and width < args.min_width:
+                continue
+            if args.max_width is not None and width > args.max_width:
+                continue
+            if args.min_height is not None and height < args.min_height:
+                continue
+            if args.max_height is not None and height > args.max_height:
+                continue
+        elif (args.min_width is not None or args.max_width is not None or
+              args.min_height is not None or args.max_height is not None):
+            continue
+        rows.append({
+            "id": rec.rid,
+            "id_hex": "0x%08x" % rec.rid,
+            "name": rec.name,
+            "kind": kind,
+            "width": width,
+            "height": height,
+            "offset": rec.offset,
+            "payload": rec.payload,
+            "stored": rec.stored,
+        })
+
+    keys = {
+        "offset": lambda r: r["offset"],
+        "id": lambda r: r["id"],
+        "name": lambda r: r["name"] or "",
+        "size": lambda r: r["payload"],
+        "stored": lambda r: r["stored"],
+    }
+    rows.sort(key=keys[args.sort], reverse=args.reverse)
+
+    matched = len(rows)
+    if args.limit:
+        rows = rows[:args.limit]
+    text = render_inventory(rows, args.format)
+
+    if args.out:
+        with open(args.out, "w") as fh:
+            fh.write(text)
+        print("wrote %s (%d rows)" % (args.out, len(rows)))
+    else:
+        sys.stdout.write(text)
+
+    named = sum(1 for r in rows if r["name"] is not None)
+    unnamed = len(rows) - named
+    counts = {}
+    for row in rows:
+        counts[row["kind"]] = counts.get(row["kind"], 0) + 1
+    kinds = ", ".join("%s=%d" % (k, counts[k]) for k in sorted(counts)) \
+        or "none"
+    dims = sum(1 for r in rows if r["width"] is not None)
+    print("inventory: %d rows (%d named, %d unnamed); kinds %s; "
+          "%d with width/height" % (len(rows), named, unnamed, kinds, dims),
+          file=sys.stderr)
+    if args.limit and matched > len(rows):
+        print("inventory: showing %d of %d matching rows"
+              % (len(rows), matched), file=sys.stderr)
+    return 0
+
+
+def render_inventory(rows, fmt):
+    if fmt == "json":
+        return json.dumps(rows, indent=1) + "\n"
+    if fmt == "tsv":
+        lines = ["id\tname\tkind\twidth\theight\toffset\tpayload\tstored"]
+        for row in rows:
+            lines.append("\t".join([
+                row["id_hex"],
+                row["name"] if row["name"] is not None else "",
+                row["kind"],
+                "" if row["width"] is None else str(row["width"]),
+                "" if row["height"] is None else str(row["height"]),
+                str(row["offset"]),
+                str(row["payload"]),
+                str(row["stored"]),
+            ]))
+        return "\n".join(lines) + "\n"
+    lines = ["%-10s %-10s %5s %5s %12s %10s %9s  %s"
+             % ("id", "kind", "width", "height", "offset", "payload",
+                "stored", "name")]
+    for row in rows:
+        lines.append("%-10s %-10s %5s %5s %12d %10d %9d  %s"
+                     % (row["id_hex"], row["kind"],
+                        "-" if row["width"] is None else row["width"],
+                        "-" if row["height"] is None else row["height"],
+                        row["offset"], row["payload"], row["stored"],
+                        row["name"] if row["name"] is not None else "-"))
+    return "\n".join(lines) + "\n"
 
 
 def cmd_extract(args):
@@ -472,6 +618,33 @@ def main(argv=None):
     p.add_argument("--min-payload", type=int, default=0)
     p.add_argument("--limit", type=int, default=0)
     p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser(
+        "inventory",
+        help="list every resource with its block kind, size and name")
+    p.add_argument("dat")
+    p.add_argument("--name", help="only names containing this text")
+    p.add_argument("--prefix", help="only names starting with this text")
+    p.add_argument("--kind", action="append", choices=KINDS,
+                   help="only this block kind (repeatable)")
+    p.add_argument("--min-width", type=int)
+    p.add_argument("--max-width", type=int)
+    p.add_argument("--min-height", type=int)
+    p.add_argument("--max-height", type=int)
+    p.add_argument("--min-payload", type=int, default=0,
+                   help="smallest payload in bytes")
+    p.add_argument("--max-payload", type=int,
+                   help="largest payload in bytes")
+    p.add_argument("--sort", choices=("offset", "id", "name", "size",
+                                      "stored"),
+                   default="offset", help="size sorts by payload bytes")
+    p.add_argument("--reverse", action="store_true",
+                   help="sort largest/last first")
+    p.add_argument("--format", choices=("table", "json", "tsv"),
+                   default="table")
+    p.add_argument("--out", help="write the listing here instead of stdout")
+    p.add_argument("--limit", type=int, default=0)
+    p.set_defaults(func=cmd_inventory)
 
     p = sub.add_parser("extract", help="write one resource's payload")
     p.add_argument("dat")
