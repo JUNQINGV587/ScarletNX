@@ -194,6 +194,7 @@ int vk_tex_can_coarsen(const Surf* t) { stub_hit("vk_tex_can_coarsen"); }
 u64 vk_tex_coarser(Surf* t) { stub_hit("vk_tex_coarser"); }
 u64 vk_tex_demote(Surf* t) { stub_hit("vk_tex_demote"); }
 u32 vk_mem_owner_prio(u32 owner) { stub_hit("vk_mem_owner_prio"); }
+void vk_pool_map_swapped(const Surf* t) { (void)t; } /* no image or view here: a move changes none */
 static u32 g_tex_evictions; /* textures the cache let go (tex_superseded_takes) */
 void vk_tex_evicted(const Surf* t) { g_tex_evictions++; }
 int vk_tex_image_own(Surf* s, VkImage* img, DevMem* mem, u64* bytes) {
