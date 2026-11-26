@@ -63,7 +63,19 @@ true
 # launcher's arguments. Chinese (Simplified) is language=15.
 ini=$appdir/$id.ini
 [ -f "$ini" ] || printf '[Game]\n' >"$ini"
-pins='language=15
+# The 3D resolution multiplier (SNX_PORT_RESOLUTION=1.5 renders 1080p out of a 720p game, as
+# Frostpunk's does) and the picture keys that cost nothing on a GPU with room to spare
+# (SNX_PORT_ANISOTROPY=16, SNX_PORT_ANTI_ALIASING=smaa, SNX_PORT_UPSCALER=fsr1).
+resolution=${SNX_PORT_RESOLUTION:-1}
+quality_args=""
+quality_pins=""
+[ -n "${SNX_PORT_ANISOTROPY:-}" ] && { quality_args="$quality_args --anisotropy=$SNX_PORT_ANISOTROPY"; quality_pins="$quality_pins
+anisotropy=$SNX_PORT_ANISOTROPY"; }
+[ -n "${SNX_PORT_ANTI_ALIASING:-}" ] && { quality_args="$quality_args --anti_aliasing=$SNX_PORT_ANTI_ALIASING"; quality_pins="$quality_pins
+anti_aliasing=$SNX_PORT_ANTI_ALIASING"; }
+[ -n "${SNX_PORT_UPSCALER:-}" ] && { quality_args="$quality_args --upscaler=$SNX_PORT_UPSCALER"; quality_pins="$quality_pins
+upscaler=$SNX_PORT_UPSCALER"; }
+pins="language=15
 fullscreen=1
 gamepad_face_labels=1
 gamepad_assign=0
@@ -71,9 +83,9 @@ extract=1
 emulated_cores=0
 touch_in_tv=1
 docked=1
-resolution=1
+resolution=$resolution
 screen_fit=0
-fps_limit=240'
+fps_limit=240$quality_pins"
 # A virtual pad that repeats the handheld's own (InputPlumber's, Steam Input's) connects first, and takes player 1
 # from it: name the pad player 1 has, as the log names its GUID (SNX_PORT_PAD=0300d628b00d00000119000014030000).
 [ -n "${SNX_PORT_PAD:-}" ] && pins="$pins
@@ -96,7 +108,7 @@ cat > "$appdir/play-$slug.sh" <<EOF
 set -euo pipefail
 HERE="\$(cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")" && pwd)"
 export LD_LIBRARY_PATH="\$HERE/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-exec "\$HERE/$id" --extract-container --fullscreen=1 --resolution=1 --docked=1 --fps-limit=240 --gamepad-face-labels=1 --screen-fit=0 --emulated-cores=0 --touch-in-tv=1 "\$@"
+exec "\$HERE/$id" --extract-container --fullscreen=1 --resolution=$resolution --docked=1 --fps-limit=240 --gamepad-face-labels=1 --screen-fit=0 --emulated-cores=0 --touch-in-tv=1$quality_args "\$@"
 EOF
 chmod +x "$appdir/play-$slug.sh"
 
