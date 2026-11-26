@@ -11,6 +11,18 @@ Everything below was measured on the Switch package
 and cross-checked against the PC package (`textures-s3.*`, 4178 resources,
 6.8 GB). `scripts/frostpunk-assets.py` reads and writes these files.
 
+## Index
+
+* [`.idx`](#idx)
+* [`.dat`](#dat)
+* [`.str`](#str)
+* [Texture payloads](#texture-payloads)
+* [Taking stock of a package](#taking-stock-of-a-package)
+  * [Block kinds and their evidence](#block-kinds-and-their-evidence)
+* [Replacing one resource](#replacing-one-resource)
+* [Round-trip differences](#round-trip-differences)
+* [What was proven](#what-was-proven)
+
 ## `.idx`
 
 An 11-byte header, then one fixed **29-byte record** per resource:
@@ -80,11 +92,66 @@ Not every payload is a texture: 62 are Stingray XML `<TextureArrayDescriptor>`
 documents naming the original PC `.dds` files, and 4 are plain 32-bit TGA
 (cursors) ending in a `TRUEVISION-XFILE` footer.
 
+## Taking stock of a package
+
+`inventory` lists every record in one pass: resource id, name, block kind,
+declared width and height, offset in the `.dat`, and payload and stored sizes.
+It is the way to go from "that blurry thing on screen" to "this texture in the
+package" without reading the tool's source:
+
+```
+scripts/frostpunk-assets.py inventory <dat>                          # all rows
+scripts/frostpunk-assets.py inventory <dat> --name vignette          # substring
+scripts/frostpunk-assets.py inventory <dat> --prefix ui/menu/        # prefix
+scripts/frostpunk-assets.py inventory <dat> --min-width 1024 --kind texture
+scripts/frostpunk-assets.py inventory <dat> --max-payload 5000       # small blocks
+scripts/frostpunk-assets.py inventory <dat> --sort size --reverse --limit 20
+scripts/frostpunk-assets.py inventory <dat> --format json --out rows.json
+scripts/frostpunk-assets.py inventory <dat> --format tsv --out rows.tsv
+```
+
+Filters combine; a record must pass all of them. `--sort` takes `offset`
+(default), `id`, `name`, `size` (payload bytes) and `stored`; `--reverse` turns
+it around, so `--sort size --reverse` is the list of resources worth upgrading
+first. Name and payload-size filters are applied before a block is read, so a
+query does not pay for decompressing the rest of the package.
+
+### Block kinds and their evidence
+
+`kind` is decided from the payload bytes alone, in this order:
+
+| kind | evidence |
+| --- | --- |
+| `texture` | the 28-byte Switch texture header: magic `0x001c7865` at +0, width and height as u16 at +12/+14 |
+| `descriptor` | a Stingray XML document that begins with `<TextureArrayDescriptor` |
+| `tga` | an uncompressed TGA, whose 26-byte footer carries `TRUEVISION-XFILE` (checked in the last 32 bytes) |
+| `unknown` | none of the above. A block with any other header is not guessed at |
+
+Width and height are printed only for `texture` blocks; every other kind prints
+`-` (`null` in JSON, an empty field in TSV). A record with no `.str` entry is
+reported as unnamed (`-`, empty, `null`); no name is ever made up.
+
+On the Switch package the command prints 4238 rows — 4172 `texture`, 62
+`descriptor`, 4 `tga`, 0 `unknown` — 4238 of them named and 4172 with a width
+and height. The one-line summary after the rows states those counts:
+
+```
+inventory: 4238 rows (4238 named, 0 unnamed); kinds descriptor=62, texture=4172, tga=4; 4172 with width/height
+```
+
+`--out` writes the listing to a file and prints `wrote <path> (<n> rows)`
+instead of the rows; `--format json` writes a list of objects with `id`,
+`id_hex`, `name` (null when unnamed), `kind`, `width`/`height` (null when the
+kind declares none), `offset`, `payload` and `stored`; `--format tsv` writes a
+header line and one tab-separated row per resource, with empty fields where
+JSON has null.
+
 ## Replacing one resource
 
 ```
 scripts/frostpunk-assets.py info    <dat>                    # record, name, gap counts
 scripts/frostpunk-assets.py list    <dat> --name ui/tiles    # offsets, payload sizes
+scripts/frostpunk-assets.py inventory <dat> --name ui/tiles  # + kind, size, export
 scripts/frostpunk-assets.py extract <dat> <name|id> --out f  # payload bytes
 scripts/frostpunk-assets.py replace <dat> <name|id> <payload> --out DIR
 scripts/frostpunk-assets.py digest  <dat> --out f.json       # per-resource payload hash

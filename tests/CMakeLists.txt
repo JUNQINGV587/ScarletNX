@@ -2938,6 +2938,11 @@ if(Python3_Interpreter_FOUND)
     # payload hash compared; a deliberately corrupt block is reported by its resource id (scripts/frostpunk-assets.py)
     add_test(NAME frostpunk_roundtrip
              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_roundtrip_test.py")
+    # every resource in a Frostpunk container with its block kind, declared size, offset and payload, and the
+    # filters, size sort and JSON/TSV export that trace what is on screen back to a texture in the package
+    # (scripts/frostpunk-assets.py)
+    add_test(NAME frostpunk_inventory
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_inventory_test.py")
     # which GitHub Actions caches the cleanup workflow deletes (scripts/trim-caches.py)
     add_test(NAME trim_caches COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/trim_caches_test.py")
     # build.yml's LLVM builds, each saved by the step right after it: a later failure or a cancelled run keeps it;
