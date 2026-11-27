@@ -277,13 +277,13 @@ int vk_present_quad_effects(VkCommandBuffer cb, SnxPresentSource* s, VkRect2D* c
     int aa = atomic_load_explicit(&g_present_quad.aa, memory_order_relaxed);
     SNX_ZONE_TEXT(z_fx, "upscaler %d, aa %d", filter, aa);
     int sharpness = atomic_load_explicit((_Atomic int*)&g_settings.upscaler_sharpness, memory_order_relaxed);
-    int sharpen = atomic_load_explicit((_Atomic int*)&g_settings.sharpen_at_1_1, memory_order_relaxed);
-    /* sharpen's own pass is asked and has a strength: a frame at its own size is then not the window's blit */
+    int sharpen = atomic_load_explicit((_Atomic int*)&g_settings.sharpen, memory_order_relaxed);
+    /* sharpen's own pass is asked and has a strength: the frame is then not the window's blit */
     int sharp_on = sharpen && sharpness > 0;
     u32 w = transform & 4 ? to.extent.height : to.extent.width, h = transform & 4 ? to.extent.width : to.extent.height;
     SnxFxImage out;
     /* Bilinear is the quad's own sampler: with anti-aliasing Off, it and Off record no pass (snx_fx_render), so they
-       neither make the effects nor drain the recording ring; sharpen at 1:1 does record one */
+       neither make the effects nor drain the recording ring; sharpen does record one */
     if ((((filter == SNX_FX_UPSCALE_OFF || filter == SNX_FX_UPSCALE_BILINEAR) && aa == SNX_FX_AA_OFF) && !sharp_on) ||
         g_present_quad.fx_failed || !w || !h)
         return 0;

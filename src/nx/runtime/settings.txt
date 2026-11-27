@@ -437,20 +437,20 @@ setting Upscaler sharpness
     words #%
     step 5
     slider
-    help How sharp AMD FSR 1, NVIDIA NIS and Qualcomm SGSR draw the frame's edges, and sharpen's RCAS where the frame
-    help is shown at its own size: 0 the softest, 100 the sharpest
-setting Sharpen at 1:1
+    help How sharp AMD FSR 1, NVIDIA NIS and Qualcomm SGSR draw the frame's edges, and sharpen's RCAS: 0 the softest,
+    help 100 the sharpest
+setting Sharpen
     key sharpen
     int 0 1
     default 0
     words Off|On
-    help 1 = where the window shows the frame at its own size (a Switch game's 1:1), AMD FSR 1's RCAS runs over it at
-    help Upscaler sharpness's strength before the interface is drawn over it; 0 = no such pass. A frame the upscaler
-    help grows is sharpened by the upscaler after growing instead, a frame shown at another size by the game's dynamic
-    help resolution is left as it is (the log says so once), and a game's HDR frames are shown without it. On an sRGB
-    help window the pass reads the frame in linear light, as FSR 1's own RCAS does, so it is subtler there: 85 to 100
-    help of Upscaler sharpness is where it shows. A change while it runs (the game's menu) takes effect at the next
-    help frame
+    help 1 = AMD FSR 1's RCAS runs over the frame, at Upscaler sharpness's strength, before the interface is drawn over
+    help it; 0 = no such pass. A frame drawn smaller or larger than the window's part it fills is first sampled to that
+    help part's size, then sharpened at that size. With AMD FSR 1, NVIDIA NIS or Qualcomm SGSR doing the resample, that
+    help upscaler already sharpens the frame at the same strength, so no second pass runs. A game's HDR frames are shown
+    help without it. On an sRGB window the pass reads the frame in linear light, as FSR 1's own RCAS does, so it is
+    help subtler there: 85 to 100 of Upscaler sharpness is where it shows. A change while it runs (the game's menu)
+    help takes effect at the next frame
 setting Anti-aliasing
     key anti_aliasing
     text 8
