@@ -437,7 +437,18 @@ setting Upscaler sharpness
     words #%
     step 5
     slider
-    help How sharp AMD FSR 1, NVIDIA NIS and Qualcomm SGSR draw the frame's edges: 0 the softest, 100 the sharpest
+    help How sharp AMD FSR 1, NVIDIA NIS and Qualcomm SGSR draw the frame's edges, and sharpen's RCAS where the frame
+    help is shown at its own size: 0 the softest, 100 the sharpest
+setting Sharpen at 1:1
+    key sharpen
+    int 0 1
+    default 0
+    words Off|On
+    help 1 = where the window shows the frame at its own size (a Switch game's 1:1), AMD FSR 1's RCAS runs over it at
+    help Upscaler sharpness's strength before the interface is drawn over it; 0 = no such pass. A frame the upscaler
+    help grows is sharpened by the upscaler after growing instead, a frame shown at another size by the game's dynamic
+    help resolution is left as it is (the log says so once), and a game's HDR frames are shown without it. A change
+    help while it runs (the game's menu) takes effect at the next frame
 setting Anti-aliasing
     key anti_aliasing
     text 8

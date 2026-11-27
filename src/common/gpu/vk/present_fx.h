@@ -75,6 +75,12 @@ SnxFx* snx_fx_create(VkPhysicalDevice phys, VkDevice dev, VkPipelineCache cache,
 void snx_fx_destroy(SnxFx* fx);
 /* the upscalers' sharpness, upscaler_sharpness's 0 (the softest) to 100 (the sharpest), clamped */
 void snx_fx_set_sharpness(SnxFx* fx, int sharpness);
+/* whether a frame shown at its own size (1:1) is sharpened by FSR 1's RCAS, at snx_fx_set_sharpness's strength, as
+   sharpen's 1 asks: 0, no such pass, until set. The filter asked does not matter: at its own size no upscaler grows the
+   frame, so the pass runs over it as it is, and the anti-aliasing, where on, smooths the sharpened frame after it. A
+   frame shown at another size is left to the upscaler, whose own RCAS sharpens it after growing it; a strength of 0 runs
+   no pass; the log says which */
+void snx_fx_set_sharpen(SnxFx* fx, int sharpen);
 /* the device's shaderFloat16, for FSR 1's fp16 passes where it runs */
 void snx_fx_set_fp16(SnxFx* fx, int on);
 /* whether the frames snx_fx_render is given hold linear light (read through an sRGB view): FXAA then judges an edge
@@ -93,10 +99,11 @@ int snx_fx_aa_auto(uint32_t render_w, uint32_t render_h, uint32_t shown_w, uint3
    With the upscaler Off and anti-aliasing on, the crop is scaled as snx_fx_set_off_sharp says, then smoothed.
    What runs: an upscaler where the crop grows, the bilinear copy where it does not; NIS where it grows twice at most,
    else FSR 1; Auto as snx_fx_aa_auto says; SSAA where the device holds the image 2 or 4 times as large, else the
-   step under it. The log says what runs and why it is not what was asked, once each time that changes. slot is the
-   frame slot cb records (modulo slots), whose last frame the GPU is done with: its images are this frame's. src is in
-   src_layout, ready to be sampled (SHADER_READ_ONLY_OPTIMAL, or GENERAL where the caller keeps its images there).
-   transform is vi's flip: bit 0 mirrors x, bit 1 mirrors y. The output is left in
+   step under it. With snx_fx_set_sharpen on a frame shown at its own size, FSR 1's RCAS alone runs over it, at the
+   sharpness, instead of the copy. The log says what runs and why it is not what was asked, once each time that
+   changes. slot is the frame slot cb records (modulo slots), whose last frame the GPU is done with: its images are this
+   frame's. src is in src_layout, ready to be sampled (SHADER_READ_ONLY_OPTIMAL, or GENERAL where the caller keeps its
+   images there). transform is vi's flip: bit 0 mirrors x, bit 1 mirrors y. The output is left in
    TRANSFER_SRC_OPTIMAL. */
 int snx_fx_render(SnxFx* fx, VkCommandBuffer cb, uint32_t slot, VkImageView src, VkImageLayout src_layout,
                   uint32_t img_w, uint32_t img_h, uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t transform,

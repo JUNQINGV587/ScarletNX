@@ -21,7 +21,13 @@ interface, `src/nx/gpu/vk/upscaler/upscaler.h`. Its caller gives a picture at a 
 it is told so and runs its own fallback.
 
 The presented frame's effects (FXAA, the present-time upscalers of the window) are another thing: they scale the
-frame the game finished, after everything here.
+frame the game finished, after everything here. They run from one module every Vulkan frontend shares,
+`src/common/gpu/vk/present_fx.c`: the window asks `snx_fx_render` for an image of the shown size (the Switch's
+presenter, `src/nx/gpu/vk/present_quad.c`, calls it for each frame right after the game's own rendering and before the
+interface is drawn over it), or `snx_fx_prepare` and `snx_fx_draw` for the last pass drawn into a rendering of its own
+(the 3DS's and the Vita's). `pick` chooses what runs there: at 1:1 (the shown size is the frame's) FSR 1, NIS and SGSR
+are not run, there being nothing to grow; with `sharpen=1`, FSR 1's RCAS alone then runs over the frame at its own
+size, at `upscaler_sharpness`'s strength, which is the one post process here that does something at 1:1.
 
 ## Who calls it
 
