@@ -65,7 +65,8 @@ ini=$appdir/$id.ini
 [ -f "$ini" ] || printf '[Game]\n' >"$ini"
 # The 3D resolution multiplier (SNX_PORT_RESOLUTION=1.5 renders 1080p out of a 720p game, as
 # Frostpunk's does) and the picture keys that cost nothing on a GPU with room to spare
-# (SNX_PORT_ANISOTROPY=16, SNX_PORT_ANTI_ALIASING=smaa, SNX_PORT_UPSCALER=fsr1).
+# (SNX_PORT_ANISOTROPY=16, SNX_PORT_ANTI_ALIASING=smaa, SNX_PORT_UPSCALER=fsr1,
+# SNX_PORT_SHARPEN=1 with SNX_PORT_SHARPNESS=90 sharpens the presented frame).
 resolution=${SNX_PORT_RESOLUTION:-1}
 quality_args=""
 quality_pins=""
@@ -75,6 +76,10 @@ anisotropy=$SNX_PORT_ANISOTROPY"; }
 anti_aliasing=$SNX_PORT_ANTI_ALIASING"; }
 [ -n "${SNX_PORT_UPSCALER:-}" ] && { quality_args="$quality_args --upscaler=$SNX_PORT_UPSCALER"; quality_pins="$quality_pins
 upscaler=$SNX_PORT_UPSCALER"; }
+[ -n "${SNX_PORT_SHARPEN:-}" ] && { quality_args="$quality_args --sharpen=$SNX_PORT_SHARPEN"; quality_pins="$quality_pins
+sharpen=$SNX_PORT_SHARPEN"; }
+[ -n "${SNX_PORT_SHARPNESS:-}" ] && { quality_args="$quality_args --upscaler_sharpness=$SNX_PORT_SHARPNESS"; quality_pins="$quality_pins
+upscaler_sharpness=$SNX_PORT_SHARPNESS"; }
 pins="language=15
 fullscreen=1
 gamepad_face_labels=1
