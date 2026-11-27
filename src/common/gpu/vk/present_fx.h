@@ -82,6 +82,10 @@ void snx_fx_set_sharpness(SnxFx* fx, int sharpness);
    anti-aliasing, where on, smooths the sharpened frame after it, and SSAA supersamples instead. A strength of 0 runs no
    pass; the log says which */
 void snx_fx_set_sharpen(SnxFx* fx, int sharpen);
+/* SNX_PRESENT_DEBUG=1 in the environment asks the present's path through this module and the frontends' present to be
+   said in the log: each frame's source and shown sizes, what runs, and why nothing does. Read once; nothing else
+   changes with it, so a log taken with it set is of the same run as one without */
+int snx_fx_present_debug(void);
 /* the device's shaderFloat16, for FSR 1's fp16 passes where it runs */
 void snx_fx_set_fp16(SnxFx* fx, int on);
 /* whether the frames snx_fx_render is given hold linear light (read through an sRGB view): FXAA then judges an edge

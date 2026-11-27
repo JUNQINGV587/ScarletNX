@@ -17,6 +17,7 @@
 #include "nx/gpu/vk/ledger.h"
 #include "nx/gpu/vk/descriptors.h"
 #include "nx/gpu/vk/present_quad.h"
+#include "common/gpu/vk/present_fx.h"
 #include "nx/gpu/vk/ui_spv.h"
 #include "common/utilities/endian.h"
 #include "common/utilities/font.h"
@@ -775,6 +776,11 @@ void vk_ui_present(VkCommandBuffer cb, VkImage sc, Surf* src, VkRect2D crop, VkR
                    const int safe[4]) {
     SnxPresentSource from;
     int n = ui_prepare(cb, safe), framed = src && vk_present_quad_source(cb, src, 1, !g_vk.sc_srgb, &from);
+    if (snx_fx_present_debug()) /* SNX_PRESENT_DEBUG=1: which of this pass's two ways the frame takes */
+        LOG_LIMIT(8, "present: window pass, %s: frame %ux%u at %d,%d %ux%u drawn at %d,%d %ux%u\n",
+                  framed ? "the present quad draws it" : "nothing to draw, the swapchain is cleared black",
+                  src ? src->sw : 0, src ? src->sh : 0, crop.offset.x, crop.offset.y, crop.extent.width,
+                  crop.extent.height, to.offset.x, to.offset.y, to.extent.width, to.extent.height);
     if (framed) vk_present_quad_effects(cb, &from, &crop, to, transform); /* the upscaler and the anti-aliasing */
     VkImageView view = sc_view(sc);
     /* the acquire's wait is at the colour output (renderer.c's submit): the image's first use */

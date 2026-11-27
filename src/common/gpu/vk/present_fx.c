@@ -761,6 +761,16 @@ void snx_fx_set_sharpen(SnxFx* fx, int sharpen) {
     if (fx) fx->sharpen = sharpen != 0;
 }
 
+/* read once: a log taken with SNX_PRESENT_DEBUG=1 says the present's path, and the run is the same one */
+int snx_fx_present_debug(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* said = getenv("SNX_PRESENT_DEBUG");
+        on = said && said[0] && strcmp(said, "0") != 0;
+    }
+    return on;
+}
+
 void snx_fx_set_fp16(SnxFx* fx, int on) {
     if (fx) fx->fp16 = on != 0;
 }
@@ -1220,6 +1230,40 @@ static int last_kind(const SnxFx* fx, int filter, int aa) {
     return filter == SNX_FX_UPSCALE_NIS ? LAST_NONE : LAST_COPY;
 }
 
+/* SNX_PRESENT_DEBUG=1: the name of the pass a frame ends in, for the line frame says */
+static const char* last_name(int kind) {
+    switch (kind) {
+    case LAST_COPY: return "a copy";
+    case LAST_RCAS: return "RCAS";
+    case LAST_RCAS16: return "RCAS in fp16";
+    case LAST_SGSR: return "SGSR";
+    case LAST_FXAA: return "FXAA";
+    case LAST_BLEND: return "SMAA's blend";
+    default: return "NIS's compute pass";
+    }
+}
+
+/* SNX_PRESENT_DEBUG=1: whether this frame's sizes are said, the first eight and each change of one, then every 300th
+   (a frame is presented sixty times a second, and the log is read after the run) */
+static int debug_frame(uint32_t img_w, uint32_t img_h, uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h) {
+    static struct {
+        uint32_t img_w, img_h, w, h, out_w, out_h;
+        unsigned frames;
+    } said;
+    unsigned n = said.frames++;
+    int changed = said.img_w != img_w || said.img_h != img_h || said.w != w || said.h != h || said.out_w != out_w ||
+                  said.out_h != out_h;
+    if (changed) {
+        said.img_w = img_w;
+        said.img_h = img_h;
+        said.w = w;
+        said.h = h;
+        said.out_w = out_w;
+        said.out_h = out_h;
+    }
+    return changed || n < 8 || n % 300 == 0;
+}
+
 /* an image of the effects made, or said once (the frame then shows as with both off) */
 static int fx_image(SnxFx* fx, FxImage* im, uint32_t w, uint32_t h, VkFormat fmt, VkImageUsageFlags usage) {
     char said[160];
@@ -1290,6 +1334,18 @@ static int frame(SnxFx* fx, VkCommandBuffer cb, uint32_t slot, VkImageView src, 
     kind = (sharp || scaled) && aa == SNX_FX_AA_OFF ? (fx->fp16 && fx->rcas16 ? LAST_RCAS16 : LAST_RCAS)
                                                     : last_kind(fx, filter, aa);
     if (window && !window_pipe(fx, kind == LAST_NONE ? LAST_COPY : kind, format, &entry)) goto plain;
+    if (snx_fx_present_debug() && debug_frame(img_w, img_h, w, h, out_w, out_h)) {
+        char said[256];
+        snprintf(said, sizeof said,
+                 "fx: %ux%u image, the frame %ux%u at %u,%u shown at %ux%u, upscaler %s and anti-aliasing %s: %s, the "
+                 "last pass %s",
+                 img_w, img_h, w, h, x, y, out_w, out_h, upscale_labels[filter], aa_labels[aa],
+                 sharp    ? "sharpen's RCAS over the frame at its own size"
+                 : scaled ? "the copy at the window's size, then sharpen's RCAS over it"
+                          : "no sharpen pass",
+                 last_name(kind));
+        fx_echo(fx, said);
+    }
     {
         /* the filter's pass is the last where no anti-aliasing follows it: at the caller's place then */
         int ends = aa == SNX_FX_AA_OFF;
@@ -1410,6 +1466,13 @@ static int frame(SnxFx* fx, VkCommandBuffer cb, uint32_t slot, VkImageView src, 
     }
     return 1;
 plain:
+    if (snx_fx_present_debug() && debug_frame(img_w, img_h, w, h, out_w, out_h)) {
+        char said[224];
+        snprintf(said, sizeof said,
+                 "fx: %ux%u image, the frame %ux%u at %u,%u shown at %ux%u: nothing runs, the window's plain copy",
+                 img_w, img_h, w, h, x, y, out_w, out_h);
+        fx_echo(fx, said);
+    }
     /* where neither runs, or the effects can't: the window samples the frame itself, as with both off (the upscaler
        Off in sharp pixels where the window keeps them), the crop in place */
     last->kind = LAST_NONE;

@@ -43,6 +43,7 @@
 #include "nx/memory/own.h"
 #include "nx/gpu/vk/pending_pages.h"
 #include "nx/gpu/vk/present_quad.h"
+#include "common/gpu/vk/present_fx.h"
 #include "nx/gpu/renderer.h"
 #include "nx/runtime/platform/tracy.h"
 
@@ -1562,6 +1563,17 @@ static void vkr_present_buffer(u64 cpu_addr, u32 w, u32 h, u32 pitch, u32 layout
         overlay_settings_start(plat_ns());
         ui_unlock();
     }
+    if (snx_fx_present_debug()) /* SNX_PRESENT_DEBUG=1: what the game presented, and what the window will be given */
+        LOG_LIMIT(8, "present: nvn frame %ux%u of a %s, part %u,%u %ux%u, %s\n", w, h,
+                  fmt == RENDERER_FORMAT_RGBA_1010102 || fmt == RENDERER_FORMAT_RGBA_FP16 ? "10-bit format" : "8-bit one",
+                  x0, y0, x1 - x0, y1 - y0,
+                  !src ? "no render target over it, shown black"
+                  : src->w == w && src->h == h
+                      ? "a render target of the same size"
+                      : "a render target of another size, scaled to it");
+    if (src && snx_fx_present_debug() && (src->w != w || src->h != h))
+        LOG_LIMIT(8, "present: its render target is %ux%u guest pixels, a %ux%u image\n", src->w, src->h, src->sw,
+                  src->sh);
     show(src, &hdr, x1 - x0, y1 - y0, transform, 1, released_ns, period_ns, shown_syncpt);
     atomic_store_explicit(&g_shown_ns, plat_ns(), memory_order_relaxed);
     vk_unlock();

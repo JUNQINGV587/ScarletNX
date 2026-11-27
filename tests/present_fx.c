@@ -58,9 +58,11 @@ static struct {
     } real;
 } g_test;
 
-/* the effects' log: printed, and the last line kept */
+/* the effects' log: printed, and the last line kept. SNX_PRESENT_DEBUG=1's lines say the frames' sizes, not what the
+   effects chose, and they come after the choice's own line: the choice is the one kept */
 static void log_line(const char* text) {
     puts(text);
+    if (!strncmp(text, "fx: ", 4)) return;
     snprintf(g_test.said, sizeof g_test.said, "%s", text);
 }
 
