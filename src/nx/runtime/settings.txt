@@ -447,8 +447,10 @@ setting Sharpen at 1:1
     help 1 = where the window shows the frame at its own size (a Switch game's 1:1), AMD FSR 1's RCAS runs over it at
     help Upscaler sharpness's strength before the interface is drawn over it; 0 = no such pass. A frame the upscaler
     help grows is sharpened by the upscaler after growing instead, a frame shown at another size by the game's dynamic
-    help resolution is left as it is (the log says so once), and a game's HDR frames are shown without it. A change
-    help while it runs (the game's menu) takes effect at the next frame
+    help resolution is left as it is (the log says so once), and a game's HDR frames are shown without it. On an sRGB
+    help window the pass reads the frame in linear light, as FSR 1's own RCAS does, so it is subtler there: 85 to 100
+    help of Upscaler sharpness is where it shows. A change while it runs (the game's menu) takes effect at the next
+    help frame
 setting Anti-aliasing
     key anti_aliasing
     text 8
