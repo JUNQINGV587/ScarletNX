@@ -113,7 +113,7 @@ cat > "$appdir/play-$slug.sh" <<EOF
 set -euo pipefail
 HERE="\$(cd -- "\$(dirname -- "\${BASH_SOURCE[0]}")" && pwd)"
 export LD_LIBRARY_PATH="\$HERE/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-exec "\$HERE/$id" --extract-container --fullscreen=1 --resolution=$resolution --docked=1 --fps-limit=240 --gamepad-face-labels=1 --screen-fit=0 --emulated-cores=0 --touch-in-tv=1$quality_args "\$@"
+exec "\$HERE/$id" --extract-container --fullscreen=1 --resolution=$resolution --docked=1 --fps-limit=240 --gamepad-face-labels=1 --screen-fit=0 --touch-in-tv=1$quality_args "\$@"
 EOF
 chmod +x "$appdir/play-$slug.sh"
 
