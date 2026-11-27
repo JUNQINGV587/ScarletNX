@@ -27,7 +27,12 @@ presenter, `src/nx/gpu/vk/present_quad.c`, calls it for each frame right after t
 interface is drawn over it), or `snx_fx_prepare` and `snx_fx_draw` for the last pass drawn into a rendering of its own
 (the 3DS's and the Vita's). `pick` chooses what runs there: at 1:1 (the shown size is the frame's) FSR 1, NIS and SGSR
 are not run, there being nothing to grow; with `sharpen=1`, FSR 1's RCAS alone then runs over the frame at its own
-size, at `upscaler_sharpness`'s strength, which is the one post process here that does something at 1:1.
+size, at `upscaler_sharpness`'s strength, which is the one post process here that does something at 1:1. A frame
+drawn smaller or larger than the part of the window it fills is a copy or an upscaler's pass at that part's size first
+(FSR 1's own RCAS included, NIS and SGSR sharpening in their pass), and with `sharpen=1` and a plain copy (the filter
+off or bilinear) RCAS then runs over the copy at that size, in place of the copy's sharpening. `sharpen` is therefore
+the one place here that sharpens a frame the window does not show at its own size without asking for an upscaler;
+`record_sharp` is its pass, `fsr_rcas.frag` sampling by `texelFetch`, which needs no resample of its own.
 
 ## Who calls it
 
