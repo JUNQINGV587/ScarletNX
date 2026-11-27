@@ -719,6 +719,24 @@ void video_init(const char* title, const char* addons) {
     char header[768];
     snprintf(g_sdl3.title, sizeof g_sdl3.title, "%s", title);
     backend_window_size(&w, &h);
+    /* A fullscreen game fills the display, and the display server would otherwise stretch the game's own 1280x720
+       window up to it: a stretch of anything but a whole number blurs the frame, and the interface drawn after it
+       with the same blur. So the window is made the display's size, in the display's own pixels. */
+    if (g_settings.fullscreen && !g_opt_headless) {
+        SDL_DisplayID disp = SDL_GetPrimaryDisplay();
+        const SDL_DisplayMode* mode = disp ? SDL_GetDesktopDisplayMode(disp) : NULL;
+        float scale = disp ? SDL_GetDisplayContentScale(disp) : 1.0f;
+        if (mode && mode->w > 0 && mode->h > 0) {
+            if (!(scale > 0.0f)) scale = 1.0f;
+            int lw = (int)((float)mode->w / scale + 0.5f), lh = (int)((float)mode->h / scale + 0.5f);
+            if (lw > 0 && lh > 0) {
+                w = lw;
+                h = lh;
+                LOG("video: a fullscreen game takes the display's %dx%d pixels (%dx%d at scale %.2f)\n", mode->w,
+                    mode->h, lw, lh, scale);
+            }
+        }
+    }
     if (addons[0])
         snprintf(header, sizeof header, "%s (%s) - %s", title, addons, snx_build_info());
     else
