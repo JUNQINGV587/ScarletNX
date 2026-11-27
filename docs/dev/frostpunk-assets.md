@@ -30,6 +30,12 @@ and cross-checked against the PC package (`textures-s3.*`, 4178 resources,
   * [The header it writes](#the-header-it-writes)
   * [The cache](#the-cache)
   * [The report](#the-report)
+* [Writing format 72 as BC3](#writing-format-72-as-bc3)
+  * [The layout, measured](#the-layout-measured)
+  * [The encode path](#the-encode-path)
+  * [The target size](#the-target-size-1)
+  * [The padding](#the-padding)
+  * [The report it prints](#the-report-it-prints)
 * [Replacing one resource](#replacing-one-resource)
 * [Round-trip differences](#round-trip-differences)
 * [What was proven](#what-was-proven)
@@ -99,7 +105,7 @@ Most payloads are textures and start with `65 78 1c 00`. The 28-byte header is
 | 16 | u16 | `1` in every block seen |
 | 18 | u8 | `1` in every block seen |
 | 19 | u8 | **mip level count** |
-| 20 | 4 bytes | format descriptor: `02 03 04 05` for ASTC 4×4, `04 03 02 05` for RGBA8, `00 00 00 02` for R8 |
+| 20 | 4 bytes | format descriptor: `02 03 04 05` on format 72, `04 03 02 05` on RGBA8, `00 00 00 02` on R8 |
 | 24 | u32 | **pixel bytes of every level**, which is the payload length less 28 |
 
 Offset 24 holds on all 4172 texture blocks: it equals the payload length minus
@@ -107,19 +113,35 @@ Offset 24 holds on all 4172 texture blocks: it equals the payload length minus
 level count implies, so both fields describe the payload and a writer must set
 both.
 
-A block whose level count is 1 holds one level: `ceil(w/4)*ceil(h/4)*16` bytes
-of ASTC 4×4 blocks. 2629 of the 3725 ASTC blocks are like this. A block with a
-higher count holds the full size first and the mips after it, one level after
-another. Their sizes follow the `ceil` rule for each step, and every level takes
-at least 512 bytes: that explains the 2192 extra bytes of a square block (its
-256, 64, 16, 16 and 16 byte levels padded to 512) but leaves 512 to 9216 bytes
-unexplained on blocks that are not square. The tool therefore writes one level
-and never a chain. A 2048×2048 atlas with a chain carries 5 596 160 payload
-bytes where one 4×4 ASTC level needs 4 194 304.
+A level of a format-72 block is made of BC3 blocks, one 16-byte block per 4×4
+texels, and the blocks are not in reading order: they are in the block-linear
+layout the GPU samples, with block height 4 for this title. A level of `w` by `h`
+texels is `ceil(w/4)` blocks wide and `ceil(h/4)` blocks high, cut into GOBs of
+512 bytes — 64 bytes across, eight block rows of four texel rows each — and a
+level is whole GOB columns wide and whole blocks of `2^bh` GOB rows high, where
+`bh` starts at 4 and drops to 3, 2, 1 and 0 as the levels get small.
+`scripts/frostpunk_bl.py` is the port of that layout; the section on
+[writing format 72](#writing-format-72-as-bc3) gives the sizes measured on a real
+block.
 
-Format ids: `72` is ASTC 4×4 (3725 blocks), `37` is uncompressed RGBA8 (224),
-`1` is uncompressed R8 (172) and `5` is 16-bit uncompressed data (46, for
-example a 4096×4096 height field at 33 554 432 bytes). Replacing a texture means
+The level count at +19 says how many levels the block holds, and a block of a
+mip chain holds the full size first and the mips after it, one level after
+another, each exactly the size the layout gives for its own dimensions. 2629 of
+the 3725 format-72 blocks hold level 0 alone, which is what a count of 1 says.
+A writer that replaces a block keeps the claim the field makes: it either writes
+the whole chain or leaves the block alone.
+
+Three shapes are not the common one, and the tool refuses them rather than
+guess. 687 format-72 blocks declare one level and a pixel count that is the size
+the same layout gives at block height 0 — a 508×268 image taking 147 456 bytes
+where block height 4 gives 262 144, so its blocks are packed tighter than this
+title's layout. 18 hold a whole number of copies of their chain, six faces of a
+cube map, and one is a terrain block of an unmatched size.
+
+Format ids: `72` is BC3 blocks in the block-linear layout (3725 blocks), `37` is
+uncompressed RGBA8 (224),
+`1` is uncompressed R8 (172) and `5` is 16-bit uncompressed data (46, for example
+a 4096×4096 height field at 33 554 432 bytes). Replacing a texture means
 writing a payload whose own header describes it; the container itself does not
 care what the bytes are, but the game reads the pixels by the format id.
 
@@ -321,6 +343,13 @@ case and not an error. The estimate for a replacement is
 no mip chain — because that is what the replacement will cost, not what the PC
 payload happens to weigh.
 
+The estimate, and the planned target with it, are shaped like the `apply` path
+that writes ASTC 4×4. `apply-bc3` writes the format the package actually holds,
+which costs a different number of bytes, so it ignores both and recomputes the
+size from the PC payload and `--max-size`; the section on
+[writing format 72](#writing-format-72-as-bc3) says how. A plan is still the
+right input: it carries the resource ids, the names and the categories.
+
 ### The budget
 
 `--budget` takes bytes with an optional `K`, `M`, `G` or `T` suffix and is
@@ -413,6 +442,13 @@ as well. No device run has covered that yet.
 A texture of format 5 is always refused: it holds 16 bits a channel and ASTC 4x4
 keeps 8.
 
+These blocks are not what a format-72 texture holds. The shipped package keeps
+BC3 blocks in the block-linear layout in those 3725 blocks, as
+[writing format 72](#writing-format-72-as-bc3) shows, so this path was written
+against an earlier reading of them. It stays for the formats whose blocks are
+linear and for experiments on them; a format-72 texture is `apply-bc3`'s job.
+No run has loaded a container that this path wrote into a format-72 header.
+
 A block that declares a mip chain gets one level. The tool does not write a
 chain, because the padding of the levels is not fully understood: for a block
 that is not square the sizes do not add up, as the section above shows. One level
@@ -440,6 +476,125 @@ The report gives the replaced count, the old and new payload bytes, the net
 change, the time, and the size of the `.dat` on disk. The last value is measured
 after the write and compared with the block sizes of the index that was written,
 so the report cannot disagree with the file.
+
+## Writing format 72 as BC3
+
+```
+scripts/frostpunk-assets.py apply-bc3 --plan /tmp/plan.jsonl --out /data/repack/hd1
+```
+
+`apply-bc3` replaces format-72 textures with the PC image of the same resource,
+encoded as BC3 blocks in the block-linear layout. It reads the plan that `plan`
+writes and needs no `astcenc`: `scripts/frostpunk_bl.py` carries the layout and
+the encoder. `--max-size` caps a side, `--limit` takes the first entries, and
+`--pad-to` and `--no-pad` are about the length of the file, below.
+
+### The layout, measured
+
+`buildings/generator/bld_generator_000_lv1_alb_01.texture` declares 1024×1024, 11
+levels and 1 400 320 pixel bytes, and the layout gives exactly that:
+
+| level | bytes | block height |
+| --- | --- | --- |
+| 0 | 1 048 576 | 4 |
+| 1 | 262 144 | 4 |
+| 2 | 65 536 | 3 |
+| 3 | 16 384 | 2 |
+| 4 | 4 096 | 1 |
+| 5 | 1 024 | 0 |
+| 6 to 10 | 512 each | 0 |
+| **total** | **1 400 320** | |
+
+The total is the payload less 28 (1 400 348) and the word at +24; level 0 is
+first and each level takes exactly what the layout gives for its own dimensions.
+Unswizzling every level and swizzling it back reproduces the 1 400 320 bytes of
+the payload byte for byte, so the layout is not only the right size.
+
+The sizes cannot show the block height on their own, so level 0 was decoded
+twice. Unswizzled at block height 4, decoded as BC3 and compared with the PC
+image of the same resource averaged down to 1024, the mean difference is **2.63**
+a channel and the largest is **51**: the same picture. At block height 0 the
+same comparison gives **35.23** and **223**, a scrambled picture. The block rows
+of this title are four deep, and the layout is the one the picture shows.
+
+The package agrees as a whole: 3020 of the 3725 format-72 blocks declare the
+chain the layout gives for their size, and 687 declare one level at the size the
+layout gives at block height 0, which is a tighter packing than this one. The 18
+that hold a whole number of copies of their chain are cube maps; the command
+refuses them, as it refuses a block whose pixel count is no layout it knows.
+[Texture payloads](#texture-payloads) lists the three shapes. Within the
+categories the plan covers that is 458 replaceable blocks under `buildings/`, 46
+under `rocks/` and 172 under `terrain/`.
+
+### The encode path
+
+One entry, in order:
+
+1. Read the Switch block, the PC block and the PC image header.
+2. Refuse the entry unless the Switch block is format 72 and declares a pixel
+   count the layout explains, the PC package holds the same resource, and the PC
+   payload is a DXT1, DXT3 or DXT5 image. Raw pixels are refused: the command
+   re-encodes blocks and does not guess a decoder for a layout it has not read.
+3. Decode the PC level 0 to RGBA8. The PC payload lists its levels smallest
+   first, so the full size is the last row of its table.
+4. Take the target size from the PC image and `--max-size`, and refuse the entry
+   when that is smaller than the Switch texture on either side.
+5. Encode level 0, average it down by two for every smaller level (an exact 2×2
+   mean, so an odd side loses its last column or row), encode that level, and
+   stop at 1×1.
+6. Swizzle each level into the layout at the level's own block height and
+   concatenate them, level 0 first.
+7. Write the 28-byte header of the Switch block, then the levels.
+
+The header keeps every byte but four: width and height at +12 and +14, the level
+count at +19 and the pixel bytes at +24. The format id, the descriptor and the
+fields the package does not document keep the values the replaced block had, so
+the game reads the new block as format 72 with the same descriptor.
+
+The encoder is the one in `scripts/frostpunk_bl.py`: BC3 with an eight-value
+alpha palette and a four-colour palette each block picks from its own span. On
+the generator albedo a 1024×1024 chain rebuilt from the PC image decodes back
+within a mean of 0.05 a channel of the source, with a largest error of 31 on its
+hardest edge.
+
+### The target size
+
+The PC image is the source, so the replacement is as large as that image, capped
+on its longest side by `--max-size` (2048 by default) and never smaller than the
+Switch texture: a texture that would come out smaller is refused with its id
+instead of downscaled, because the point is to spend the pixels the PC build has,
+not to lose the ones the console already had. Nothing is rounded to a power of
+two.
+
+The plan's own target and estimate are ignored, since they are shaped like the
+ASTC path: a BC3 chain costs a different number of bytes.
+
+### The padding
+
+A `.dat` shorter than the file it replaces stops the game at load:
+`nn::fs::ReadFile` fails with `0x177a02`. A replaced set is normally smaller than
+the original, so `apply-bc3` pads the file it writes with zero bytes up to the
+size of the `.dat` it replaces. That is the default, and the report says how many
+bytes of padding there are.
+
+`--pad-to BYTES` pads to a size named on the command line, and `--no-pad` turns
+the padding off and leaves the shorter file. The index does not describe the
+padding: it lists the blocks, and the padded tail is bytes no record owns, like
+the spans the original container has between its blocks. Only the length of the
+file matters to the RomFS read.
+
+### The report it prints
+
+The report names the two packages and the plan, the number of entries replaced
+of the number attempted, the level count, the old and new payload bytes with
+their difference, the size of the `.dat` on disk with the padding, and the wall
+time. Under it comes a table with one row a replacement — the id, the name, the
+old and new size, the level count, and the payload bytes before and after — and
+then the refusals, grouped by the reason they share with the ids that share it.
+
+A refusal is per record and does not stop the run. `--fail-fast` stops at the
+first one and writes nothing, and a run in which no entry could be replaced exits
+2 with the reasons on stderr.
 
 ## Replacing one resource
 
@@ -506,3 +661,12 @@ Two runs of the same 300 s script, one on the repacked set and one on the
 original, differ over 36.6% of the panel's pixels, over 1.7% of the rest of the
 frame (snowfall and animation) and over 0.0% of the quest panel in the bottom
 left.
+
+That run swapped two payloads and left every header and every other block as it
+was, so it proves the container can carry new bytes; it says nothing about which
+bytes a block holds. The layout of format 72 was settled separately, by the
+byte-for-byte round trip and the decode comparison in
+[writing format 72](#writing-format-72-as-bc3), and the encoder was settled by
+measuring the chain it rebuilds against its source. No container written by
+`apply-bc3` has been loaded by the game yet, so the padding rule rests on the
+`0x177a02` load failure it avoids rather than on a run that succeeded with it.
