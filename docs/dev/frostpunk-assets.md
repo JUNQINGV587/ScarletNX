@@ -507,8 +507,8 @@ levels and 1 400 320 pixel bytes, and the layout gives exactly that:
 
 The total is the payload less 28 (1 400 348) and the word at +24; level 0 is
 first and each level takes exactly what the layout gives for its own dimensions.
-Unswizzling every level and swizzling it back reproduces the 1 400 320 bytes of
-the payload byte for byte, so the layout is not only the right size.
+Unswizzling every level and swizzling it back reproduces those 1 400 320 bytes
+byte for byte, so the layout is not only the right size.
 
 The sizes cannot show the block height on their own, so level 0 was decoded
 twice. Unswizzled at block height 4, decoded as BC3 and compared with the PC
