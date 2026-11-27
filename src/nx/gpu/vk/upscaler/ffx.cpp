@@ -301,21 +301,18 @@ SnxFfx* snx_ffx_create(const SnxUpscalerInfo* info, const char** why) {
     up.maxRenderSize = {info->render_max[0], info->render_max[1]};
     up.maxUpscaleSize = {info->output[0], info->output[1]};
     up.fpMessage = from_ffx;
-    ffxCreateContextDescUpscaleVersion ver = {};
-    ver.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_UPSCALE_VERSION;
-    ver.version = FFX_UPSCALER_VERSION;
-    backend.header.pNext = forced ? &over.header : &up.header;
-    if (forced) over.header.pNext = &up.header;
-    /* the effect's API version first (its provider may be older), then no dynamic resolution: a driver that refuses
-       either still runs the upscaler, at a fixed size in the last case */
-    auto attempt = [&](int dynamic_resolution, int with_version) {
+    /* the upscale description is the context's root, as AMD's API takes it: the backend and the pinned provider
+       hang off it. A provider that follows the API answers NO_PROVIDER when a backend is handed in as the root */
+    up.header.pNext = &backend.header;
+    backend.header.pNext = forced ? &over.header : NULL;
+    over.header.pNext = NULL;
+    /* dynamic resolution, then a fixed size: a device that refuses the first still runs the upscaler */
+    auto attempt = [&](int dynamic_resolution) {
         up.flags = flags | (dynamic_resolution ? FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION : 0);
-        up.header.pNext = with_version ? &ver.header : NULL;
-        return g.api.create(&f->ctx, &backend.header, NULL);
+        return g.api.create(&f->ctx, &up.header, NULL);
     };
-    ffxReturnCode_t rc = attempt(1, 1);
-    if (rc != FFX_API_RETURN_OK) rc = attempt(1, 0);
-    if (rc != FFX_API_RETURN_OK) rc = attempt(0, 0);
+    ffxReturnCode_t rc = attempt(1);
+    if (rc != FFX_API_RETURN_OK) rc = attempt(0);
     if (rc != FFX_API_RETURN_OK) {
         snprintf(g.why, sizeof g.why, "AMD's FidelityFX API made no FSR 4.1 context (%s)", code_name(rc));
         say(2, "FSR 4.1: %s", g.why);

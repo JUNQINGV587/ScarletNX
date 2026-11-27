@@ -43,6 +43,9 @@ struct SnxFfx {
     ffxContext ctx;
     int failed;
     char fail_reason[192];
+    VkImage exposure;
+    VkImageView exposure_view;
+    int exposure_ready;
 };
 
 namespace {
@@ -231,7 +234,8 @@ extern "C" SnxFfx* snx_ffx_create(const SnxUpscalerInfo* info, const char** why)
     if (info->flags & SNX_UP_FLAG_DISPLAY_MOTION) flags |= FFX_UPSCALE_ENABLE_DISPLAY_RESOLUTION_MOTION_VECTORS;
     if (info->flags & SNX_UP_FLAG_JITTERED_MOTION) flags |= FFX_UPSCALE_ENABLE_MOTION_VECTORS_JITTER_CANCELLATION;
     if (info->flags & SNX_UP_FLAG_INVERTED_DEPTH) flags |= FFX_UPSCALE_ENABLE_DEPTH_INVERTED;
-    if (info->flags & SNX_UP_FLAG_AUTO_EXPOSURE) flags |= FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
+    /* no FFX_UPSCALE_ENABLE_AUTO_EXPOSURE here: the provider's automatic exposure multiplies a frame it reads as
+       dark to black, so an exposure texture is always handed over instead (see snx_ffx_evaluate) */
 
     /* which versions the provider offers: only a 4.1 one is asked for */
     uint64_t count = 0;
@@ -286,15 +290,16 @@ extern "C" SnxFfx* snx_ffx_create(const SnxUpscalerInfo* info, const char** why)
     up.maxUpscaleSize.height = info->output[1];
     up.fpMessage = NULL;
 
+    /* the upscale description is the context's root, as AMD's API takes it: the backend, the provider and the
+       Vulkan API version hang off it. The provider answers NO_PROVIDER when the backend comes in as the root */
+    up.header.pNext = &back.header;
+    back.header.pNext = &over.header;
+    over.header.pNext = &apiver.header;
+    apiver.header.pNext = NULL;
     ffxReturnCode_t rc = FFX_API_RETURN_ERROR;
     for (int drs = 1; drs >= 0 && rc != FFX_API_RETURN_OK; drs--) {
-        for (int with_version = 1; with_version >= 0 && rc != FFX_API_RETURN_OK; with_version--) {
-            up.flags = flags | (drs ? FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION : 0);
-            back.header.pNext = with_version ? &over.header : &up.header;
-            over.header.pNext = &up.header;
-            up.header.pNext = &apiver.header;
-            rc = ffxCreateContext(&f->ctx, &back.header, NULL);
-        }
+        up.flags = flags | (drs ? FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION : 0);
+        rc = ffxCreateContext(&f->ctx, &up.header, NULL);
     }
     if (rc != FFX_API_RETURN_OK) {
         snprintf(g.why, sizeof g.why, "AMD's FSR 4.1 provider made no context (%s)", code_name(rc));
@@ -339,10 +344,82 @@ extern "C" int snx_ffx_evaluate(SnxFfx* f, const SnxUpscaleEval* e, const char**
     d.depth = resource(&e->depth, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY);
     d.motionVectors =
         resource(&e->motion, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY);
+    FfxApiResource exposure = {};
     if (e->exposure.image) {
-        d.exposure =
-            resource(&e->exposure, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY);
+        exposure = resource(&e->exposure, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ,
+                            FFX_API_RESOURCE_USAGE_READ_ONLY);
+    } else {
+        /* one texel of 1.0, cleared each dispatch: the provider's own automatic exposure reads a frame this dark as
+           black, so the exposure has to come from here even when the game has no exposure texture to give */
+        if (!f->exposure) {
+            VkImageCreateInfo ici = {VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            ici.imageType = VK_IMAGE_TYPE_2D;
+            ici.format = VK_FORMAT_R32_SFLOAT;
+            ici.extent.width = 1;
+            ici.extent.height = 1;
+            ici.extent.depth = 1;
+            ici.mipLevels = 1;
+            ici.arrayLayers = 1;
+            ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            if (vkCreateImage(f->info.device, &ici, NULL, &f->exposure) != VK_SUCCESS) {
+                snprintf(g.why, sizeof g.why, "no memory for the FSR 4.1 exposure texture");
+                if (why) *why = g.why;
+                return 0;
+            }
+            VkImageViewCreateInfo vci = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            vci.image = f->exposure;
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = VK_FORMAT_R32_SFLOAT;
+            vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            vci.subresourceRange.levelCount = 1;
+            vci.subresourceRange.layerCount = 1;
+            if (vkCreateImageView(f->info.device, &vci, NULL, &f->exposure_view) != VK_SUCCESS) {
+                vkDestroyImage(f->info.device, f->exposure, NULL);
+                f->exposure = VK_NULL_HANDLE;
+                snprintf(g.why, sizeof g.why, "no memory for the FSR 4.1 exposure view");
+                if (why) *why = g.why;
+                return 0;
+            }
+        }
+        VkImageMemoryBarrier b = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        b.srcAccessMask = 0;
+        b.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.oldLayout = f->exposure_ready ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_UNDEFINED;
+        b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        b.image = f->exposure;
+        b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        b.subresourceRange.levelCount = 1;
+        b.subresourceRange.layerCount = 1;
+        vkCmdPipelineBarrier(e->cb, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &b);
+        VkClearColorValue one = {};
+        one.float32[0] = 1.0f;
+        VkImageSubresourceRange range = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        vkCmdClearColorImage(e->cb, f->exposure, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &one, 1, &range);
+        b.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        vkCmdPipelineBarrier(e->cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0,
+                             NULL, 0, NULL, 1, &b);
+        f->exposure_ready = 1;
+        exposure.resource = (void*)f->exposure;
+        exposure.description.type = FFX_API_RESOURCE_TYPE_TEXTURE2D;
+        exposure.description.format = surface(VK_FORMAT_R32_SFLOAT);
+        exposure.description.width = 1;
+        exposure.description.height = 1;
+        exposure.description.depth = 1;
+        exposure.description.mipCount = 1;
+        exposure.description.usage = FFX_API_RESOURCE_USAGE_READ_ONLY;
+        exposure.state = FFX_API_RESOURCE_STATE_COMPUTE_READ;
     }
+    d.exposure = exposure;
     if (e->reactive.image) {
         d.reactive =
             resource(&e->reactive, FFX_API_RESOURCE_STATE_PIXEL_COMPUTE_READ, FFX_API_RESOURCE_USAGE_READ_ONLY);
@@ -380,7 +457,9 @@ extern "C" int snx_ffx_evaluate(SnxFfx* f, const SnxUpscaleEval* e, const char**
 
 extern "C" void snx_ffx_destroy(SnxFfx* f) {
     if (!f) return;
-    ffxDestroyContext(&f->ctx, NULL);
+    if (f->ctx) ffxDestroyContext(&f->ctx, NULL);
+    if (f->exposure_view) vkDestroyImageView(f->info.device, f->exposure_view, NULL);
+    if (f->exposure) vkDestroyImage(f->info.device, f->exposure, NULL);
     free(f);
 }
 
