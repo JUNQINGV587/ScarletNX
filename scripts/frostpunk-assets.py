@@ -2279,6 +2279,11 @@ def apply_bc3_entry(entry, switch, pc, max_size):
                                   (width, height))
     if target is None:
         raise ContainerError(where, why)
+    # The plan's target is the PC size capped at --max-size, so a 4096 image
+    # capped to 2048 has to come down before it is cut into 4x4 blocks.
+    if (width, height) != target:
+        pixels = bc3_layout().resample(pixels, width, height, target[0],
+                                       target[1])
     replacement = build_bc3_payload(original, target[0], target[1], pixels)
     return replacement, {
         "id": entry["id"], "name": entry["name"] or "",
