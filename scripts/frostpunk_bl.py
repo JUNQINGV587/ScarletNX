@@ -2,10 +2,12 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """The block-linear (GOB) layout Frostpunk's texture blocks are stored in, and a BC3 codec for them.
 
-The container's format-72 blocks are not linear: they are the bytes the GPU samples, in NVN's block-linear
-layout with the block height the game's descriptor asks for (bh = 4 for this title).  A level's bytes are
-gx GOB columns wide and whole blocks of 2^bh GOB rows high, and the block height shrinks for the small
-levels.  This mirrors src/nx/gpu/texture/blocklinear.h and the bl_* helpers in src/nx/gpu/gpu.c and
+The container's format-72 blocks are not linear: they hold the BC3 blocks in NVN's block-linear layout, a
+level gx GOB columns wide and gy GOB rows high.  The bytes a level declares are packed — its gx by gy GOBs,
+with no padding of the GOB rows out to whole 2^bh blocks: `ui/tiles/tech_tree_atlas2.texture` is 1280x1280
+with 11 levels in 2,189,824 bytes, where block height 4 would take 2,842,624.  The block height (4 for the
+aligned chains, 0 for a single level) only changes that count when a level's GOB rows are not whole 2^bh
+blocks, so an aligned texture is the same bytes under either rule.  This mirrors src/nx/gpu/texture/blocklinear.h and the bl_* helpers in src/nx/gpu/gpu.c and
 src/nx/gpu/vk/texture.c: bl_level_size, bl_level_blocks, bl_offset.
 """
 

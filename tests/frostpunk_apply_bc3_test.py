@@ -241,6 +241,32 @@ class LevelTableTest(unittest.TestCase):
         self.assertEqual([self.fa.bc3_level_dims(8, 4, level) for level in range(4)],
                          [(8, 4), (4, 2), (2, 1), (1, 1)])
 
+    def test_a_chain_is_stored_packed(self):
+        # The sizes the container holds: a level whose GOB rows do not fill
+        # whole 2^bh blocks takes only the rows it has, so the packed sum is
+        # what a block declares (ui/tiles/tech_tree_atlas2.texture is 1280x1280
+        # with 11 levels and 2,189,824 bytes, not the 2,842,624 padding it to a
+        # block height of 4 would take).
+        self.assertEqual(self.fa.bc3_packed_bytes(1280, 1280, 11), 2189824)
+        self.assertEqual(self.fa.bc3_packed_bytes(2560, 1320, 1), 3440640)
+        self.assertEqual(self.fa.bc3_packed_bytes(5120, 2640, 1), 13598720)
+        self.assertEqual(self.fa.bc3_packed_bytes(2048, 2048, 12), 5594624)
+
+    def test_block_height_is_read_back_from_the_sizes(self):
+        # The block height the game asks for is not in the container; it is the
+        # largest one whose levels stay whole GOB rows, and a single level is
+        # stored with no grouping at all.  Measured: the 2x title texture is
+        # 5120x2640 at bh 0 with a 13,598,720-byte level.
+        for width, height, levels, bh in ((2048, 2048, 12, 4),
+                                          (1024, 1024, 11, 4),
+                                          (1280, 1280, 11, 0),
+                                          (2560, 1320, 1, 0),
+                                          (5120, 2640, 1, 0)):
+            chosen = self.fa.bc3_base_bh(width, height, levels)
+            self.assertEqual(chosen, bh, "%dx%d %d levels" % (width, height, levels))
+            self.assertEqual(self.fa.bc3_chain_bytes(width, height, levels, chosen),
+                             self.fa.bc3_packed_bytes(width, height, levels))
+
     def test_every_level_is_whole_gobs(self):
         for width, height in ((8, 8), (10, 6), (64, 64), (128, 64), (1024, 1024)):
             for level in range(self.fa.bc3_levels(width, height)):
@@ -476,6 +502,24 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(payload[19], 4)
         self.assertEqual(len(payload) - self.fa.TEXTURE_HEADER_SIZE,
                          self.fa.bc3_chain_bytes(8, 8))
+
+    def test_accepts_a_single_level_block_that_is_packed(self):
+        # A one-level texture is stored packed with no block grouping, so its
+        # pixels are 64x64 = 4096 bytes; padding them to a block height of 4
+        # would be 32768 and the block would be read as something else.
+        body = b"\x5c" * 4096
+        block = switch_block(64, 64, fmt=72, mips=1, pixel_bytes=4096, body=body)
+        self.fixture.write([(TEST_ID, block, "of/menu.texture")],
+                           [(TEST_ID, pc_dxt5(64, 64), "of/menu.texture")],
+                           [plan_entry(self.fa, TEST_ID, "of/menu.texture",
+                                       (64, 64), (64, 64), (64, 64))])
+        code, out, err = self.fixture.apply()
+        self.assertEqual(code, 0, err)
+        self.assertEqual(err, "")
+        self.assertIn("replaced  1 of 1", out)
+        payload = self.fixture.payload(TEST_ID)
+        self.assertEqual(len(payload) - self.fa.TEXTURE_HEADER_SIZE,
+                         self.fa.bc3_chain_bytes(64, 64))
 
     def test_refuses_a_cube_map(self):
         # Six faces, each the chain of an 8 by 8 image.

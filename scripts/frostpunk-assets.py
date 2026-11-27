@@ -2067,19 +2067,19 @@ def bc3_level_dims(width, height, level):
     return max(width >> level, 1), max(height >> level, 1)
 
 
-def bc3_level_bh(height, level):
+def bc3_level_bh(height, level, bh=BC3_BLOCK_HEIGHT):
     """The block height a level is stored with: the texture's, shrunk for small levels."""
-    return bc3_layout().level_blocks(0, BC3_BLOCK_HEIGHT, level, height)
+    return bc3_layout().level_blocks(0, bh, level, height)
 
 
-def bc3_level_bytes(width, height, level):
+def bc3_level_bytes(width, height, level, bh=BC3_BLOCK_HEIGHT):
     """The bytes one level of a `width` by `height` chain takes."""
     level_w, level_h = bc3_level_dims(width, height, level)
     return bc3_layout().level_bytes(level_w, level_h,
-                                    bc3_level_bh(height, level))
+                                    bc3_level_bh(height, level, bh))
 
 
-def bc3_chain_bytes(width, height, levels=None):
+def bc3_chain_bytes(width, height, levels=None, bh=BC3_BLOCK_HEIGHT):
     """The pixel bytes a `width` by `height` block takes, every level or the first `levels`.
 
     A block may declare fewer levels than the chain could hold: 2629 of the
@@ -2088,11 +2088,72 @@ def bc3_chain_bytes(width, height, levels=None):
     """
     if levels is None:
         levels = bc3_levels(width, height)
-    return sum(bc3_level_bytes(width, height, level)
+    return sum(bc3_level_bytes(width, height, level, bh)
                for level in range(levels))
 
 
-def build_bc3_payload(original, width, height, pixels):
+def bc3_packed_bytes(width, height, levels=None):
+    """The bytes those levels take with no block padding: gx * gy GOBs a level.
+
+    This is what every shipped block declares, whatever its texture's block
+    height: `ui/tiles/tech_tree_atlas2.texture` (1280x1280, 11 levels) holds
+    2,189,824 bytes, its GOB rows with no whole-block padding, not the
+    2,842,624 that block height 4 would round its levels out to.
+    """
+    if levels is None:
+        levels = bc3_levels(width, height)
+    total = 0
+    for level in range(levels):
+        level_w, level_h = bc3_level_dims(width, height, level)
+        tw = (level_w + BC3_BLOCK - 1) // BC3_BLOCK
+        th = (level_h + BC3_BLOCK - 1) // BC3_BLOCK
+        gx = (tw * BC3_BYTES_PER_BLOCK + 63) // 64
+        gy = (th + 7) // 8
+        total += gx * gy * 512
+    return total
+
+
+def bc3_base_bh(width, height, levels=None):
+    """The block height a chain of this size is stored with.
+
+    The container does not record it, so it is read back from the sizes: a
+    chain is stored with the largest block height whose every level holds whole
+    2^bh blocks of GOB rows (no padding), and a single-level texture with 0.
+    Measured against the runtime: a 2048x2048 12-level chain is stored at 4 (all
+    levels aligned), `ui/menu/layer_03_combined.texture` (2560x1320, one level)
+    and its 5120x2640 double at 0, and the shipped 1280x1280 11-level chain at 0
+    because no larger height leaves every level aligned.
+    """
+    if levels is None:
+        levels = bc3_levels(width, height)
+    if levels == 1:
+        return 0
+    packed = bc3_packed_bytes(width, height, levels)
+    for bh in range(BC3_BLOCK_HEIGHT, -1, -1):
+        if bc3_chain_bytes(width, height, levels, bh) == packed:
+            return bh
+    return 0
+
+
+def bc3_record_bh(texture):
+    """The block height a shipped block's pixels are stored with, or None.
+
+    Tried from the sizes: the declared pixel bytes have to be the chain's.  A
+    single-level block is stored packed (block height 0); a chain that fits
+    more than one height is stored at the largest, which is what the runtime
+    asks its descriptor for.
+    """
+    fits = [bh for bh in range(BC3_BLOCK_HEIGHT + 1)
+            if bc3_chain_bytes(texture.width, texture.height, texture.mips, bh)
+            == texture.pixel_bytes]
+    if not fits:
+        return None
+    if texture.mips == 1:
+        return 0
+    return max(fits)
+
+
+def build_bc3_payload(original, width, height, pixels, levels=None):
     """A format-72 payload: every level of `pixels` as BC3, in the block-linear layout.
 
     The header of the block being replaced is kept except the three fields
@@ -2101,7 +2162,9 @@ def build_bc3_payload(original, width, height, pixels):
     fields the package does not document keep their old values.
     """
     layout = bc3_layout()
-    levels = bc3_levels(width, height)
+    if levels is None:
+        levels = bc3_levels(width, height)
+    bh = bc3_base_bh(width, height, levels)
     level_w, level_h, image = width, height, pixels
     body = bytearray()
     for level in range(levels):
@@ -2111,8 +2174,8 @@ def build_bc3_payload(original, width, height, pixels):
             level_w, level_h = new_w, new_h
         blocks = layout.dxt5_encode(image, level_w, level_h)
         written = layout.swizzle(blocks, level_w, level_h,
-                                 bc3_level_bh(height, level))
-        want = bc3_level_bytes(width, height, level)
+                                 bc3_level_bh(height, level, bh))
+        want = bc3_level_bytes(width, height, level, bh)
         if len(written) != want:
             raise ContainerError(
                 "bc3", "level %d of %dx%d takes %d bytes, the layout gave %d"
@@ -2166,7 +2229,6 @@ def apply_bc3_entry(entry, switch, pc, max_size):
             "is stored as %s (format %d), not format 72, so it does not hold "
             "the BC3 blocks this command writes and is left alone"
             % (texture.label, texture.format))
-    chain = bc3_chain_bytes(texture.width, texture.height)
     levels = bc3_levels(texture.width, texture.height)
     if texture.mips > levels:
         raise ContainerError(
@@ -2177,21 +2239,27 @@ def apply_bc3_entry(entry, switch, pc, max_size):
     # A block holds its declared levels or a whole number of copies of them:
     # a cube map or a texture array carries one copy a face, and this command
     # encodes one image, so those are refused rather than guessed at.
-    own = bc3_chain_bytes(texture.width, texture.height, texture.mips)
-    if own and texture.pixel_bytes != own and not texture.pixel_bytes % own:
-        raise ContainerError(
-            where,
-            "holds %d copies of its %d-level chain (%s bytes each), a cube map "
-            "or a texture array, which this command does not encode"
-            % (texture.pixel_bytes // own, texture.mips, format(own, ",")))
-    if texture.pixel_bytes != own:
+    own = bc3_packed_bytes(texture.width, texture.height, texture.mips)
+    stored_bh = bc3_record_bh(texture)
+    if stored_bh is None:
+        for copies in range(2, 65):
+            for bh in range(BC3_BLOCK_HEIGHT, -1, -1):
+                chain = bc3_chain_bytes(texture.width, texture.height,
+                                        texture.mips, bh)
+                if chain * copies == texture.pixel_bytes:
+                    raise ContainerError(
+                        where,
+                        "holds %d copies of its %d-level chain (%s bytes each), "
+                        "a cube map or a texture array, which this command does "
+                        "not encode"
+                        % (copies, texture.mips, format(chain, ",")))
         raise ContainerError(
             where,
             "declares %d level(s) and %s pixel bytes; %dx%d in the block-linear "
-            "layout at block height %d is %s bytes, so its pixels are not that "
-            "layout and are left alone"
+            "layout is %s bytes, so its pixels are not that layout and are left "
+            "alone"
             % (texture.mips, format(texture.pixel_bytes, ","), texture.width,
-               texture.height, BC3_BLOCK_HEIGHT, format(own, ",")))
+               texture.height, format(own, ",")))
     source = pc.record_map().get(plan_id)
     if source is None:
         raise ContainerError(where, "has no record in the PC package")
