@@ -583,6 +583,18 @@ padding: it lists the blocks, and the padded tail is bytes no record owns, like
 the spans the original container has between its blocks. Only the length of the
 file matters to the RomFS read.
 
+Padding is a lower bound, and a replacement can pass the upper one too. A `.dat`
+whose blocks grow past the length of the file they replace puts those blocks
+past the end the loader may know: if it bounds a read by the size the RomFS
+records, the tail of the file is unreachable, and if it takes the size from the
+disk, it is not. Which of the two the game does has not been measured. The
+report therefore counts the records that end past the replaced file's length and
+says how many bytes that is, and it does so on every run, so a container that
+outgrew its original is visible before anyone loads it. On the twelve-replacement
+run used to prove the command, 16 of 4238 records end past the replaced length by
+13 889 121 bytes; a whole category does far more, so the question has to be
+settled before a large set goes to the console.
+
 ### The report it prints
 
 The report names the two packages and the plan, the number of entries replaced

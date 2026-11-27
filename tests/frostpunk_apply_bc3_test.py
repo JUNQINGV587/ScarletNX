@@ -449,7 +449,8 @@ class ApplyTest(unittest.TestCase):
         self.assertEqual(code, 0)
         report = json.loads(out)
         for key in ("switch", "pc", "plan", "count", "attempted", "old_bytes",
-                    "new_bytes", "on_disk", "padding", "elapsed", "entries",
+                    "new_bytes", "on_disk", "padding", "replaced_size", "beyond",
+                    "beyond_bytes", "encoded", "write", "elapsed", "entries",
                     "refused", "dat", "idx"):
             self.assertIn(key, report)
         self.assertEqual(report["count"], 1)
@@ -663,6 +664,29 @@ class PaddingTest(unittest.TestCase):
         code, _, _ = self.fixture.apply("--pad-to", str(before + 4096))
         self.assertEqual(code, 0)
         self.assertEqual(self.written(), before + 4096)
+
+    def report(self, beyond, beyond_bytes):
+        return {
+            "switch": "switch-s3.dat", "pc": "pc-s3.dat", "plan": "plan.jsonl",
+            "planned": 1, "attempted": 1, "count": 1, "max_size": 2048,
+            "levels": 4, "old_bytes": 2076, "new_bytes": 2076,
+            "on_disk": 4096, "pad_to": 4096, "padding": 2048,
+            "replaced_size": 1024, "beyond": beyond,
+            "beyond_bytes": beyond_bytes, "encoded": 0.1, "write": 0.1,
+            "elapsed": 0.2, "entries": [], "refused": [],
+            "dat": "out/switch-s3.dat", "idx": "out/switch-s3.idx",
+        }
+
+    def test_notes_a_tail_past_the_replaced_file(self):
+        # Padding fixes a file that is too short; a replacement that grows the
+        # blocks moves them past the length of the file they replace, which the
+        # report names instead of leaving the reader to compare two numbers.
+        out = self.fa.render_apply_bc3(self.report(2, 4096), "table")
+        self.assertIn("end past the", out)
+        self.assertIn("2 record(s)", out)
+        self.assertIn("4,096 bytes in all", out)
+        clean = self.fa.render_apply_bc3(self.report(0, 0), "table")
+        self.assertNotIn("end past the", clean)
 
     def test_the_index_still_describes_the_blocks(self):
         self.fixture.apply()

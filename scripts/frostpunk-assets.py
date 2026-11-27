@@ -2248,6 +2248,14 @@ def render_apply_bc3(report, fmt):
            % (report["elapsed"], report["encoded"], report["write"])]
     if report["padding"]:
         out.append("padding   %s" % BC3_PAD_REASON)
+    if report["beyond"]:
+        out.append(
+            "note      %s record(s) end past the %s bytes of the file they "
+            "replace, by %s bytes in all; a loader that bounds its reads by "
+            "the size it knows would not reach them"
+            % (format(report["beyond"], ","),
+               format(report["replaced_size"], ","),
+               format(report["beyond_bytes"], ",")))
     if report["refused"]:
         groups = {}
         for row in report["refused"]:
@@ -2320,6 +2328,13 @@ def cmd_apply_bc3(args):
         raise ContainerError(
             dat_path, "holds %d bytes but its index accounts for %d"
             % (on_disk, accounted))
+    # Padding fixes a file that is too short, but a replacement that grows the
+    # blocks moves the tail past the length of the file it replaces.  Whether
+    # that is reachable depends on how the loader sizes the file, which this
+    # command cannot know, so the report counts the blocks that sit past it.
+    replaced_size = os.path.getsize(switch.dat_path)
+    beyond = [record for record in written.records
+              if record.offset + record.stored > replaced_size]
     report = {
         "switch": switch_path,
         "pc": pc_path,
@@ -2334,6 +2349,10 @@ def cmd_apply_bc3(args):
         "on_disk": on_disk,
         "pad_to": pad_to,
         "padding": on_disk - accounted,
+        "replaced_size": replaced_size,
+        "beyond": len(beyond),
+        "beyond_bytes": sum(record.offset + record.stored - replaced_size
+                            for record in beyond),
         "encoded": round(encoded, 2),
         "write": round(elapsed - encoded, 2),
         "elapsed": round(elapsed, 2),
