@@ -38,21 +38,29 @@ def bl_level_blocks(height, bh, level, bh_tex=4):
     return bh
 
 
-def bl_level_size(width, height, bh, level, bw=4, bh_tex=4, bpp=16, tile_w=0):
-    """The bytes of one mip level of a 2D block-linear surface (texture.c's bl_level_size)."""
-    lw = width >> level if width >> level else 1
-    lh = height >> level if height >> level else 1
-    tw = (lw + bw - 1) // bw
-    th = (lh + bh_tex - 1) // bh_tex
+def level_bytes(width, height, bh, bw=4, bh_tex=4, bpp=16, tile_w=0):
+    """The bytes one block-linear level of this size takes, given its own size and block height.
+
+    The block height is the one the level is stored with, which for the small levels is not the texture's:
+    `bl_level_blocks` says which, so a level's size never has to be re-derived from the level above it.
+    """
+    tw = (width + bw - 1) // bw
+    th = (height + bh_tex - 1) // bh_tex
     lwb = tw * bpp
     gx = (lwb + GOB_SIZE_X - 1) // GOB_SIZE_X
     if tile_w and lwb >= 64 << tile_w and th >= 8 << bh:
         n = 1 << tile_w
         gx = (gx + n - 1) // n * n
     gy = (th + GOB_SIZE_Y - 1) // GOB_SIZE_Y
-    b = bl_level_blocks(height, bh, level, bh_tex)
-    gys = ((gy + (1 << b) - 1) >> b) << b
+    gys = ((gy + (1 << bh) - 1) >> bh) << bh
     return gx * gys * GOB_SIZE
+
+
+def bl_level_size(width, height, bh, level, bw=4, bh_tex=4, bpp=16, tile_w=0):
+    """The bytes of one mip level of a 2D block-linear surface (texture.c's bl_level_size)."""
+    lw = width >> level if width >> level else 1
+    lh = height >> level if height >> level else 1
+    return level_bytes(lw, lh, bl_level_blocks(height, bh, level, bh_tex), bw, bh_tex, bpp, tile_w)
 
 
 def bl_offset(x_bytes, y, width_bytes, block_rows, bh):
@@ -73,7 +81,7 @@ def block_slots(width, height, bh):
     tw = (width + 3) // 4
     th = (height + 3) // 4
     width_bytes = tw * GOB_RUN
-    size = bl_level_size(width, height, bh, 0)
+    size = level_bytes(width, height, bh)
     out = []
     for by in range(th):
         for bx in range(tw):
@@ -88,31 +96,36 @@ def level_blocks(mips, bh, level, base_height=None):
     return bl_level_blocks(base_height, bh, level)
 
 
-def unswizzle(data, width, height, bh, base_height=None, level=0):
-    """The level's 16-byte blocks, in row-major block order, out of its block-linear bytes."""
+def unswizzle(data, width, height, bh):
+    """The level's 16-byte blocks, in row-major block order, out of its block-linear bytes.
+
+    `width` and `height` are the level's own size and `bh` the block height it is stored with, which
+    `level_blocks(base_height, bh, level)` gives for a level of a mip chain.
+    """
     tw = (width + 3) // 4
     th = (height + 3) // 4
     width_bytes = tw * GOB_RUN
-    lbh = level_blocks(0, bh, level, base_height)
     out = bytearray(tw * th * GOB_RUN)
     for by in range(th):
         for bx in range(tw):
-            at = bl_offset(bx * GOB_RUN, by, width_bytes, th, lbh)
+            at = bl_offset(bx * GOB_RUN, by, width_bytes, th, bh)
             out[(by * tw + bx) * GOB_RUN:(by * tw + bx + 1) * GOB_RUN] = data[at:at + GOB_RUN]
     return bytes(out)
 
 
-def swizzle(blocks, width, height, bh, base_height=None, level=0):
-    """Block-linear bytes of a level from its 16-byte blocks in row-major block order."""
+def swizzle(blocks, width, height, bh):
+    """Block-linear bytes of a level from its 16-byte blocks in row-major block order.
+
+    Takes the level's own size and block height, like `unswizzle`, so the buffer is exactly the level's
+    bytes whatever level of a chain it is.
+    """
     tw = (width + 3) // 4
     th = (height + 3) // 4
     width_bytes = tw * GOB_RUN
-    base_height = height if base_height is None else base_height
-    lbh = level_blocks(0, bh, level, base_height)
-    out = bytearray(bl_level_size(base_height if base_height else height, height << level if base_height else height, bh, level))
+    out = bytearray(level_bytes(width, height, bh))
     for by in range(th):
         for bx in range(tw):
-            at = bl_offset(bx * GOB_RUN, by, width_bytes, th, lbh)
+            at = bl_offset(bx * GOB_RUN, by, width_bytes, th, bh)
             out[at:at + GOB_RUN] = blocks[(by * tw + bx) * GOB_RUN:(by * tw + bx + 1) * GOB_RUN]
     return bytes(out)
 
@@ -159,7 +172,12 @@ def dxt5_encode(rgba, width, height):
     colour_weights = (4 ** np.arange(16)).astype(np.uint32)
     alpha_weights = (8 ** np.arange(16)).astype(np.uint64)
     out = np.zeros((len(tiles), 16), dtype=np.uint8)
-    chunk = 32768
+    # A chunk is as much as the per-block arrays below are built for at once.  They are several arrays of
+    # chunk * 16 * 3 numbers, and a chunk of 32768 blocks of a 1024x1024 image is 1.5 MB of int16 that grows
+    # to 25 MB of int32 in the distance step: on a machine whose memory is nearly full that allocation is what
+    # the kernel spends its time reclaiming, and the encoder then takes minutes instead of a second.  Smaller
+    # chunks keep the same output byte for byte and stay inside a cache.
+    chunk = 4096
     for at in range(0, len(tiles), chunk):
         part = tiles[at:at + chunk]
         rgb = part[..., :3].astype(np.int16)

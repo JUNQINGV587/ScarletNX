@@ -2954,6 +2954,13 @@ if(Python3_Interpreter_FOUND)
     # (scripts/frostpunk-assets.py)
     add_test(NAME frostpunk_apply
              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_apply_test.py")
+    # a plan turned into a replacement container of BC3 in the block-linear layout: the level sizes of a 1024
+    # texture (1,400,320 bytes over 11 levels, block height shrinking to 0), the block layout round-tripping, an
+    # 8 by 8 image read back out of the payload it was encoded into, the refusals (another format, pixels that are
+    # not that layout, a missing PC block, raw PC pixels, a PC image below the Switch size, a cap below it) and the
+    # padding that keeps the file as long as the one it replaces (scripts/frostpunk-assets.py, scripts/frostpunk_bl.py)
+    add_test(NAME frostpunk_apply_bc3
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_apply_bc3_test.py")
     # which GitHub Actions caches the cleanup workflow deletes (scripts/trim-caches.py)
     add_test(NAME trim_caches COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/trim_caches_test.py")
     # build.yml's LLVM builds, each saved by the step right after it: a later failure or a cancelled run keeps it;

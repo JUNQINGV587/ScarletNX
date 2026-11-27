@@ -35,6 +35,7 @@ docs/dev/frostpunk-assets.md for the measured evidence.
 """
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import shutil
@@ -147,6 +148,7 @@ class DatSet:
         self.names = {}
         self.header = b""
         self.gaps = []          # (offset, length) bytes no record owns
+        self._by_id = None
         self.load()
 
     # -- reading ---------------------------------------------------------
@@ -168,6 +170,7 @@ class DatSet:
                 % (body, RECORD_SIZE))
         self.header = idx[:IDX_MAGIC_SIZE]
         self.records = []
+        self._by_id = None
         for i in range(body // RECORD_SIZE):
             off = IDX_MAGIC_SIZE + i * RECORD_SIZE
             rec = idx[off:off + RECORD_SIZE]
@@ -202,11 +205,18 @@ class DatSet:
         if end < size:
             self.gaps.append((end, size - end))
 
+    def record_map(self):
+        """The records by id, for a caller that looks up many of them."""
+        if self._by_id is None:
+            self._by_id = {rec.rid: rec for rec in self.records}
+        return self._by_id
+
     def by_id(self, rid):
-        for rec in self.records:
-            if rec.rid == rid:
-                return rec
-        raise ContainerError(self.idx_path, "no record with id 0x%08x" % rid)
+        rec = self.record_map().get(rid)
+        if rec is None:
+            raise ContainerError(self.idx_path,
+                                 "no record with id 0x%08x" % rid)
+        return rec
 
     def by_name(self, name):
         for rec in self.records:
@@ -266,13 +276,19 @@ class DatSet:
         return payload
 
     # -- writing ---------------------------------------------------------
-    def write(self, out_dir, replacements=None, compress_level=18):
+    def write(self, out_dir, replacements=None, compress_level=18, pad_to=None):
         """Write the set to `out_dir`, optionally replacing payloads.
 
         `replacements` maps a record to its new payload bytes.  Blocks are
         rewritten in their original order; a block that grows or shrinks moves
         the blocks after it, so the index is rebuilt with the new offsets and
         the leftover bytes of the original file are kept out.
+
+        `pad_to` appends zero bytes until the `.dat` is that long, because a
+        file shorter than the one it replaces is what the game refuses to read
+        (see `cmd_apply_bc3`).  The index does not describe the padding, which
+        is why a caller that pads measures the block bytes apart from the file
+        size.
         """
         replacements = replacements or {}
         os.makedirs(out_dir, exist_ok=True)
@@ -293,6 +309,8 @@ class DatSet:
             rec.stored = len(block)
             rec.payload = len(payload)
             blob += block
+        if pad_to is not None and len(blob) < pad_to:
+            blob += bytes(pad_to - len(blob))
         with open(dat_path, "wb") as fh:
             fh.write(blob)
         out = bytearray(self.header)
@@ -1988,6 +2006,364 @@ def cmd_apply(args):
     return 0
 
 
+# -- writing format 72 as BC3 in the block-linear layout -------------------
+#
+# Format 72 is not ASTC 4x4: a level's bytes are BC3 (DXT5) blocks in NVN's
+# block-linear layout, the layout src/nx/gpu/texture/blocklinear.h describes
+# and `frostpunk_bl.py` ports.  A level of `w` by `h` texels takes
+# `bl_level_size(w, h, 4, level)` bytes, which is the 16-byte blocks of
+# ceil(w/4) by ceil(h/4) laid out in GOBs of 512 bytes, whole blocks of 2^bh
+# GOB rows high, with the block height shrunk for the small levels of a chain.
+#
+# On `buildings/generator/bld_generator_000_lv1_alb_01.texture` (1024x1024, 11
+# levels, format 72) the levels take 1,048,576 + 262,144 + 65,536 + 16,384 +
+# 4,096 + 1,024 + 512 + 512 + 512 + 512 + 512 = 1,400,320 bytes, which is the
+# payload length less its 28-byte header and exactly the header's +24 field.
+# Reading those levels back with `unswizzle` and writing them out again with
+# `swizzle` reproduces the payload byte for byte, which is what proves the
+# layout.
+#
+# A replacement is therefore the PC image, decoded, cut down to a size the
+# package can carry, encoded to BC3 and written back in that layout, level
+# after level.  `apply` (above) writes ASTC blocks instead, which is what
+# format 72 was read as before the layout was measured; it stays for the
+# textures whose pixels are not format 72 and for the record of that reading.
+BC3_BLOCK = 4
+BC3_BYTES_PER_BLOCK = 16
+BC3_BLOCK_HEIGHT = 4
+BC3_PC_FORMATS = ("dxt1", "dxt3", "dxt5")
+BC3_PC_LABELS = {"dxt1": "BC1/DXT1", "dxt3": "BC2/DXT3", "dxt5": "BC3/DXT5"}
+DEFAULT_BC3_MAX_SIZE = 2048
+BC3_PAD_REASON = (
+    "a .dat shorter than the one it replaces is what the game refuses to read: "
+    "nn::fs::ReadFile fails with 0x177a02 at load")
+
+_BC3 = None
+
+
+def bc3_layout():
+    """The layout and codec module that sits next to this script."""
+    global _BC3
+    if _BC3 is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "frostpunk_bl.py")
+        spec = importlib.util.spec_from_file_location("frostpunk_bl", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _BC3 = module
+    return _BC3
+
+
+def bc3_levels(width, height):
+    """The levels a BC3 chain of this size has: one per halving, down to 1x1."""
+    levels = 1
+    while max(width >> levels, height >> levels) >= 1:
+        levels += 1
+    return levels
+
+
+def bc3_level_dims(width, height, level):
+    """The texel size of one level of the chain."""
+    return max(width >> level, 1), max(height >> level, 1)
+
+
+def bc3_level_bh(height, level):
+    """The block height a level is stored with: the texture's, shrunk for small levels."""
+    return bc3_layout().level_blocks(0, BC3_BLOCK_HEIGHT, level, height)
+
+
+def bc3_level_bytes(width, height, level):
+    """The bytes one level of a `width` by `height` chain takes."""
+    level_w, level_h = bc3_level_dims(width, height, level)
+    return bc3_layout().level_bytes(level_w, level_h,
+                                    bc3_level_bh(height, level))
+
+
+def bc3_chain_bytes(width, height, levels=None):
+    """The pixel bytes a `width` by `height` block takes, every level or the first `levels`.
+
+    A block may declare fewer levels than the chain could hold: 2629 of the
+    shipped format-72 blocks hold level 0 alone.  The bytes of a shorter chain
+    are the bytes of the same levels in the same order.
+    """
+    if levels is None:
+        levels = bc3_levels(width, height)
+    return sum(bc3_level_bytes(width, height, level)
+               for level in range(levels))
+
+
+def build_bc3_payload(original, width, height, pixels):
+    """A format-72 payload: every level of `pixels` as BC3, in the block-linear layout.
+
+    The header of the block being replaced is kept except the three fields
+    that describe the pixels: the size at +12/+14, the level count at +19 and
+    the pixel bytes at +24.  The magic, the format id, the descriptor and the
+    fields the package does not document keep their old values.
+    """
+    layout = bc3_layout()
+    levels = bc3_levels(width, height)
+    level_w, level_h, image = width, height, pixels
+    body = bytearray()
+    for level in range(levels):
+        if level:
+            new_w, new_h = bc3_level_dims(width, height, level)
+            image = layout.resample(image, level_w, level_h, new_w, new_h)
+            level_w, level_h = new_w, new_h
+        blocks = layout.dxt5_encode(image, level_w, level_h)
+        written = layout.swizzle(blocks, level_w, level_h,
+                                 bc3_level_bh(height, level))
+        want = bc3_level_bytes(width, height, level)
+        if len(written) != want:
+            raise ContainerError(
+                "bc3", "level %d of %dx%d takes %d bytes, the layout gave %d"
+                % (level, width, height, want, len(written)))
+        body += written
+    header = bytearray(original[:TEXTURE_HEADER_SIZE])
+    struct.pack_into("<HH", header, 12, width, height)
+    header[19] = levels
+    struct.pack_into("<I", header, 24, len(body))
+    return bytes(header) + bytes(body)
+
+
+def bc3_target_dims(max_size, switch_size, pc_size):
+    """The size a BC3 replacement is written at, or `None` and why it cannot be.
+
+    The PC image is the source, so the target is the PC size with its longest
+    side capped at `max_size`; a replacement never comes out smaller than the
+    Switch texture it stands in for, because that would lose detail the
+    package already has.  Nothing is rounded to a power of two: the layout
+    rounds up per block, so a 1010x534 image is a normal case.
+    """
+    pc_w, pc_h = pc_size
+    longest = max(pc_w, pc_h)
+    if longest <= max_size:
+        width, height = pc_w, pc_h
+    else:
+        width = max(1, min(max_size, (pc_w * max_size + longest // 2) // longest))
+        height = max(1, min(max_size, (pc_h * max_size + longest // 2) // longest))
+    switch_w, switch_h = switch_size
+    if width < switch_w or height < switch_h:
+        return None, ("would be %dx%d, smaller than the Switch texture %dx%d; "
+                      "raise --max-size (it is %d) or leave this texture alone"
+                      % (width, height, switch_w, switch_h, max_size))
+    return (width, height), None
+
+
+def apply_bc3_entry(entry, switch, pc, max_size):
+    """One plan entry to its replacement payload, or a `ContainerError`."""
+    plan_id = int(entry["id"], 16)
+    where = "%s %s" % (entry["id"], entry["name"])
+    record = switch.record_map().get(plan_id)
+    if record is None:
+        raise ContainerError(where, "is not in the Switch package")
+    original = switch.read_payload(record)
+    texture = switch_texture(original)
+    if texture is None:
+        raise ContainerError(where, "is not a Switch texture block")
+    if texture.format != SWITCH_FORMAT_ASTC_4X4:
+        raise ContainerError(
+            where,
+            "is stored as %s (format %d), not format 72, so it does not hold "
+            "the BC3 blocks this command writes and is left alone"
+            % (texture.label, texture.format))
+    chain = bc3_chain_bytes(texture.width, texture.height)
+    levels = bc3_levels(texture.width, texture.height)
+    if texture.mips > levels:
+        raise ContainerError(
+            where,
+            "declares %d level(s); %dx%d has a chain of %d, so its pixels are "
+            "not that layout and are left alone"
+            % (texture.mips, texture.width, texture.height, levels))
+    # A block holds its declared levels or a whole number of copies of them:
+    # a cube map or a texture array carries one copy a face, and this command
+    # encodes one image, so those are refused rather than guessed at.
+    own = bc3_chain_bytes(texture.width, texture.height, texture.mips)
+    if own and texture.pixel_bytes != own and not texture.pixel_bytes % own:
+        raise ContainerError(
+            where,
+            "holds %d copies of its %d-level chain (%s bytes each), a cube map "
+            "or a texture array, which this command does not encode"
+            % (texture.pixel_bytes // own, texture.mips, format(own, ",")))
+    if texture.pixel_bytes != own:
+        raise ContainerError(
+            where,
+            "declares %d level(s) and %s pixel bytes; %dx%d in the block-linear "
+            "layout at block height %d is %s bytes, so its pixels are not that "
+            "layout and are left alone"
+            % (texture.mips, format(texture.pixel_bytes, ","), texture.width,
+               texture.height, BC3_BLOCK_HEIGHT, format(own, ",")))
+    source = pc.record_map().get(plan_id)
+    if source is None:
+        raise ContainerError(where, "has no record in the PC package")
+    payload = pc.read_payload(source)
+    image = describe_pc_image(payload)
+    if image is None:
+        raise ContainerError(
+            where, "is not an image payload on the PC side, so there is "
+                   "nothing to encode")
+    if image.fmt not in BC3_PC_FORMATS:
+        raise ContainerError(
+            where,
+            "is %s on the PC side, not BC1, BC2 or BC3 blocks, so it is not "
+            "an image to encode again" % image.label)
+    width, height, pixels = decode_pc_level0(payload, where)
+    target, why = bc3_target_dims(max_size, (texture.width, texture.height),
+                                  (width, height))
+    if target is None:
+        raise ContainerError(where, why)
+    replacement = build_bc3_payload(original, target[0], target[1], pixels)
+    return replacement, {
+        "id": entry["id"], "name": entry["name"] or "",
+        "switch": [texture.width, texture.height],
+        "pc": [width, height],
+        "target": [target[0], target[1]],
+        "levels": bc3_levels(target[0], target[1]),
+        "pc_format": image.label,
+        "old": len(original), "new": len(replacement),
+    }
+
+
+def render_apply_bc3(report, fmt):
+    """The report of one `apply-bc3` run, as text or as JSON."""
+    if fmt == "json":
+        return json.dumps(report, indent=2, sort_keys=False) + "\n"
+    out = ["switch    %s" % report["switch"],
+           "pc        %s" % report["pc"],
+           "plan      %s (%s entries)"
+           % (report["plan"], format(report["planned"], ",")),
+           "replaced  %s of %s" % (format(report["count"], ","),
+                                   format(report["attempted"], ",")),
+           "levels    %s" % format(report["levels"], ","),
+           "old payload %s bytes, new payload %s bytes, net %+d"
+           % (format(report["old_bytes"], ","),
+              format(report["new_bytes"], ","),
+              report["new_bytes"] - report["old_bytes"]),
+           "on disk   %s bytes%s"
+           % (format(report["on_disk"], ","),
+              "" if not report["padding"]
+              else ", %s of padding to reach %s"
+                   % (format(report["padding"], ","),
+                      format(report["pad_to"], ","))),
+           "time      %.1f s (encode %.1f s, write %.1f s)"
+           % (report["elapsed"], report["encoded"], report["write"])]
+    if report["padding"]:
+        out.append("padding   %s" % BC3_PAD_REASON)
+    if report["beyond"]:
+        out.append(
+            "note      %s record(s) end past the %s bytes of the file they "
+            "replace, by %s bytes in all; a loader that bounds its reads by "
+            "the size it knows would not reach them"
+            % (format(report["beyond"], ","),
+               format(report["replaced_size"], ","),
+               format(report["beyond_bytes"], ",")))
+    if report["refused"]:
+        groups = {}
+        for row in report["refused"]:
+            groups.setdefault(row["reason"], []).append(row["id"])
+        out.append("refused   %s" % format(len(report["refused"]), ","))
+        for reason in sorted(groups):
+            out.append("  %s  %s" % (format(len(groups[reason]), ","), reason))
+            out.append("           ids: %s" % " ".join(sorted(groups[reason])))
+    if report["entries"]:
+        out.append("replacements:")
+        for row in report["entries"]:
+            out.append("  %s %-38s %4dx%-4d -> %4dx%-4d %2d lv %12s -> "
+                       "%12s %+13s"
+                       % (row["id"], _short_name(row["name"]), row["switch"][0],
+                          row["switch"][1], row["target"][0],
+                          row["target"][1], row["levels"],
+                          format(row["old"], ","), format(row["new"], ","),
+                          format(row["new"] - row["old"], ",")))
+    return "\n".join(out) + "\n"
+
+
+def cmd_apply_bc3(args):
+    """Write a replacement container set from a plan, format 72 as BC3 blocks.
+
+    The `.dat` is padded to the length of the one it replaces by default: the
+    loader asks for the file's length from the RomFS and fails the load with
+    `nn::fs::ReadFile` 0x177a02 when the rewritten file is shorter, even
+    though every offset in the index is right.  The padding is not described
+    by the index, so the block bytes and the file size are reported apart.
+    """
+    header, entries = read_plan(args.plan)
+    switch_path = args.switch or header.get("switch")
+    pc_path = args.pc or header.get("pc")
+    if not switch_path or not pc_path:
+        raise ContainerError(
+            args.plan, "does not name the two packages; pass --switch and --pc")
+    switch = DatSet(switch_path)
+    pc = DatSet(pc_path)
+    planned = len(entries)
+    entries = entries[:args.limit] if args.limit else entries
+    started = time.time()
+    replacements, rows, refused = {}, [], []
+    for entry in entries:
+        try:
+            replacement, row = apply_bc3_entry(entry, switch, pc,
+                                               args.max_size)
+        except ContainerError as err:
+            if args.fail_fast:
+                raise
+            refused.append({"id": entry["id"],
+                            "name": entry.get("name") or "",
+                            "reason": err.why})
+            continue
+        replacements[int(entry["id"], 16)] = replacement
+        rows.append(row)
+    encoded = time.time() - started
+    if not replacements:
+        said = "; ".join("%s: %s" % (row["id"], row["reason"])
+                         for row in refused[:5])
+        raise ContainerError(args.plan, "no entry could be replaced: %s" % said)
+    pad_to = None if args.no_pad else (
+        args.pad_to if args.pad_to is not None
+        else os.path.getsize(switch.dat_path))
+    dat_path, idx_path = switch.write(args.out, replacements, pad_to=pad_to)
+    elapsed = time.time() - started
+    on_disk = os.path.getsize(dat_path)
+    written = DatSet(dat_path)
+    accounted = sum(record.stored for record in written.records)
+    if accounted > on_disk:
+        raise ContainerError(
+            dat_path, "holds %d bytes but its index accounts for %d"
+            % (on_disk, accounted))
+    # Padding fixes a file that is too short, but a replacement that grows the
+    # blocks moves the tail past the length of the file it replaces.  Whether
+    # that is reachable depends on how the loader sizes the file, which this
+    # command cannot know, so the report counts the blocks that sit past it.
+    replaced_size = os.path.getsize(switch.dat_path)
+    beyond = [record for record in written.records
+              if record.offset + record.stored > replaced_size]
+    report = {
+        "switch": switch_path,
+        "pc": pc_path,
+        "plan": args.plan,
+        "planned": planned,
+        "attempted": len(entries),
+        "count": len(rows),
+        "max_size": args.max_size,
+        "levels": sum(row["levels"] for row in rows),
+        "old_bytes": sum(row["old"] for row in rows),
+        "new_bytes": sum(row["new"] for row in rows),
+        "on_disk": on_disk,
+        "pad_to": pad_to,
+        "padding": on_disk - accounted,
+        "replaced_size": replaced_size,
+        "beyond": len(beyond),
+        "beyond_bytes": sum(record.offset + record.stored - replaced_size
+                            for record in beyond),
+        "encoded": round(encoded, 2),
+        "write": round(elapsed - encoded, 2),
+        "elapsed": round(elapsed, 2),
+        "entries": rows,
+        "refused": refused,
+        "dat": dat_path, "idx": idx_path,
+    }
+    sys.stdout.write(render_apply_bc3(report, args.format))
+    return 0
+
+
 def cmd_extract(args):
     ds = DatSet(args.dat)
     rec = ds.resolve(args.what)
@@ -2286,6 +2662,33 @@ def main(argv=None):
                    help="only the first entries of the plan")
     p.add_argument("--format", choices=("table", "json"), default="table")
     p.set_defaults(func=cmd_apply)
+
+    p = sub.add_parser(
+        "apply-bc3",
+        help="write the replacement container set a plan describes, "
+             "format 72 as BC3 blocks in the block-linear layout")
+    p.add_argument("--plan", required=True,
+                   help="the plan file made by the plan command")
+    p.add_argument("--out", required=True,
+                   help="directory for the new .dat and .idx")
+    p.add_argument("--switch", help="the Switch .dat (default: from the plan)")
+    p.add_argument("--pc", help="the PC .dat (default: from the plan)")
+    p.add_argument("--max-size", type=int, default=DEFAULT_BC3_MAX_SIZE,
+                   help="largest side of a replacement, which is the PC size "
+                        "when it fits and never below the Switch size "
+                        "(default: %(default)s)")
+    p.add_argument("--pad-to", type=int, metavar="BYTES",
+                   help="pad the .dat to this many bytes (default: the size of "
+                        "the .dat it replaces, which the loader needs)")
+    p.add_argument("--no-pad", action="store_true",
+                   help="leave the .dat at its written length; the game will "
+                        "refuse a file shorter than the one it replaces")
+    p.add_argument("--fail-fast", action="store_true",
+                   help="stop at the first entry that cannot be replaced")
+    p.add_argument("--limit", type=int, default=0,
+                   help="only the first entries of the plan")
+    p.add_argument("--format", choices=("table", "json"), default="table")
+    p.set_defaults(func=cmd_apply_bc3)
 
     args = ap.parse_args(argv)
     try:
