@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* The x86-64 back end's guest functions: what ir_codegen.c's snx_ir_emit makes of a function, without LLVM. Each
+/* The x86-64 back end's guest functions. Each
    basic block's instructions are sailgen's x86-64 emitters' (a64_x64.inc), appended to one SSA region (registers read
    once, flags reused, constants folded) and assembled when the block ends; what joins the blocks is written here: the
    entry's check, the branches (a backward one polling first), the direct and dynamic calls (the dispatch table read
@@ -17,11 +17,11 @@
    values. A C call keeps every pin there, so none is stored around it. Control flow is bytes written here (jumps,
    calls, the frame): the instruction selection derives what computes values.
 
-   The object is ELF x86-64, or COFF of Windows' ABI (x64_elf.h), as LLVM's are: F_<address> global and hidden in the AOT
-   module's units (library.c), so an LLVM unit's function calls one of these and the other way; in a JIT unit local,
-   with the unit's table. A call is a PLT32 relocation, resolved here where the callee is this object's own */
+   The object is ELF x86-64, or COFF of Windows' ABI (x64_elf.h): F_<address> global and hidden in the AOT module's
+   units (library.c), so a unit's function calls another unit's; in a JIT unit local, with the unit's table. A call is a
+   PLT32 relocation, resolved here where the callee is this object's own */
 #include "common/cpu/recompiler/x64/x64_codegen.h"
-#include "common/cpu/recompiler/llvm/link.h"
+#include "common/cpu/recompiler/object/link.h"
 #include "common/cpu/aarch64/a64_decoder.h"
 #include "common/cpu/aarch64/cpu.h"
 #include "common/runtime/interface.h"
@@ -32,7 +32,7 @@
 #include "common/cpu/recompiler/x64/x64_elf.h"
 #if defined(__x86_64__) && defined(SNX_HAVE_X64)
 #if defined(__APPLE__) || defined(_WIN32)
-#include "common/cpu/recompiler/llvm/elf_defs.h"
+#include "common/cpu/recompiler/object/elf_defs.h"
 #else
 #include <elf.h>
 #endif
@@ -55,7 +55,7 @@ int snx_elf_byteswap(unsigned char* object, size_t size, int to_foreign);
 #pragma GCC diagnostic ignored "-Wunused-function"
 #endif
 
-/* a word the emitters can't make (bits.h's sg_fail) takes the function back to LLVM */
+/* a word the emitters can't make (bits.h's sg_fail): the function made again, that word undefined where it runs */
 static _Thread_local jmp_buf* g_fail;
 static _Thread_local const char* g_why; /* what it was */
 #define SG_FAIL_JUMP g_fail
@@ -71,26 +71,35 @@ static inline void sgx_machine_op(SgXAsm* a, int at, const unsigned char* r);
    x86-64's ELF; a call's target and a function's entry in RSI (Windows' RDX); the pins in RBP, R12-R15 (pushed: the
    callee's) and R11, R10 (caller-saved, values' otherwise: reserved, and an exclusive's, an atomic's or CRC32's fixed
    registers), on Windows RDI and RSI (the callee's: no value's and no sequence's); the vector pins in XMM15 down to
-   XMM8 */
+   XMM8; FPSR.QC owed by a region's saturating instructions (mg_qc); RBIT by GFNI (mg_rbit) */
 #define MG_EM EM_X86_64
 #define MG_R_ABS64 R_X86_64_64
 #define MG_WIN64(u) SGX_WIN64(&(u)->g->x)
 #define SGX_FN_TARGET (MG_WIN64(u) ? 2 : 6)
 static const signed char g_pin_hosts[2][7] = {{5, 12, 13, 14, 15, 11, 10}, {5, 12, 13, 14, 15, 7, 6}};
 #define mg_pin_hosts (g_pin_hosts[MG_WIN64(u)])
+#define MG_ENTRY_STALE 1 /* mg_entry_stale: the entry's stale check without its compare */
 #define MG_NPINS 7
+static const char* const g_gpr_names[16] = {"RAX", "RCX", "RDX", "RBX", "RSP", "RBP", "RSI", "RDI",
+                                            "R8",  "R9",  "R10", "R11", "R12", "R13", "R14", "R15"};
+#define MG_GPR_NAME(r, buf) ((void)(buf), g_gpr_names[(r) & 15])
+#define MG_VREG_PREFIX      "XMM"
 #define MG_NPINS_FIXED (MG_WIN64(u) ? 7 : 5)
 #define MG_PIN_RESERVED(h) ((h) == 10 || (h) == 11)
 #define MG_VPIN(k) (15 - (k))
 #define MG_NVPINS 8
 #define MG_XRESERVED 0u
 #define MG_BOUND 1
+#define MG_QC 1
+#define MG_RBIT mg_rbit
 #define MG_COFF win64
 #define MG_POLL_INLINE 1
 #define MG_JTAB 1
 #define MG_JTAB_CLOBBER (1u << 0 | 1u << (MG_WIN64(u) ? 8 : 2)) /* RAX, RDX (Windows' R8) */
 #define MG_JTAB_LEADERS 24 /* fewer: the dispatch block (measured on an i5-9400: 12 cases, 14 leaders, 17% quicker) */
 static void unit_reloc(void* machine, size_t at, const char* sym, long long addend);
+/* the helpers that compute with the host's floating point (x64_codegen.h's): a function that calls one checks MXCSR */
+#define MG_HOST_FP_HELPER snx_x64_host_fp_helper
 
 #include "common/cpu/recompiler/mach/mach_codegen.inc"
 
@@ -194,6 +203,13 @@ static void state_arg(Unit* u) { sgx_state_arg(&u->a, &u->b); }
 /* RAX = the target (RSI, RDX), and the target = RAX */
 static void mov_rax_target(Unit* u) { byte(u, 0x48), byte(u, 0x89), byte(u, win64(u) ? 0xD0 : 0xF0); }
 static void mov_target_rax(Unit* u) { byte(u, 0x48), byte(u, 0x89), byte(u, win64(u) ? 0xC2 : 0xC6); }
+/* the state's field at off = the target (RSI, RDX): store it where it is, with no scratch */
+static void store_target(Unit* u, int off) {
+    byte(u, 0x48);
+    byte(u, 0x89);
+    byte(u, win64(u) ? 0x93 : 0xB3); /* mov [rbx + disp32], rdx (rsi) */
+    imm(u, off, 4);
+}
 /* the state's field at off = RAX, and RAX = it */
 static void store_rax(Unit* u, int off) {
     byte(u, 0x48);
@@ -319,18 +335,16 @@ static void prologue(Unit* u) {
     if (pushed >> 7 & 1) byte(u, 0x57);                            /* push rdi */
     if (pushed >> 6 & 1) byte(u, 0x56);                            /* push rsi */
     byte(u, 0x48), byte(u, 0x89), byte(u, win64(u) ? 0xCB : 0xFB); /* mov rbx, rdi (rcx) */
-    if (u->again) {
+    if (u->again == 2) {
         /* a frame of a page or more: each page read first, nearest first (sgx_stack_probe) */
         sgx_stack_probe(&u->b);
         u->frame_at = (size_t*)grow(u->frame_at, &u->cap_frame, u->nframe + 1, sizeof *u->frame_at);
         u->frame_at[u->nframe++] = u->b.n - SGX_STACK_PROBE_SIZE + 1;
     }
-    byte(u, 0x48); /* sub rsp, imm32 */
-    byte(u, 0x81);
-    byte(u, 0xEC);
+    sgx_frame(&u->b, 0, u->again); /* four bytes where the frame fits an imm8, seven on the function made again */
     u->frame_at = (size_t*)grow(u->frame_at, &u->cap_frame, u->nframe + 1, sizeof *u->frame_at);
     u->frame_at[u->nframe++] = u->b.n;
-    imm(u, 0, 4);
+    imm(u, 0, u->again ? 4 : 1);
     xsaved(u, 0);
     pins(u, 0);
 }
@@ -340,12 +354,10 @@ static void epilogue(Unit* u) {
     unsigned pushed = pushed_pins(u);
     int n;
     xsaved(u, 1);
-    byte(u, 0x48); /* add rsp, imm32 */
-    byte(u, 0x81);
-    byte(u, 0xC4);
+    sgx_frame(&u->b, 1, u->again);
     u->frame_at = (size_t*)grow(u->frame_at, &u->cap_frame, u->nframe + 1, sizeof *u->frame_at);
     u->frame_at[u->nframe++] = u->b.n;
-    imm(u, 0, 4);
+    imm(u, 0, u->again ? 4 : 1);
     if (pushed >> 6 & 1) byte(u, 0x5E); /* pop rsi */
     if (pushed >> 7 & 1) byte(u, 0x5F); /* pop rdi */
     for (n = 15; n >= 12; --n)
@@ -413,13 +425,13 @@ static void call_sym(Unit* u, const char* sym, int tail) {
     if (!tail) pins(u, 0);
 }
 
-/* if (c->pc != next) return: the callee changed the code it returns to, or left for another pc */
+/* if (c->pc != next) return: the callee changed the code it returns to, or left for another pc. The equal case
+   jumps over the leave, so the leave lies fall-through and takes no jump of its own */
 static void check_return(Unit* u, SnxU64 next) {
     int stay = new_label(u), go = new_label(u);
     mov_rax_imm(u, next);
     byte(u, 0x48), byte(u, 0x39), byte(u, 0x83), imm(u, (long long)offsetof(CPU, pc), 4); /* cmp [rbx+pc], rax */
-    jcc(u, 0x5, go);
-    jmp(u, stay);
+    jcc(u, 0x4, stay);                                                                    /* equal: stay */
     bind(u, go);
     leave(u);
     bind(u, stay);
@@ -532,19 +544,34 @@ static void mg_brk(Unit* u, SnxU64 address, unsigned imm16) {
     mov_arg2_imm(u, imm16);
     call_rt(u, (int)offsetof(RtAPI, brk));
 }
+/* if (snx_stale[index]) { c->pc = e; return; }: all the entry of a function nothing enters but at its start */
+static void mg_entry_stale(Unit* u, size_t index) {
+    int live = new_label(u);
+    stale_test(u, index);
+    jcc(u, 0x4, live);
+    store_target(u, (int)offsetof(CPU, pc));
+    epilogue(u); /* no pin changed yet (and not every one loaded): none stored */
+    byte(u, 0xC3);
+    bind(u, live);
+}
+/* a function with floating point of the host's (mg_finish): the host's FP environment at its entry, after the stale
+   check, before its code, whichever way it is entered */
+static void mg_entry_fp(Unit* u) {
+    if (!u->fp_entry) return;
+    if (u->a.slots_max < 1) u->a.slots_max = 1; /* the frame's first slot, SNX_X64_MXCSR_ENTRY's */
+    sgx_bytes(&u->b, SNX_X64_MXCSR_ENTRY);
+}
 static void mg_entry(Unit* u, size_t index, SnxU64 start) {
-    if (u->options->stale) {
-        int live = new_label(u);
-        stale_test(u, index);
-        jcc(u, 0x4, live);
-        mov_rax_target(u);
-        store_rax(u, (int)offsetof(CPU, pc));
-        epilogue(u); /* no pin changed yet (and not every one loaded): none stored */
-        byte(u, 0xC3);
-        bind(u, live);
+    if (u->options->stale) mg_entry_stale(u, index);
+    mg_entry_fp(u);
+    if (start < 0x80000000u) {
+        /* cmp rsi (rdx), imm32: sign extended, so no scratch register and no mov */
+        byte(u, 0x48), byte(u, 0x81), byte(u, win64(u) ? 0xFA : 0xFE);
+        imm(u, (long long)start, 4);
+    } else {
+        mov_rax_imm(u, start);
+        byte(u, 0x48), byte(u, 0x39), byte(u, win64(u) ? 0xC2 : 0xC6);
     }
-    mov_rax_imm(u, start);
-    byte(u, 0x48), byte(u, 0x39), byte(u, win64(u) ? 0xC2 : 0xC6); /* cmp rsi, rax */
     jcc(u, 0x5, u->mismatch_label);
 }
 /* cmp rax, value (RDX the value where it is no imm32) */
@@ -582,8 +609,7 @@ static void mg_dispatch(Unit* u, int lab0) {
     const SnxFunction* f = u->f;
     size_t i;
     if (u->dispatch) {
-        mov_rax_target(u);
-        store_rax(u, (int)offsetof(CPU, pc));
+        store_target(u, (int)offsetof(CPU, pc));
         jmp(u, u->d_label);
     } else
         calldyn(u, 1);
@@ -624,18 +650,27 @@ static void mg_dispatch(Unit* u, int lab0) {
 }
 static int mg_finish(Unit* u, size_t fix0) {
     size_t i;
+    int again = 0, size, small;
+    /* floating point of the host's and no check at the entry: made again with it, the frame's first slot its */
+    if (u->host_fp && !u->fp_entry) {
+        if (u->a.slots_max < 1) u->a.slots_max = 1;
+        u->fp_entry = again = 1;
+    }
     /* RSP 16-aligned in the body: the return address and RBX, and the pushed pins' registers: 8 more where those are
        an odd number of doublewords */
-    int size = ((u->a.slots_max * 8 + 15) & ~15) + (int)snx_popcount64(pushed_pins(u)) % 2 * 8;
-    if (win64(u) && size >= 4096 && !u->again) {
-        u->again = 1; /* a page or more, whose prologue reads each page first (the guard page): made again with it */
-        return 0;
-    }
+    size = ((u->a.slots_max * 8 + 15) & ~15) + (int)snx_popcount64(pushed_pins(u)) % 2 * 8;
+    small = !u->again; /* the first make has four-byte frame instructions, the one again seven */
+    /* an imm8 can't hold it: made again with imm32 ones (1), and on Windows a frame of a page or more with the prologue
+       that reads each page first (2) */
+    if (small && size > 127) u->again = again = win64(u) && size >= 4096 ? 2 : 1;
+    if (again) return 0;
     for (i = 0; i < u->nframe; ++i)
-        if (u->frame_at[i] + 4 <= u->b.cap) {
-            unsigned char* p = u->b.p + u->frame_at[i];
-            p[0] = (unsigned char)size, p[1] = (unsigned char)(size >> 8), p[2] = (unsigned char)(size >> 16),
-            p[3] = (unsigned char)(size >> 24);
+        if (u->frame_at[i] + (small ? 1 : 4) <= u->b.cap) {
+            if (!i && !size) { /* no frame: a four-byte NOP in the prologue, as x64_elf.c's unwind reader knows */
+                unsigned char* p = u->b.p + u->frame_at[i] - 3;
+                p[0] = 0x0F, p[1] = 0x1F, p[2] = 0x40, p[3] = 0x00;
+            } else
+                sgx_frame_patch(&u->b, u->frame_at[i], size, u->again);
         }
     for (i = fix0; i < u->nfixups; ++i) {
         long long t = u->label_at[u->fixups[i].label];
@@ -663,36 +698,36 @@ static struct {
     _Atomic unsigned without;
     _Atomic int win64;
 } g_x64_codegen;
-/* the back end's SSE code needs SSSE3 and SSE4.1 (2008's processors), and SSE4.2, PCLMULQDQ and POPCNT */
-#define X64_BASELINE (SGX_F_SSE3 | SGX_F_SSSE3 | SGX_F_SSE41 | SGX_F_SSE42 | SGX_F_PCLMUL | SGX_F_POPCNT)
-int snx_x64_available(void) {
-    return (host_features() & X64_BASELINE) == X64_BASELINE;
+/* the back end's code needs SSE2, which every x86-64 processor has: none is below it but a test's (snx_x64_without) */
+static const SnxNativeFeature k_x64_floor[] = {{"SSE2", SGX_F_SSE2}};
+/* and does without these, the instructions of them it uses its helpers' (x64.h's sgx_vf_helped_forms). Android's x86_64
+   ABI (x86-64-v2, developer.android.com/ndk/guides/abis) has all of the floor's and none of these */
+static const SnxNativeFeature k_x64_helped[] = {
+    {"SSSE3", SGX_F_SSSE3}, {"SSE4.1", SGX_F_SSE41}, {"SSE4.2", SGX_F_SSE42}, {"PCLMULQDQ", SGX_F_PCLMUL}};
+int snx_x64_floor(char* why, size_t size) {
+    return snx_native_lacks(k_x64_floor, sizeof k_x64_floor / sizeof *k_x64_floor, host_features(), why, size);
 }
+int snx_x64_fallback(char* why, size_t size) {
+    return snx_native_done(k_x64_helped, sizeof k_x64_helped / sizeof *k_x64_helped, host_features(), why, size);
+}
+int snx_x64_available(void) { return !snx_x64_floor(NULL, 0); }
 unsigned snx_x64_features(void) { return host_features(); }
 int snx_x64_win64(void) { return snx_x64_available() && (host_features() & SGX_F_WIN64); }
 void snx_x64_without(unsigned features) {
-    atomic_store_explicit(&g_x64_codegen.without, features & ~(unsigned)(X64_BASELINE | SGX_F_WIN64),
-                          memory_order_relaxed);
+    atomic_store_explicit(&g_x64_codegen.without, features & ~(unsigned)SGX_F_WIN64, memory_order_relaxed);
 }
 void snx_x64_set_win64(int on) { atomic_store_explicit(&g_x64_codegen.win64, on, memory_order_relaxed); }
 
-/* CPUID's BMI1, BMI2, SHA and LZCNT (ABM), and Windows' ABI */
-static unsigned host_features(void) {
-    unsigned a, b, c, d, f = 0;
-#if defined(_WIN32)
-    f |= SGX_F_WIN64;
-#else
-    if (atomic_load_explicit(&g_x64_codegen.win64, memory_order_relaxed)) f |= SGX_F_WIN64;
-#endif
-    __asm__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(7), "c"(0));
-    if (b & (1u << 3)) f |= SGX_F_BMI1;
-    if (b & (1u << 8)) f |= SGX_F_BMI2;
-    if (b & (1u << 29)) f |= SGX_F_SHA;
-    __asm__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000001u), "c"(0));
-    if (c & (1u << 5)) f |= SGX_F_LZCNT;
-    /* leaf 1's: SSE3, PCLMULQDQ, SSSE3, SSE4.1, SSE4.2, POPCNT, AES; the VEX forms' (AVX, FMA, F16C) where the system
-       keeps the YMM state (OSXSAVE, and XCR0's SSE and AVX bits) */
-    __asm__("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1), "c"(0));
+unsigned snx_x64_features_of(const unsigned leaf1[4], const unsigned leaf7[4], unsigned leaf7_1a, const unsigned ext1[4],
+                             unsigned xcr0) {
+    const unsigned c = leaf1[2];
+    unsigned f = 0;
+    if (leaf7[1] & (1u << 3)) f |= SGX_F_BMI1;
+    if (leaf7[1] & (1u << 8)) f |= SGX_F_BMI2;
+    if (leaf7[1] & (1u << 29)) f |= SGX_F_SHA;
+    if (leaf7[2] & (1u << 8)) f |= SGX_F_GFNI;
+    if (ext1[2] & (1u << 5)) f |= SGX_F_LZCNT;
+    if (leaf1[3] & (1u << 26)) f |= SGX_F_SSE2;
     if (c & 1u) f |= SGX_F_SSE3;
     if (c & (1u << 1)) f |= SGX_F_PCLMUL;
     if (c & (1u << 9)) f |= SGX_F_SSSE3;
@@ -700,15 +735,40 @@ static unsigned host_features(void) {
     if (c & (1u << 20)) f |= SGX_F_SSE42;
     if (c & (1u << 23)) f |= SGX_F_POPCNT;
     if (c & (1u << 25)) f |= SGX_F_AES;
-    if ((c & (1u << 27)) && (c & (1u << 28))) {
-        unsigned lo, hi;
-        __asm__("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
-        if ((lo & 6) == 6) {
-            f |= SGX_F_AVX;
-            if (c & (1u << 12)) f |= SGX_F_FMA;
-            if (c & (1u << 29)) f |= SGX_F_F16C;
-        }
+    /* the VEX forms' (AVX, FMA, F16C, leaf 7's AVX2 and its subleaf 1's SM4) where the system keeps the YMM state:
+       OSXSAVE, and XCR0's SSE and AVX bits */
+    if ((c & (1u << 27)) && (c & (1u << 28)) && (xcr0 & 6) == 6) {
+        f |= SGX_F_AVX;
+        if (c & (1u << 12)) f |= SGX_F_FMA;
+        if (c & (1u << 29)) f |= SGX_F_F16C;
+        if (leaf7[1] & (1u << 5)) f |= SGX_F_AVX2;
+        if (leaf7_1a & (1u << 2)) f |= SGX_F_SM4;
     }
+    return f;
+}
+static void cpuid(unsigned leaf, unsigned r[4]) {
+    __asm__("cpuid" : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3]) : "a"(leaf), "c"(0));
+}
+/* this processor's, and Windows' ABI */
+static unsigned host_features(void) {
+    unsigned leaf0[4], leaf1[4], leaf7[4] = {0, 0, 0, 0}, leaf7_1[4] = {0, 0, 0, 0}, ext1[4], xcr0 = 0, f = 0;
+#if defined(_WIN32)
+    f |= SGX_F_WIN64;
+#else
+    if (atomic_load_explicit(&g_x64_codegen.win64, memory_order_relaxed)) f |= SGX_F_WIN64;
+#endif
+    /* leaf 7 where leaf 0 says there is one: past the last, Intel's answer the last's; its subleaf 1 where its EAX
+       says there is one */
+    cpuid(0, leaf0), cpuid(1, leaf1), cpuid(0x80000001u, ext1);
+    if (leaf0[0] >= 7) cpuid(7, leaf7);
+    if (leaf0[0] >= 7 && leaf7[0] >= 1)
+        __asm__("cpuid" : "=a"(leaf7_1[0]), "=b"(leaf7_1[1]), "=c"(leaf7_1[2]), "=d"(leaf7_1[3]) : "a"(7), "c"(1));
+    if ((leaf1[2] & (1u << 27)) && (leaf1[2] & (1u << 28))) {
+        unsigned hi;
+        __asm__("xgetbv" : "=a"(xcr0), "=d"(hi) : "c"(0));
+        (void)hi;
+    }
+    f |= snx_x64_features_of(leaf1, leaf7, leaf7_1[0], ext1, xcr0);
     return f & ~atomic_load_explicit(&g_x64_codegen.without, memory_order_relaxed);
 }
 
@@ -758,10 +818,8 @@ void snx_x64_unit_facts(const SnxCodegen* codegen, size_t first, size_t last, co
     fact64(put, user, (SnxU64)options->jit);
     if (options->jit && options->table_name) put(user, options->table_name, strlen(options->table_name) + 1);
     fact64(put, user, (SnxU64)options->stale);
-    fact64(put, user, (SnxU64)options->alone);
     fact64(put, user, options->without_count);
     if (options->without_count) put(user, options->without, options->without_count * sizeof *options->without);
-    fact64(put, user, options->llvm_at);
     fact64(put, user, first);
     fact64(put, user, last);
     for (i = first; i < last; ++i) {
@@ -796,7 +854,20 @@ void snx_x64_unit_facts(const SnxCodegen* codegen, size_t first, size_t last, co
 
 #else
 int snx_x64_available(void) { return 0; }
+int snx_x64_floor(char* why, size_t size) {
+    if (size) why[0] = 0;
+    return 0;
+}
+int snx_x64_fallback(char* why, size_t size) {
+    if (size) why[0] = 0;
+    return 0;
+}
 unsigned snx_x64_features(void) { return 0; }
+unsigned snx_x64_features_of(const unsigned leaf1[4], const unsigned leaf7[4], unsigned leaf7_1a, const unsigned ext1[4],
+                             unsigned xcr0) {
+    (void)leaf1, (void)leaf7, (void)leaf7_1a, (void)ext1, (void)xcr0;
+    return 0;
+}
 int snx_x64_win64(void) { return 0; }
 void snx_x64_without(unsigned features) { (void)features; }
 void snx_x64_set_win64(int on) { (void)on; }

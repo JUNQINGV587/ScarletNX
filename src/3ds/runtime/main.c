@@ -15,6 +15,7 @@
 #include "common/utilities/common.h"
 #include "common/platform/file.h"
 #include "common/utilities/game_ini.h"
+#include "3ds/runtime/game_record.h"
 #include "common/utilities/ini_lines.h"
 #include "snx_settings.h"
 #include <errno.h>
@@ -103,12 +104,10 @@ static void usage(FILE* out) {
         "                         Switch's, the same as --jobs N. KEY is the key with a - for each _; the key as\n"
         "                         written, the older spelling, is still read, and said once\n"
         "\n"
-        "On the 3DS, -O is the level of the static blocks LLVM compiles: those this computer's native back end does\n"
-        "not make, and every one with --keep-ir. --chunk N puts N instructions in a chunk, whole blocks (default: 512\n"
-        "blocks a chunk). --jit-cache FILE is the list of the blocks a run compiled at run time that discovery starts\n"
-        "from, another game folder's <title ID>.hints (default: the game's own). --jit-only makes a module of no blocks,\n"
-        "the run-time compiler compiling every one, and --keep-ir has LLVM compile them all and keeps each chunk's IR in\n"
-        "<title ID>_build of the game's folder.\n"
+        "On the 3DS, --chunk N puts N instructions in a chunk, whole blocks (default: 512 blocks a chunk).\n"
+        "--jit-cache FILE is the list of the blocks a run compiled at run time that discovery starts from, another\n"
+        "game folder's <title ID>.hints (default: the game's own). --jit-only makes a module of no blocks, the\n"
+        "run-time compiler compiling every one. -O and --keep-ir, LLVM's, went with it: said, and nothing done.\n"
         "\n"
         "On the 3DS, --update takes an update's or a DLC's CIA (a bare NCCH for an update), given again for each.\n"
         "It is recorded beside the game in its folder and checked in its .ini's addons=, as a Switch game's are,\n"
@@ -474,24 +473,12 @@ bool snx_ctr_title_name(const char* path) {
    why */
 /* What the game's .ini (<folder>/<title ID>.ini) says: the game it plays (source=), *source the caller's, NULL
    without one, and the console (model=), *model kept without one, *named (when given) whether it names one. False
-   only when it cannot be read */
+   only when it cannot be read; what it does not take said */
 static bool read_game_ini_model(const char* folder, char** source, SnxCtrModel* model, bool* named) {
-    char *path = snx_ctr_game_file(folder, ".ini"), *key, *value;
-    size_t size;
-    char* text = path ? (char*)snx_read_file(path, &size) : NULL;
-    bool read = text || (path && !snx_path_exists(path));
-    *source = NULL;
-    SnxIni ini;
-    if (text) snx_ini_start(&ini, text);
-    while (text && snx_ini_next(&ini, &key, &value))
-        if (!strcmp(key, "source") && *value) {
-            free(*source);
-            *source = snx_strdup(value);
-        } else if (!strcmp(key, "model") && (!strcmp(value, "old") || !strcmp(value, "new"))) {
-            *model = !strcmp(value, "old") ? SNX_CTR_OLD : SNX_CTR_NEW;
-            if (named) *named = true;
-        }
-    free(text);
+    char *path = snx_ctr_game_file(folder, ".ini"), said[1024] = "";
+    bool read = path && snx_ctr_record_read(path, source, model, named, said, sizeof said);
+    if (!path) *source = NULL;
+    if (said[0]) fprintf(stderr, "settings: %s\n", said);
     free(path);
     return read;
 }
@@ -509,24 +496,12 @@ static bool own_console(const char* folder, ConsoleFrom from, SnxCtrModel* model
     char *full = snx_absolute(folder), *name = full ? last_part(full) : NULL;
     char *beside = name ? snx_game_ini(full, name) : NULL, *picks = beside ? snx_game_picks(beside) : NULL;
     const char* kept = from != CONSOLE_LAUNCHER ? "auto" : *model == SNX_CTR_OLD ? "old" : "new";
-    char *key, *value, *console = NULL, why[256];
-    SnxIni ini;
-    size_t size;
-    char* text = picks ? (char*)snx_read_file(picks, &size) : NULL;
-    if (!text && picks && snx_path_exists(picks))
-        fprintf(stderr, "settings: %s could not be read (%s): ctr_model keeps %s\n", picks,
-                snx_os_error(why, sizeof why), kept);
-    if (text) {
-        snx_ini_start(&ini, text);
-        while (snx_ini_next(&ini, &key, &value))
-            if (!strcmp(key, "ctr_model"))
-                console = value;
-            else
-                fprintf(stderr,
-                        "settings: %s=%s in %s is no setting a 3DS game's picks take: it is kept there and does "
-                        "nothing\n",
-                        key, value, picks);
-    }
+    char *console = NULL, said[1024] = "";
+    int read = picks ? snx_ctr_picks_console(picks, &console, said, sizeof said) : 0;
+    if (read < 0)
+        fprintf(stderr, "settings: %s: ctr_model keeps %s\n", said, kept);
+    else if (said[0]) /* what another console's or version's picks name besides */
+        fprintf(stderr, "settings: %s\n", said);
     bool own = console && (!strcmp(console, "old") || !strcmp(console, "new"));
     if (own) {
         *model = !strcmp(console, "old") ? SNX_CTR_OLD : SNX_CTR_NEW;
@@ -534,7 +509,7 @@ static bool own_console(const char* folder, ConsoleFrom from, SnxCtrModel* model
                *model == SNX_CTR_OLD ? "an Old" : "a New", console, picks);
     } else if (console && strcmp(console, "auto"))
         fprintf(stderr, "settings: ctr_model=%s in %s is not auto, old or new: it keeps %s\n", console, picks, kept);
-    free(text);
+    free(console);
     free(picks);
     free(beside);
     free(name);
@@ -554,53 +529,12 @@ static SnxCtrModel model_of(const SnxCtrSource* source, const char** why) {
         *why = "its ExHeader asks for the New 3DS's 178 MiB memory mode";
     return *why ? SNX_CTR_NEW : SNX_CTR_OLD;
 }
-/* whether a line of the game's .ini sets one of the keys this file writes, which the new values replace */
-static bool game_ini_own_line(const char* line, size_t n) {
-    static const char* const keys[] = {"source", "model", "system"};
-    size_t i;
-    while (n && (*line == ' ' || *line == '\t')) line++, n--;
-    for (i = 0; i < sizeof keys / sizeof keys[0]; ++i) {
-        size_t k = strlen(keys[i]), at;
-        if (n <= k || strncmp(line, keys[i], k)) continue;
-        for (at = k; at < n && (line[at] == ' ' || line[at] == '\t'); ++at) continue;
-        if (at < n && line[at] == '=') return true;
-    }
-    return false;
-}
 /* The keys this file writes, as they are now. The game's .ini's other lines stay, so a setting a player added by hand is
    not lost when a game is played again */
 static bool write_game_ini(const char* folder, const char* source, SnxCtrModel model) {
-    char *path = snx_ctr_game_file(folder, ".ini"), *full = snx_absolute(source);
-    size_t size = 0, n = 0, tail_n = 0;
-    char* old = path && full ? (char*)snx_read_file(path, &size) : NULL;
-    char* tail =
-        full ? snx_format("source=%s\nmodel=%s\nsystem=3ds\n", full, model == SNX_CTR_OLD ? "old" : "new") : NULL;
-    bool read = full && (!path || old || !snx_path_exists(path));
-    char* text = read && tail ? (char*)snx_alloc(size + strlen(tail) + 2) : NULL;
-    if (tail) tail_n = strlen(tail);
-    if (text) {
-        const char* at = old;
-        for (; at && at < old + size;) {
-            const char* end = (const char*)memchr(at, '\n', (size_t)(old + size - at));
-            size_t length = (size_t)((end ? end + 1 : old + size) - at);
-            if (!game_ini_own_line(at, length)) {
-                memcpy(text + n, at, length);
-                n += length;
-            }
-            at += length;
-        }
-        if (n && text[n - 1] != '\n') text[n++] = '\n';
-        memcpy(text + n, tail, tail_n + 1);
-    }
-    bool written = path && text && !snx_write_file(path, text, n + tail_n);
-    if (!written) {
-        char why[256];
-        fprintf(stderr, "scarletnx-3ds: cannot write %s: %s\n", path ? path : "the game's .ini",
-                snx_os_error(why, sizeof why));
-    }
-    free(tail);
-    free(text);
-    free(old);
+    char *path = snx_ctr_game_file(folder, ".ini"), *full = snx_absolute(source), why[1024] = "";
+    bool written = path && full && snx_ctr_record_write(path, full, model, why, sizeof why);
+    if (!written) fprintf(stderr, "scarletnx-3ds: %s\n", why[0] ? why : "the game's .ini: out of memory");
     free(full);
     free(path);
     return written;
@@ -862,8 +796,6 @@ int snx_ctr_main(int argc, char** argv) {
             ini_read(ini_find(g_ctr_run_ini, "ctr_script"), cli.value[SNX_CLI_SCRIPT]);
         else if (common == SNX_CLI_FULLSCREEN)
             ini_read(ini_find(g_display_ini, "fullscreen"), cli.fullscreen ? "1" : "0");
-        else if (common == SNX_CLI_OPT) /* the Switch's settings, as --aot-threads= is: the last given counts */
-            ini_read(ini_find(g_recompile_ini, "opt"), cli.value[SNX_CLI_OPT]);
         else if (common == SNX_CLI_JOBS)
             g_settings.aot_threads = cli.jobs;
         if (common) continue;
@@ -1038,7 +970,7 @@ int snx_ctr_main(int argc, char** argv) {
     /* the Switch's fps_limit, its text as the Switch reads it, the game's clock's pace (board/clock.h) */
     char said[192];
     int pace = snx_ctr_clock_pace();
-    (void)snx_ctr_clock_parse(g_settings.fps_limit, &pace, said, sizeof said);
+    (void)snx_pace_parse(g_settings.fps_limit, &pace, said, sizeof said);
     if (said[0]) fprintf(stderr, "settings: %s\n", said);
     snx_ctr_clock_set_pace(pace);
     if (old_trace)

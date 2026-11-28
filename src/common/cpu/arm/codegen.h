@@ -1,8 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* What an AArch32 block is made for, whichever compiler makes it (llvm.h's, the native back ends' of
-   recompiler/mach/mach_arm.inc): the guest's CPU (arm.h's profiles), how its code reaches guest memory, and what it
-   records as it runs */
+/* What an AArch32 block is made for, by the native back ends (recompiler/mach/mach_arm.inc): the guest's CPU (arm.h's
+   profiles), how its code reaches guest memory, and what it records as it runs */
 #ifndef SNX_ARM_CODEGEN_H
 #define SNX_ARM_CODEGEN_H
 #include "common/cpu/arm/arm.h"
@@ -21,7 +20,7 @@
    - the mapping covers all 2^32 guest addresses and is followed by pages that fault on the host (at least 256 bytes
      of them), so an access that leaves the mapping is a host fault and gets no range check;
    - while a block runs, the SnxArmCPU is reached only through the pointer the block got, so the compiler keeps
-     registers and flags in host registers across guest loads and stores (LLVM's cpu argument is noalias);
+     registers and flags in host registers across guest loads and stores;
    - the dispatch loop has seen to the entry state: r15 is the block's address, CPSR.T is its instruction set, ITSTATE
      is clear (snx_arm_itstate), and exit is SNX_ARM_OK. The block checks and clears none of these.
    CPSR.E is never set by a hosted block: SETEND BE and an MSR that sets E stop with SNX_ARM_ENDIAN_UNSUPPORTED
@@ -54,9 +53,9 @@ static inline int snx_arm_codegen_options_valid(const SnxArmCodegenOptions* o) {
                    (o->profile == SNX_ARM_PROFILE_ARM7TDMI && o->trace && o->skipped && o->trace != o->skipped)));
 }
 /* Options for hosted blocks that go on to the next by themselves, for a runtime whose dispatch loop runs one thread's
-   blocks a slice at a time (the Vita's). The native back ends take these where options.abi says so; LLVM's blocks go on
-   by what their compiler adds to them (vita/aot/compiler.c). poll, lookup and direct are where the runtime keeps a thing
-   past the pointer its blocks get, 0 for none of it:
+   blocks a slice at a time (the Vita's). The native back ends take these where options.abi says so; the fallback's go
+   on by what it adds to them (fallback.h's snx_fallback_arm_chain). poll, lookup and direct are where the runtime keeps
+   a thing past the pointer its blocks get, 0 for none of it:
    - poll: an int32_t, the steps back (to a block at or before the one that ends) the slice may still take. A block counts
      its own down and returns to the loop where they run out, so every loop of blocks ends the slice;
    - lookup (with poll alone): a pointer to a table of SNX_ARM_LOOKUP_SLOTS SnxArmLookups, or null. A target that is none

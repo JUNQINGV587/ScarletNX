@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 /* The menu's Settings: the launcher's own rows and the recompiler's (settings.txt's launcher sections: gdbstub, Extract
-   to tmpfs, Extract dump, the optimization level, the AOT threads and the LLVM Internals page), then every setting of
+   to tmpfs, Extract dump and the AOT threads), then every setting of
    the game's .ini as the runtime lists them (scarletnx --settings, its tables), each a row of the form (editor.h),
    named and its values worded as the game's menu shows them. A setting is the .ini's, passed to no run, while it is at
    its default: a word row's value is one of its words, the default's marked [default]; one whose default has no word
@@ -15,8 +15,9 @@
 #include "gui/theme.h"
 
 /* a row that is no setting: a page's, which opens the section/page rows listed after it, and its All, first on that
-   page, which steps them together */
-enum { GUI_SETTING_PAGE = 1, GUI_SETTING_ALL, GUI_SETTING_SECRET };
+   page, which steps them together; a link, a row of another screen past every setting (gui_settings_link) */
+enum { GUI_SETTING_PAGE = 1, GUI_SETTING_ALL, GUI_SETTING_SECRET, GUI_SETTING_LINK };
+#define GUI_SETTING_LINKS 24  /* the links past count a list of settings has room for */
 #define GUI_SETTING_TEXT 512 /* a typed value's room: the longest of settings.txt's texts the launcher keeps */
 typedef struct {
     int word;                           /* a word row's: the word, 0 the .ini's (a plain row's: its first) */
@@ -28,8 +29,9 @@ typedef struct {
     const char* fallback; /* the runtime's default for the .ini, as the row words it: what it shows while not picked */
     const char* def;      /* that default as the .ini writes it */
     const char* only;     /* where it does something, when not on this system ("macOS only", ini.h's ini_only) */
-    int kind;             /* 0, GUI_SETTING_PAGE, GUI_SETTING_ALL, or GUI_SETTING_SECRET: the Eden room's password,
-                             which is neither the picks' nor a run's option (users/online.ini holds it) */
+    int kind;             /* 0, GUI_SETTING_PAGE, GUI_SETTING_ALL, GUI_SETTING_SECRET: the Eden room's password,
+                             which is neither the picks' nor a run's option (users/online.ini holds it), or
+                             GUI_SETTING_LINK */
     int plain;            /* a word row whose words are its values alone, no .ini's: its default's is no pick */
     int always;           /* plain, and passed to every run, its start too (gui_settings_always) */
     int type_text;        /* the .ini's value is a text, often a folder: gui_settings_debug says its key alone */
@@ -60,7 +62,7 @@ typedef struct {
                            first word Global, no pick. The console it is of, GUI_GAME_*, 0 for the launcher's */
 } GuiSettings;
 /* the consoles whose games have picks of their own */
-enum { GUI_GAME_SWITCH = 1, GUI_GAME_3DS };
+enum { GUI_GAME_SWITCH = 1, GUI_GAME_3DS, GUI_GAME_VITA, GUI_GAME_GBA, GUI_GAME_NDS };
 /* the launcher's own rows and the recompiler's (g_launch_sections, listed by ini_list_text), then the runtime's list of
    the game's settings, a line each (section[/page], key, default, int | float | text, lowest, highest, help, name, the
    values value=word between '|', where it does something when not on this system, what the build needs, slider for a
@@ -73,9 +75,15 @@ int gui_settings_read(GuiSettings* settings, const char* runtime);
    no pick has and the launcher's picks then give (no plain row, no slider). As gui_settings_read: 0, else nonzero */
 int gui_settings_read_game(GuiSettings* settings, const char* runtime);
 /* a game's of console (GUI_GAME_*): a 3DS game's, the settings it has of its own alone (3ds/runtime/main.h's
-   snx_ctr_game_setting, its console), a word row's words Global and those its default is not, which Global gives */
+   snx_ctr_game_setting, its console), a word row's words Global and those its default is not, which Global gives; a
+   Vita's, a GBA's or a DS's, the on-screen controls' it has (common/utilities/vpad_consoles.h) and its touch screen's,
+   each control by the console's name for it */
 int gui_settings_read_console(GuiSettings* settings, const char* runtime, int console);
 void gui_settings_free(GuiSettings* settings);
+/* row count + i (i under GUI_SETTING_LINKS), past the settings and out of their count, made a link: a row of another
+   screen that Settings' search lists, its name, help and value shown, which nothing of the settings reads or writes.
+   Its row, or -1 for an i past them or no list read */
+int gui_settings_link(GuiSettings* settings, int i, const char* name, const char* about, const char* value);
 /* the row of key set to value, a word or a text as the row takes: 1 when it did */
 int gui_settings_set(GuiSettings* settings, const char* key, const char* value);
 /* the rows as they are, the launcher's own choices among them, as the values to start from */
@@ -84,20 +92,24 @@ void gui_settings_mark(GuiSettings* settings);
    .ini's, which it no longer has. Its [default] marks the value it starts with (gui_settings_mark), which Del and a
    reset put back. 1 when it did, 0 for no such row or a value not of its words */
 int gui_settings_always(GuiSettings* settings, const char* key, const char* value);
-/* the picks of a file of them, global or a game's: each key's row set, the others left as they are. What older
-   versions wrote that a plain row reads otherwise is said in old ("; " between, cut where it ends): its .ini, read as
+/* the picks of a file of them, global or a game's: each key's row set, the others left as they are. What it does not
+   take is said in old ("; " between, cut where it ends): a key another version's or program's, a line with no = and a
+   key given twice, named once a run (config_file.h), a value its row has not, with the row's value now, and a file that
+   cannot be read, with the system's reason. What older versions wrote that a plain row reads otherwise too: its .ini, read as
    the value it starts with ("fullscreen=.ini is no longer a value of Fullscreen: fullscreen=0 now"), and its default
    picked, which a run was given over the game's .ini and is now no pick ("docked=1 is the default of TV mode: no run
    is given it over the game's .ini"), and the pick of a key renamed (ini.h's ini_renamed) on its new row while the
    file gives that one none ("vk_descriptors=1 is deprecated: Descriptor buffers is vk_descriptors_mode=1 now"). How
    many, 0 for none */
 int gui_settings_load(GuiSettings* settings, const char* path, char* old, size_t size);
-/* the rows that are not at their start in path, by section; with the launcher's rows alone (the runtime listed none),
-   the keys path holds that no row has after them, as they were, and nonzero for a path it cannot read. 0, else
-   nonzero */
+/* the rows that are not at their start in path, by section, and the lines of the keys path holds that no row has, as
+   they were (config_file.h): another version's or program's, an older version's but a renamed one, whose value its new
+   row has. Nonzero for a path it cannot read, which is never written over, and one it cannot write. 0, else nonzero */
 int gui_settings_save(const GuiSettings* settings, const char* path);
-/* what the file of picks at path holds that no row takes, which the next save leaves out while the runtime's rows are
-   there: a key no row has, or a value its row does not take, as key=value, ", " between. How many */
+/* the same, without an older version's keys (ini.h's ini_deprecated and ini_renamed): Clean Old Settings */
+int gui_settings_clean(const GuiSettings* settings, const char* path);
+/* the keys of an older version the file of picks at path holds, which no row has and gui_settings_clean takes out, as
+   key=value, ", " between. How many */
 int gui_settings_unread(GuiSettings* settings, const char* path, char* out, size_t size);
 /* row back to its start (a page's or an All's: their rows), every row for -1 */
 void gui_settings_reset(GuiSettings* settings, int row);
@@ -164,6 +176,10 @@ size_t gui_settings_ctr_options(GuiSettings* settings, const char** argv);
 /* argv's --key=value for each of the Vita driver's settings picked: its Debug page's (keys that start with vita_). Its
    count */
 size_t gui_settings_vita_options(GuiSettings* settings, const char** argv);
+/* argv's --key=value for each of the on-screen controls' settings picked (Show controls' always, gui_settings_always)
+   and the touch screen's, which a GBA, a DS and a Vita game's driver take (one its console has nothing for said there),
+   --launcher-picks=1 after them, which puts the game's own over them. Its count */
+size_t gui_settings_controls_options(GuiSettings* settings, const char** argv);
 /* the same for a Linux program's run (linux_), an Android app's (android_) and a DS game's (nds_, but the WFC
    service's, which that driver reads from settings.ini) */
 size_t gui_settings_linux_options(GuiSettings* settings, const char** argv);
@@ -174,10 +190,10 @@ const char* gui_settings_tmpfs(const GuiSettings* settings);
 /* Extract dump: --extract-container while it is on, else NULL (a dump read in place, nothing extracted).
    Both drivers take it */
 const char* gui_settings_extract(const GuiSettings* settings);
-/* argv's --key=value for each of the recompiler's settings picked (the optimization level, the AOT threads, LLVM
-   Internals), which the Switch driver takes for a run (which recompiles when it must) and for R's recompile; with
+/* argv's --key=value for each of the recompiler's settings picked (the AOT threads
+   and the like), which the Switch driver takes for a run (which recompiles when it must) and for R's recompile; with
    make, a run that makes the game and plays nothing (-r), each of the game's settings the recompile takes too
-   (settings.txt's recompile: NCE, Debug's SLP vectorizer) picked, which a run gets with the game's options: the game's
+   (settings.txt's recompile: NCE among them) picked, which a run gets with the game's options: the game's
    own pick where its picks beside game_ini (NULL: none) have one, else the launcher's. Their count */
 size_t gui_settings_recompile(GuiSettings* settings, int make, const char* game_ini, const char** argv);
 /* argv's --key=value for each of the recompile's settings every driver that recompiles takes picked: the optimization

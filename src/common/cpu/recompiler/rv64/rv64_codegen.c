@@ -9,8 +9,8 @@
    ELF RISC-V: a call R_RISCV_CALL_PLT (AUIPC and JALR, a tail call's of t6 and x0), resolved here where the callee is
    this object's own; snx_stale's address an R_RISCV_64 in the code */
 #include "common/cpu/recompiler/rv64/rv64_codegen.h"
-#include "common/cpu/recompiler/llvm/link.h"
-#include "common/cpu/recompiler/llvm/elf_object.h"
+#include "common/cpu/recompiler/object/link.h"
+#include "common/cpu/recompiler/object/elf_object.h"
 #include "common/cpu/aarch64/a64_decoder.h"
 #include "common/cpu/aarch64/cpu.h"
 #include "common/runtime/interface.h"
@@ -45,7 +45,7 @@ static inline void sgx_machine_op(SgXAsm* a, int at, const unsigned char* r);
 
 /* ---- what mach_codegen.inc asks of the machine ---- */
 #define MG_EM EM_RISCV
-#define MG_ELF_FLAGS 0x5 /* RVC, the LP64D float ABI: LLVM's riscv64 objects' */
+#define MG_ELF_FLAGS  0x5 /* RVC, the LP64D float ABI */
 #define MG_R_ABS64 SNX_RV_64
 #define MG_R_LITERAL SNX_RV_32_PCREL
 #define MG_R_CALL SNX_RV_CALL_PLT

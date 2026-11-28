@@ -1,21 +1,17 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 /* The offline compiler, part of the driver, after the 3DS's (3ds/aot/compiler.c): the blocks discovery found in the
-   image's regions, compiled in chunks on a worker per thread by the host's native back end, and LLVM for what that does
-   not make (cpu/arm/aot.h), an index of them for each region, and the helpers they call, linked by the backend's own
-   linker into the module the run loads. */
+   image's regions, compiled in chunks on a worker per thread by the host's native back end (cpu/arm/aot.h), an index of
+   them for each region, and the helpers they call, linked by the backend's own linker into the module the run loads. */
 #include "nds/aot/nds_module.h"
 #include "common/cpu/arm/aot.h"
-#include "common/cpu/recompiler/llvm/ir.h"
-#include "common/cpu/recompiler/llvm/rtlib_object.h"
-#include "common/cpu/recompiler/llvm/link.h"
+#include "common/cpu/recompiler/rtlib/rtlib_object.h"
+#include "common/cpu/recompiler/object/link.h"
 #include "common/cpu/recompiler/mach/native.h"
-#include "common/cpu/recompiler/workers.h"
+#include "common/cpu/recompiler/worker_threads.h"
 #include "common/cpu/recompiler/x64/x64_elf.h"
 #include "common/platform/file.h"
 #include "common/utilities/common.h"
-#include <llvm-c/Core.h>
-#include <llvm-c/Target.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,11 +26,11 @@ static void name(char out[48], const Entry* e) {
     snprintf(out, 48, "nds_%u_%c_%u", e->region, e->mode ? 't' : 'a', e->index);
 }
 
-/* The entries' blocks into objects (two at most: cpu/arm/aot.h), LLVM's IR kept as id.ll where it is kept. A block the
-   backend ends sooner than discovery planned goes on as a block of its own at the instruction after. *made gets every
-   block that was made, with the length the backend gave it (*made_count of them, the caller's to free), for the index */
-static bool chunk(SnxArmAot* aot, const NdsRom* rom, const Entry* entries, unsigned count, SnxLinkInput output[2],
-                  const char* id, Entry** made, unsigned* made_count, char* error, size_t size) {
+/* The entries' blocks into an object (cpu/arm/aot.h). A block the backend ends sooner than discovery planned goes on as a
+   block of its own at the instruction after. *made gets every block that was made, with the length the backend gave it
+   (*made_count of them, the caller's to free), for the index */
+static bool chunk(SnxArmAot* aot, const NdsRom* rom, const Entry* entries, unsigned count, SnxLinkInput* output,
+                  Entry** made, unsigned* made_count, char* error, size_t size) {
     unsigned capacity = 0;
     const SnxArmCodegenOptions options = {SNX_ARM_CODEGEN_OPTIONS_ABI, SNX_ARM_PROFILE_ARM946E, SNX_ARM_MEMORY_FLAT, 0,
                                           0};
@@ -64,7 +60,7 @@ static bool chunk(SnxArmAot* aot, const NdsRom* rom, const Entry* entries, unsig
             e.length = (uint8_t)(e.length - consumed);
         }
     }
-    return snx_arm_aot_objects(aot, id, output, error, size) >= 0;
+    return snx_arm_aot_objects(aot, output, error, size) >= 0;
 }
 
 /* The module's descriptor, its regions' address the linker's */
@@ -78,14 +74,17 @@ static NdsModule describe(const NdsRom* rom) {
                        .region_count = rom->region_count,
                        .identity = rom->identity};
 }
-/* The index without LLVM (native.h's snx_native_data): each region's two tables of blocks and of their lengths, the
-   regions, and the descriptor the run reads, the object's one global. entries are sorted by region, mode and slot. 1, 0
-   where this host's native back end has no objects, -1 with the reason in error */
+/* The index (native.h's snx_native_data): each region's two tables of blocks and of their lengths, the regions, and the
+   descriptor the run reads, the object's one global. entries are sorted by region, mode and slot. 0, or -1 with the
+   reason in error */
 static int native_index(const NdsRom* rom, const Entry* entries, unsigned count, SnxLinkInput* output, char* error,
                         size_t size) {
     unsigned pointer = 0, cursor = 0;
     SnxXElf* o = snx_native_data(&pointer);
-    if (!o) return 0;
+    if (!o) {
+        snprintf(error, size, "this host's native back end (%s) makes no module index", snx_native_name());
+        return -1;
+    }
     NdsModuleRegion* regions = calloc(rom->region_count ? rom->region_count : 1, sizeof *regions);
     unsigned char* object = NULL;
     int rc = -1;
@@ -138,108 +137,13 @@ static int native_index(const NdsRom* rom, const Entry* entries, unsigned count,
     const size_t at = snx_xelf_put(o, SNX_ELF_RELRO, &m, sizeof m, alignof(NdsModule));
     snx_xelf_symbol(o, NDS_MODULE_SYMBOL, SNX_ELF_RELRO, at, sizeof m, SNX_ELF_GLOBAL);
     snx_xelf_reloc(o, SNX_ELF_RELRO, at + offsetof(NdsModule, regions), "nds_regions", pointer, 0);
-    if (!snx_xelf_write(o, &object, &output->size)) rc = 1;
+    if (!snx_xelf_write(o, &object, &output->size)) rc = 0;
     output->data = object;
 done:
     if (rc < 0) snprintf(error, size, "out of memory for the module's index");
     free(regions);
     snx_xelf_free(o);
     return rc;
-}
-
-/* ---- the index through LLVM, where the host has no native back end ---- */
-static LLVMValueRef constant_array(LLVMModuleRef mod, const char* id, LLVMTypeRef element, LLVMValueRef* values,
-                                   unsigned count) {
-    LLVMValueRef g = LLVMAddGlobal(mod, LLVMArrayType(element, count), id);
-    LLVMSetInitializer(g, LLVMConstArray(element, values, count));
-    LLVMSetGlobalConstant(g, 1);
-    LLVMSetLinkage(g, LLVMInternalLinkage);
-    return g;
-}
-
-static bool llvm_index(const NdsRom* rom, const Entry* entries, unsigned count, SnxLinkInput* output, char* error,
-                       size_t size) {
-    SnxIr* ir = snx_ir_init(error, size) ? NULL : snx_ir_new("nds-static-aot", '1', error, size);
-    if (!ir) return false;
-    LLVMContextRef c = ir->ctx;
-    LLVMModuleRef mod = LLVMModuleCreateWithNameInContext("nds-static-aot-v1", c);
-    LLVMSetTarget(mod, LLVMGetTarget(ir->mod));
-    LLVMSetDataLayout(mod, LLVMGetDataLayoutStr(ir->mod));
-    LLVMTargetDataRef layout = LLVMGetModuleDataLayout(mod);
-    LLVMTypeRef ptr = LLVMPointerTypeInContext(c, 0), i8 = LLVMInt8TypeInContext(c), i32 = LLVMInt32TypeInContext(c);
-    LLVMTypeRef i64 = LLVMInt64TypeInContext(c), ft = LLVMFunctionType(LLVMVoidTypeInContext(c), &ptr, 1, 0);
-    LLVMTypeRef region_fields[] = {i32, i32, i64, ptr, ptr, ptr, ptr};
-    LLVMTypeRef region_type = LLVMStructTypeInContext(c, region_fields, 7, 0);
-    LLVMValueRef* regions = calloc(rom->region_count ? rom->region_count : 1, sizeof *regions);
-    unsigned cursor = 0;
-    bool ok = false;
-    if (!regions || LLVMABISizeOfType(layout, region_type) != sizeof(NdsModuleRegion)) {
-        snprintf(error, size, "incompatible native descriptor layout");
-        goto done;
-    }
-    for (unsigned r = 0; r < rom->region_count; ++r) {
-        const NdsRegion* region = &rom->regions[r];
-        LLVMValueRef tables[2], lengths[2];
-        for (unsigned mode = 0; mode < 2; ++mode) {
-            unsigned n = region->size / (mode ? 2 : 4);
-            LLVMValueRef* functions = malloc((size_t)(n ? n : 1) * sizeof *functions);
-            LLVMValueRef* units = malloc((size_t)(n ? n : 1) * sizeof *units);
-            if (!functions || !units) {
-                free(functions);
-                free(units);
-                snprintf(error, size, "out of memory for the module's index");
-                goto done;
-            }
-            LLVMValueRef none = LLVMConstNull(ptr), zero = LLVMConstInt(i8, 0, 0);
-            for (unsigned i = 0; i < n; ++i) functions[i] = none, units[i] = zero;
-            while (cursor < count && entries[cursor].region == r && entries[cursor].mode == mode) {
-                const Entry* e = &entries[cursor++];
-                char id[48];
-                name(id, e);
-                if (e->index >= n || LLVMGetNamedFunction(mod, id)) continue;
-                functions[e->index] = LLVMAddFunction(mod, id, ft);
-                LLVMSetVisibility(functions[e->index], LLVMHiddenVisibility);
-                units[e->index] = LLVMConstInt(i8, e->length, 0);
-            }
-            char id[48];
-            snprintf(id, sizeof id, "nds_%u_%s", r, mode ? "thumb" : "arm");
-            tables[mode] = constant_array(mod, id, ptr, functions, n);
-            snprintf(id, sizeof id, "nds_%u_%s_units", r, mode ? "thumb" : "arm");
-            lengths[mode] = constant_array(mod, id, i8, units, n);
-            free(functions);
-            free(units);
-        }
-        LLVMValueRef values[] = {LLVMConstInt(i32, region->address, 0), LLVMConstInt(i32, region->size, 0),
-                                 LLVMConstInt(i64, region->hash, 0),    tables[0], tables[1], lengths[0], lengths[1]};
-        regions[r] = LLVMConstNamedStruct(region_type, values, 7);
-    }
-    {
-        const NdsModule m = describe(rom);
-        LLVMValueRef list = constant_array(mod, "nds_regions", region_type, regions, rom->region_count);
-        LLVMTypeRef fields[] = {i64, i32, i32, i32, i32, i32, i32, i64, ptr};
-        LLVMTypeRef type = LLVMStructTypeInContext(c, fields, 9, 0);
-        LLVMValueRef values[] = {
-            LLVMConstInt(i64, m.magic, 0),        LLVMConstInt(i32, m.abi, 0),          LLVMConstInt(i32, m.arm_abi, 0),
-            LLVMConstInt(i32, m.cpu_size, 0),     LLVMConstInt(i32, m.pointer_size, 0), LLVMConstInt(i32, m.profile, 0),
-            LLVMConstInt(i32, m.region_count, 0), LLVMConstInt(i64, m.identity, 0),     list};
-        if (LLVMABISizeOfType(layout, type) != sizeof(NdsModule) ||
-            LLVMOffsetOfElement(layout, type, 8) != offsetof(NdsModule, regions) ||
-            LLVMOffsetOfElement(layout, type, 7) != offsetof(NdsModule, identity)) {
-            snprintf(error, size, "incompatible native descriptor layout");
-            goto done;
-        }
-        LLVMValueRef global = LLVMAddGlobal(mod, type, NDS_MODULE_SYMBOL);
-        LLVMSetInitializer(global, LLVMConstNamedStruct(type, values, 9));
-        LLVMSetGlobalConstant(global, 1);
-    }
-    unsigned char* object = NULL;
-    ok = !snx_ir_module_object(ir, mod, '0', &object, &output->size, error, size);
-    output->data = object;
-done:
-    free(regions);
-    LLVMDisposeModule(mod);
-    snx_ir_free(ir);
-    return ok;
 }
 
 /* the hints: a region's index and pc | 1 a line, in hex. *count pairs, the caller's to free */
@@ -265,9 +169,8 @@ static uint32_t* read_hints(const char* path, size_t* count) {
 typedef struct {
     const NdsRom* rom;
     const Entry* entries;
-    SnxLinkInput* objects; /* chunk i's are objects[2 * i] and the next, no data for one it lacks */
+    SnxLinkInput* objects; /* chunk i's is objects[i], no data for one with no blocks */
     unsigned count, chunks, next, finished;
-    const char* keep_ir; /* where LLVM's IR goes, NULL for nowhere */
     bool failed;
     Entry* made; /* every block the chunks made */
     unsigned made_count;
@@ -278,8 +181,8 @@ typedef struct {
 
 static void worker(void* arg) {
     Work* w = arg;
-    char error[512] = "out of memory for a maker of blocks";
-    SnxArmAot* aot = snx_arm_aot_new('1', w->keep_ir);
+    char error[512];
+    SnxArmAot* aot = snx_arm_aot_new(error, sizeof error);
     bool ok = aot != NULL;
     for (;;) {
         snx_work_lock(&w->lock);
@@ -294,9 +197,7 @@ static void worker(void* arg) {
         if (n > CHUNK_ENTRIES) n = CHUNK_ENTRIES;
         Entry* made = NULL;
         unsigned made_count = 0;
-        char id[24];
-        snprintf(id, sizeof id, "blocks_%03u", i);
-        ok = chunk(aot, w->rom, w->entries + begin, n, &w->objects[2 * i], id, &made, &made_count, error, sizeof error);
+        ok = chunk(aot, w->rom, w->entries + begin, n, &w->objects[i], &made, &made_count, error, sizeof error);
         snx_work_lock(&w->lock);
         Entry* merged = made_count ? realloc(w->made, (w->made_count + made_count) * sizeof *merged) : w->made;
         if (ok && made_count && !merged) {
@@ -329,7 +230,7 @@ static int by_place(const void* a, const void* b) {
 }
 
 int nds_aot_compile(const NdsRom* rom, const char* path, const char* hints_path, int threads, int most,
-                    const char* keep_ir, SnxArmAotCount* blocks_made, char* error, size_t error_size) {
+                    SnxArmAotCount* blocks_made, char* error, size_t error_size) {
     int result = 1;
     NdsPlan* plans = NULL;
     SnxLinkInput* objects = NULL;
@@ -379,9 +280,8 @@ int nds_aot_compile(const NdsRom* rom, const char* path, const char* hints_path,
     work = (Work){.rom = rom,
                   .entries = entries,
                   .count = count,
-                  .keep_ir = keep_ir,
                   .chunks = (count + CHUNK_ENTRIES - 1) / CHUNK_ENTRIES};
-    files = 2 + 2 * work.chunks; /* the helpers, the index, two at most for each chunk */
+    files = 2 + work.chunks; /* the helpers, the index, one for each chunk */
     objects = calloc(files, sizeof *objects);
     if (!objects) {
         snprintf(error, error_size, "out of memory for native chunks");
@@ -404,14 +304,10 @@ int nds_aot_compile(const NdsRom* rom, const char* path, const char* hints_path,
         snprintf(error, error_size, "%s", work.error);
         goto done;
     }
-    snx_arm_aot_report(&work.blocks, "scarletnx-nds", 0);
+    snx_arm_aot_report(&work.blocks, stdout);
     if (blocks_made) *blocks_made = work.blocks;
     qsort(work.made, work.made_count, sizeof *work.made, by_place);
-    {
-        const int indexed = keep_ir ? 0 : native_index(rom, work.made, work.made_count, &objects[1], error, error_size);
-        if (indexed < 0 || (!indexed && !llvm_index(rom, work.made, work.made_count, &objects[1], error, error_size)))
-            goto done;
-    }
+    if (native_index(rom, work.made, work.made_count, &objects[1], error, error_size)) goto done;
     objects[0].data = (unsigned char*)snx_armlib_object, objects[0].size = (size_t)snx_armlib_object_size;
     unsigned linking = 2; /* the objects there are */
     for (unsigned i = 2; i < files; ++i)

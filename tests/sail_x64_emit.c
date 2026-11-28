@@ -2,8 +2,9 @@
    Copyright 2026 the ScarletNX contributors */
 /* The A64 emitters sailgen generates with its x86-64 back end (a64_x64.inc: x64.h and x64_a64.h over the instruction
    selection derived from the Intel SDM, x64_isel.inc), in a translation unit of their own: sail_x64.c holds them to
-   the LLVM back end's */
+   QEMU and the recorded ends */
 #include "sail_x64_emit.h"
+#include "common/utilities/endian.h"
 
 #if defined(__clang__)
 #pragma clang diagnostic ignored "-Wunused-variable"
@@ -54,7 +55,7 @@ u64 snx_x64_estimate(u64 a, u32 sqrt);
 u64 snx_x64_half(u64 a, u64 fpcr);
 u64 snx_x64_bfdot(u64 sum, u64 a, u64 b);
 u64 snx_x64_sm4_box(u64 a);
-extern const u32 snx_x64_crc32_table[256];
+extern const u32 snx_x64_crc32_table[8 * 256], snx_x64_crc32c_table[256];
 /* the floating-point helpers counted: a hot path's operation calls none */
 static unsigned long g_fp_calls;
 unsigned long snx_x64_fp_calls(void) { return g_fp_calls; }
@@ -113,9 +114,45 @@ static SnxU64 resolve(const char* sym) {
                  SNX_X64_FN(snx_x64_half),
                  SNX_X64_FN(snx_x64_bfdot),
                  SNX_X64_FN(snx_x64_sm4_box),
-                 {"snx_x64_crc32_table", (void*)snx_x64_crc32_table}};
+                 {"snx_x64_crc32_table", (void*)snx_x64_crc32_table},
+                 {"snx_x64_crc32c_table", (void*)snx_x64_crc32c_table}};
     for (size_t i = 0; i < sizeof table / sizeof *table; ++i)
         if (!strcmp(sym, table[i].name)) return (SnxU64)(uintptr_t)table[i].f;
     return 0;
 }
 [[gnu::constructor]] static void set_resolver(void) { g_ctx.resolve = resolve; }
+
+const char* snx_x64_cold_pool(void) {
+    unsigned char code[512];
+    const SnxU64 lo = 0x0123456789ABCDEFull, hi = 0x0FEDCBA987654321ull;
+    SgXBuf hot = {.p = code, .cap = sizeof code, .index = -1};
+    SgXAsm a = {.b = &hot};
+    const char* why = NULL;
+    sgx_vpool(&a, &sgx_v_movdqu_ld, 1, 1, 2); /* the hot code's own, first in the pool */
+    sgx_cold_room(&a, 64);
+    a.cold.index = -1;
+    a.b = &a.cold;
+    sgx_byte(&a.cold, 0x90); /* the cold code not at its buffer's start */
+    sgx_vpool(&a, &sgx_v_movdqu_ld, 2, lo, hi);
+    size_t at = a.rips[1].at, end = a.rips[1].end, base = hot.n;
+    a.b = &hot;
+    sgx_cold_emit(&a);
+    sgx_pool_emit(&a);
+    if (hot.n > hot.cap)
+        why = "the code past its buffer";
+    else {
+        SnxU64 got[2];
+        uint32_t d = snx_ld_le32(code + base + at);
+        long long to = (long long)(base + end) + (d >> 31 ? (long long)d - 0x100000000ll : (long long)d);
+        if (to < 0 || (size_t)to + 16 > hot.n)
+            why = "a displacement out of the code";
+        else {
+            memcpy(got, code + to, 16);
+            if (got[0] != lo || got[1] != hi) why = "a displacement to other bytes than its constant's";
+        }
+    }
+    free(a.cold.p);
+    free(a.rips);
+    free(a.pool);
+    return why;
+}

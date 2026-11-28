@@ -13,7 +13,7 @@
    with the same table: support/host_win64.c's on x86-64, support/arm64_unwinder.h's under Unicorn; there is no longjmp */
 #include "common/cpu/aarch64/cpu.h"
 #include "common/cpu/recompiler/codegen.h"
-#include "common/cpu/recompiler/llvm/code_loader.h"
+#include "common/cpu/recompiler/loader/code_loader.h"
 #if defined(SNX_TEST_ARM64WIN)
 #include "common/cpu/recompiler/arm64/arm64_codegen.h"
 #include "common/cpu/recompiler/x64/x64_elf.h"
@@ -234,8 +234,8 @@ static int step_frame(uint32_t w, Arm64State* s, uint32_t* saved) {
         s->sp += (uint64_t)(int64_t)offset;
     } else if (w == 0x910003FDu) /* MOV X29, SP */
         s->x[29] = s->sp;
-    else if (w == 0xAA0003F3u) /* MOV X19, X0 */
-        s->x[19] = s->x[0];
+    else if (w == 0x91002013u) /* ADD X19, X0, #8 */
+        s->x[19] = s->x[0] + 8;
     else if ((w & 0xFF8003FFu) == 0xD10003FFu) /* SUB SP, SP, #imm */
         s->sp -= imm;
     else if ((w & 0xFF8003FFu) == 0x910003FFu) /* ADD SP, SP, #imm */
@@ -331,7 +331,7 @@ static size_t record_case(unsigned number, uint32_t frame, int pins, uint32_t wo
         code[k++] = 0xA9025BF5u; /* STP X21, X22, [SP, #32]; X23, X24, #48; X25, X26, #64; X27, X28, #80 */
         code[k++] = 0xA90363F7u, code[k++] = 0xA9046BF9u, code[k++] = 0xA90573FBu;
     }
-    code[k++] = 0xAA0003F3u; /* MOV X19, X0 */
+    code[k++] = 0x91002013u; /* ADD X19, X0, #8 */
     if (frame > 4095) {      /* the probe */
         code[k++] = 0x910003F1u, code[k++] = 0xD10003F0u | imm, code[k++] = 0xD1400631u, code[k++] = 0x3940023Fu;
         code[k++] = 0xEB10023Fu, code[k++] = 0x54FFFFA8u;
@@ -978,10 +978,10 @@ int main(void) {
 #if !defined(SNX_TEST_ARM64WIN)
     {
         /* a callee of the object's may be another compiler's, which has 32 bytes there to write (in an AOT module LLVM's):
-           push rbx; mov rbx, rcx; sub rsp, imm32 */
+           push rbx; mov rbx, rcx; sub rsp, imm8 or imm32, the frame's low byte after either's three bytes */
         const unsigned char* p =
             (const unsigned char*)(uintptr_t)atomic_load_explicit(&g_test.disp[F_DIRECT], memory_order_relaxed);
-        if (!p || memcmp(p, "\x53\x48\x89\xCB\x48\x81\xEC", 7) || p[7] < 32)
+        if (!p || memcmp(p, "\x53\x48\x89\xCB\x48", 5) || (p[5] != 0x81 && p[5] != 0x83) || p[6] != 0xEC || p[7] < 32)
             failed("its frame has no room for its callee's", F_DIRECT);
     }
 #endif

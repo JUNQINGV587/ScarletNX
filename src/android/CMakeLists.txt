@@ -7,16 +7,6 @@
 #   snx_android_dex         the DEX reader and its translator to class files (dex/)
 #   snx_android_program     the command line (runtime/main.c), the JVM host and the natives
 #   snx_android_framework   ScarletNX's android.* and the runtime's Java side (framework/), a jar beside the program
-# the JIT compiles an app's native code at run time with the LLVM the build links: LLVM 19's code generator crashes on
-# some of an engine's (a trap in its DAG combiner), so the Android driver is built with LLVM 22 (docs/platforms/android-apps/README.md)
-if(SNX_LLVM_VERSION)
-    string(REGEX MATCH "^[0-9]+" snx_android_llvm_major "${SNX_LLVM_VERSION}")
-    if(snx_android_llvm_major AND snx_android_llvm_major LESS 22)
-        message(WARNING "The Android driver is built with LLVM ${SNX_LLVM_VERSION}: build it with LLVM 22 "
-                        "(-DSNX_LLVM_CONFIG=), as LLVM ${snx_android_llvm_major}'s code generator crashes on some "
-                        "apps' native code (docs/platforms/android-apps/README.md)")
-    endif()
-endif()
 set(snx_android_c_options -pedantic-errors -Wall -Wextra -Werror -Werror=missing-prototypes
                           -Werror=missing-variable-declarations)
 add_library(snx_android_dex STATIC dex/dex.c dex/classfile.c dex/translate.c dex/annotations.c)
@@ -79,11 +69,9 @@ endif()
 # The native bridge (bridge/, docs/platforms/android-apps/native.md): the app's AArch64 libraries run through the recompiler library,
 # which another driver's tree may have configured already. cpu.h is written in the GNU dialect of C
 if(NOT TARGET scarletnx-recompiler)
-    include("${PROJECT_SOURCE_DIR}/cmake/llvm.cmake")
-    add_subdirectory("${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler/llvm" android-llvm-backend)
-    add_subdirectory("${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler" android-recompiler-library)
+    add_subdirectory("${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler" android-recompiler)
 endif()
-add_library(snx_android_bridge STATIC bridge/bridge.c bridge/host.c bridge/linker.c bridge/hle.c bridge/hle_libc.c bridge/args.c
+add_library(snx_android_bridge STATIC bridge/bridge.c bridge/host.c bridge/linker.c bridge/hle.c bridge/hle_libc.c bridge/hle_libm.c bridge/args.c
                                       bridge/native.c bridge/hle_posix.c bridge/hle_thread.c bridge/hle_sync.c bridge/bionic_sync.c bridge/hle_signal.c bridge/fault.c bridge/hle_proc.c bridge/hle_dl.c bridge/hle_code.c
                                       bridge/hle_sles.c bridge/hle_media.c bridge/jni.c
                                       bridge/hle_android.c bridge/hle_vulkan.c
@@ -129,6 +117,11 @@ snx_glsl_spirv(snx_android_bridge SOURCE bridge/gles_rgb.comp NAME android_gles_
 # glslc (src/glslc) when they link
 snx_glsl_spirv(snx_android_bridge SOURCE bridge/gles_expand.comp NAME android_gles_expand_comp_spv
                HEADER android/bridge/gles_expand_comp_spv.h)
+# a clear that the color mask or the stencil's write mask limits, drawn
+snx_glsl_spirv(snx_android_bridge SOURCE bridge/gles2_clear.vert NAME android_gles2_clear_vert_spv
+               HEADER android/bridge/gles2_clear_vert_spv.h)
+snx_glsl_spirv(snx_android_bridge SOURCE bridge/gles2_clear.frag NAME android_gles2_clear_frag_spv
+               HEADER android/bridge/gles2_clear_frag_spv.h)
 target_include_directories(snx_android_bridge SYSTEM PUBLIC "${SNX_JAVA_HOME}/include"
                            "${SNX_JAVA_HOME}/include/${snx_jni_system}")
 set_target_properties(snx_android_bridge PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS ON)

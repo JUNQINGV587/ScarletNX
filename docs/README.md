@@ -42,8 +42,8 @@ keeps audits and measurements as they were taken.
 - [Profiling](dev/profiling.md): a walkthrough of the CPU and GPU profilers for a recompiled game, and how to read them
 - [Architecture](dev/architecture.md): AArch64 to a native module, the runtimes' boundaries and what each owns
 - [The recompiler as a library](dev/library.md): building, using and the limits of `libscarletnx-recompiler`
-- [Amberlith](dev/edenprobe.md) (edenprobe): the hardware probes CI runs against a baseline
-- [Coverage](dev/coverage.md): which of the runtime's code edenprobe, the tests and a game run, and the paths none of them reach
+- [Amberlith](dev/amberlith.md) (Amberlith): the hardware probes CI runs against a baseline
+- [Coverage](dev/coverage.md): which of the runtime's code Amberlith, the tests and a game run, and the paths none of them reach
 - [Status and roadmap](dev/roadmap.md): what is next
 - [The CPU cost of a draw](dev/draw-cost.md): the plan to cut the GPU thread's work for each draw
 - [Render targets as views of their textures](dev/one-image.md): one image for each guest surface, in place of the copies of drawn targets into textures
@@ -84,6 +84,8 @@ keeps audits and measurements as they were taken.
 - CPU (`layers/cpu/`)
   - [CPU implementation plan](layers/cpu/plan.md): Rosetta 2's design, part by part, applied to ScarletNX
   - [Working on the plan](layers/cpu/guide.md): setup, rules, how work is handed back, and the first milestone
+  - [Sail native back end instruction density](layers/cpu/sail-native-density.md): how the x86-64 back end's host
+    instructions per guest word are counted and held
 - GPU (`layers/gpu/`)
   - [NVN](layers/gpu/nvn.md): how games draw through NVN, and how the runtime replays it
   - [Upscalers](layers/gpu/upscalers.md): the one interface a DLSS evaluation and a hook module upscale through, its

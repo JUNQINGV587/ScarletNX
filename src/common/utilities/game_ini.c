@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
 #include "common/utilities/game_ini.h"
+#include "common/utilities/config_file.h"
 #include "common/utilities/ini_lines.h"
 #include "common/utilities/ascii.h"
 #include "common/platform/file.h"
@@ -28,9 +29,51 @@ static char* text_value(char* text, const char* key) {
         if (!strcmp(k, key)) found = value;
     return found;
 }
+/* the .ini at path, its size into *size: NULL for none, and for one that cannot be read, said once a run */
+static char* ini_read(const char* path, size_t* size) {
+    char *text, why[1024];
+    if (snx_config_read(path, &text, size, why, sizeof why) < 0 && snx_config_first(path, "cannot be read"))
+        snx_error("%s", why);
+    return text;
+}
+static void folders_left(void* ctx, int line, const char* text, const char* does) {
+    (void)text;
+    (void)does;
+    snx_config_other_line((SnxConfigOthers*)ctx, line);
+}
+int snx_folders_read(const char* record, char* dirs[3], char* said, size_t said_size) {
+    static const char* const keys[] = {"config", "state", "cache"};
+    char *text, *key, *value;
+    const char* was[3] = {NULL, NULL, NULL};
+    int line[3] = {0, 0, 0}, kind, read;
+    size_t size;
+    SnxIni ini;
+    SnxConfigOthers others = {0};
+    dirs[0] = dirs[1] = dirs[2] = NULL;
+    if (said_size) said[0] = 0;
+    read = snx_config_read(record, &text, &size, said, said_size);
+    if (read <= 0) return read;
+    snx_ini_start(&ini, text);
+    ini.left = folders_left;
+    ini.ctx = &others;
+    while (snx_ini_next(&ini, &key, &value)) {
+        for (kind = 0; kind < 3 && strcmp(key, keys[kind]); ++kind) {}
+        if (kind == 3) { /* another version's: kept by the driver's write, named */
+            snx_config_other_key(&others, ini.section, key, ini.line);
+            continue;
+        }
+        if (line[kind]) snx_config_twice(&others, "", key, was[kind], line[kind], value, ini.line); /* the last's */
+        was[kind] = value;
+        line[kind] = ini.line;
+    }
+    for (kind = 0; kind < 3; ++kind) dirs[kind] = was[kind] ? snx_strdup(was[kind]) : NULL;
+    snx_config_others_said(&others, record, said, said_size);
+    free(text);
+    return 1;
+}
 char* snx_ini_value(const char* path, const char* key) {
     size_t size;
-    char *text = (char*)snx_read_file(path, &size), *value = text ? text_value(text, key) : NULL;
+    char *text = ini_read(path, &size), *value = text ? text_value(text, key) : NULL;
     char* copy = value && *value ? snx_strdup(value) : NULL;
     free(text);
     return copy;
@@ -43,11 +86,12 @@ static int key_line(const char* line, const char* end, const char* key) {
     for (line += n; line < end && (*line == ' ' || *line == '\t'); line++) continue;
     return line < end && *line == '=';
 }
-/* a line, from line to end, that starts [Game] */
-static int game_line(const char* line, const char* end) {
+/* a line, from line to end, that starts [section] */
+static int section_line(const char* line, const char* end, const char* section) {
+    size_t n = strlen(section);
     while (line < end && (*line == ' ' || *line == '\t')) line++;
     while (end > line && (end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) end--;
-    return end - line == 6 && !strncmp(line, "[Game]", 6);
+    return (size_t)(end - line) == n + 2 && line[0] == '[' && !strncmp(line + 1, section, n) && line[n + 1] == ']';
 }
 /* text's n bytes in path's place, through tmp beside it: NULL, else what could not be done and the system's reason.
    Owned */
@@ -63,10 +107,13 @@ static char* replace_text(const char* path, const char* tmp, const char* text, s
     return why;
 }
 int snx_ini_record(const char* path, const char* key, const char* value) {
+    return snx_ini_record_in(path, "Game", key, value);
+}
+int snx_ini_record_in(const char* path, const char* section, const char* key, const char* value) {
     char *dir = snx_dirname(path), *tmp = snx_format("%s.tmp", path), *out = NULL, *text, *copy, *had, *why;
     char reason[512];
     const char *line, *end, *next;
-    size_t size = 0, n = 0, len = strlen(key) + strlen(value);
+    size_t size = 0, n = 0, len = strlen(section) + strlen(key) + strlen(value);
     int placed = 0, rc = 0;
     if (value[strcspn(value, "\r\n")]) {
         rc = snx_error("%s=%s has a line break, which the game's settings cannot keep", key, value);
@@ -96,13 +143,13 @@ int snx_ini_record(const char* path, const char* key, const char* value) {
         memcpy(out + n, line, (size_t)(next - line));
         n += (size_t)(next - line);
         if (next == end) out[n++] = '\n'; /* the file's last line, without a newline */
-        if (!placed && game_line(line, end)) {
+        if (!placed && section_line(line, end, section)) {
             n += (size_t)sprintf(out + n, "%s=%s\n", key, value);
             placed = 1;
         }
     }
     free(text);
-    if (!placed) n += (size_t)sprintf(out + n, "%s[Game]\n%s=%s\n", n ? "\n" : "", key, value);
+    if (!placed) n += (size_t)sprintf(out + n, "%s[%s]\n%s=%s\n", n ? "\n" : "", section, key, value);
     why = snx_mkdirs(dir) ? snx_format("%s cannot be made (%s)", dir, snx_os_error(reason, sizeof reason))
                           : replace_text(path, tmp, out, n);
     if (why) rc = snx_error("cannot record %s=%s in %s: %s", key, value, path, why);
@@ -115,7 +162,7 @@ done:
 }
 int snx_ini_has(const char* path, const char* key) {
     size_t size = 0;
-    char* text = (char*)snx_read_file(path, &size);
+    char* text = ini_read(path, &size);
     const char *line, *end, *next;
     int found = 0;
     for (line = text; line && line < text + size && !found; line = next) {
@@ -390,8 +437,8 @@ int snx_place_runtime(const char* runtime, const char* copy, char* error, size_t
         }
     }
 #ifdef _WIN32
-    /* Windows finds a program's DLLs next to it: the copy gets those next to the runtime (the package's LLVM), or it
-       does not start. All of them when the runtime was placed, else the ones the folder lacks or holds at another
+    /* Windows finds a program's DLLs next to it: the copy gets those next to the runtime (the package's libraries), or
+       it does not start. All of them when the runtime was placed, else the ones the folder lacks or holds at another
        size */
     if (rc >= 0 && strcmp(own, mine)) {
         char* folder = snx_dirname(mine);

@@ -19,7 +19,7 @@
    (SGX_CC_EXTRA: risc.h's kind of virtual flags); a division of two operands whose divisor mach.h makes 1 where it is 0
    or -1 under the most negative value (SGX_DIV_2OP, not x86's RDX:RAX); vector registers for values (SGX_HAS_VREGS:
    without them a SIMD&FP register is two doublewords in general-purpose ones); the floating point all helpers'
-   (SGX_FP_HELPERS) */
+   (SGX_FP_HELPERS); a POPCNT selection for BitCount (SGX_HAS_POPCNT) */
 #ifndef SGX_CC_EXTRA
 #define SGX_CC_EXTRA(fsel) 0
 #endif
@@ -31,6 +31,9 @@
 #endif
 #ifndef SGX_FP_HELPERS
 #define SGX_FP_HELPERS 0 /* mach_a64.h's exact helpers for all the floating point, not the machine's own code */
+#endif
+#ifndef SGX_HAS_POPCNT
+#define SGX_HAS_POPCNT 0
 #endif
 /* a machine of two calling conventions (x64.h's): the registers values may be in, a call's argument n's register (past
    the machine's registers, SGX_NREG + a slot of the frame, where the convention has it on the stack), the frame's first
@@ -115,11 +118,11 @@ typedef struct {
     /* SGX_K_VEC: the form; its result's operand (-1 none: a store, a compare), which reads in[vout] first when vtied;
        vzero: the result is made 0 first (PXOR of itself), no input; the memory operand (mplace) is the state's
        [base + mdisp] (mstate), the constant pool's kv (mrip), or guest memory [in[5] + in[6] + mdisp]; vflags: it
-       writes the flags (UCOMISS, PTEST) */
+       writes the flags (UCOMISS, PTEST); vfold: an AVX twin, whose operand 2 may be memory (sgx_fold_loads) */
     unsigned mclobber; /* SGX_K_MACHINE's: the host registers it changes besides its results' (SGX_RET, SGX_RET2) */
     const SgXVForm* vf;
     signed char vout;
-    unsigned char vtied, vzero, mstate, mrip, vflags;
+    unsigned char vtied, vzero, mstate, mrip, vflags, vfold;
     SnxU64 kv[2];
     /* SGX_K_COLD of sgx_cold_fp: its call reads and writes the state's 32-bit fields at disp (FPCR) and mdisp (FPSR)
        alone (cstate); argument cfpcr - 1 is the field at disp, ckat - 1 the constant imm, both loaded on the cold path
@@ -131,6 +134,10 @@ typedef struct {
         unsigned char kind, of, limit, w;
     } test[SGX_TESTS];
     unsigned char jdead; /* SGX_K_MACHINE: a jump, kv[1] and kv[0] what is dead where it goes (sgx_dead_words') */
+    /* a compare whose flags are no fsel's (sgx_cold_cmp's): Arm's flag f (0 N ... 3 V) the AND of the bools (SgB)
+       fb[f][0] and fb[f][1] (0: none), condition codes on its flags until those change (then SETcc's registers) */
+    int fb[4][2];
+    int src; /* the guest word it was made for: the region's SgX.src then (-1: none of the function's words) */
 } SgXIns;
 
 typedef struct {
@@ -213,6 +220,7 @@ typedef struct {
     unsigned features;
     int flags_ins; /* the instruction whose x86 flags the flags are now, -1 for none */
     int base;      /* the host register the state's address is in (RBX) */
+    int src;       /* the guest word now made, which each instruction appended takes (SgXIns' src) */
     int unmade;    /* a primitive had no candidate this host can run */
     int pool;      /* the host registers values may be in: the first pool of sgx_pool's (0: all; fewer, for tests of
                       spilling) */
@@ -236,6 +244,10 @@ typedef struct {
     unsigned char vlive[SGX_MAXV + 1], flive[SGX_MAXI + 1];
     unsigned stamp[SGX_STATE_WORDS], now;
     int next_call[SGX_MAXI + 1]; /* sgx_assemble_region's (SgXAsm's) */
+    /* with count set, what sgx_assemble_region saw of each region once sgx_optimize had run: the instructions it kept,
+       and the bytes those would take stored packed (sgx_packed's count: nothing is written) */
+    int count;
+    SnxU64 seen, seen_packed;
 } SgX;
 
 typedef int SgB;
@@ -282,6 +294,7 @@ static inline SgXIns* sgx_append(SgX* x, int kind) {
     i->flags_from = -1;
     i->mplace = -1;
     memset(i->fixed, -1, sizeof i->fixed);
+    i->src = x->src;
     return i;
 }
 static inline int sgx_vreg(SgX* x, int def, unsigned zab) {
@@ -360,21 +373,44 @@ static inline int sgx_vcse_find(SgX* x, const SgXVForm* f, int out, int tied, co
     }
     return 0;
 }
+static inline int sgx_vcold(SgX* x, SgB c, int tied, const char* sym, int a, int b, int d, SnxU32 desc);
+static inline SgB sgx_bool(SgX* x, int kind, int v, int cc);
+static inline int sgx_xconst(SgX* x, SnxU64 lo, SnxU64 hi);
+#ifdef SGX_VF_LOWER
+static inline int SGX_VF_LOWER(SgX* x, const SgXVForm* f, const int* in, long long imm);
+#endif
 static inline int sgx_vins(SgX* x, const SgXVForm* f, int out, int tied, const int* in, long long imm, int memk,
                            int mode, int base, int index, int disp, SnxU64 lo, SnxU64 hi) {
     SgXIns* i;
     int k;
     if (tied > 0 && mode == SGX_VM_NONE && f->vex && (x->features & SGX_F_AVX) && out == 0 && f->nops == 2 && in) {
-        /* the AVX twin: a op= b is c = a op b, no copy of a where a is read after */
-        int vin[4] = {0, in[0], in[1], 0};
-        return sgx_vins(x, f->vex, 0, 0, vin, imm, 0, SGX_VM_NONE, 0, 0, 0, 0, 0);
+        /* the AVX twin: a op= b is c = a op b, no copy of a where a is read after. isel.c makes each one
+           'VMNEM xmm1, xmm2, xmm3/m', so b may be memory there */
+        int vin[4] = {0, in[0], in[1], 0}, n = x->n;
+        int v = sgx_vins(x, f->vex, 0, 0, vin, imm, 0, SGX_VM_NONE, 0, 0, 0, 0, 0);
+        if (x->n > n) x->ins[x->n - 1].vfold = 1;
+        return v;
     }
     if (mode == SGX_VM_NONE && out >= 0 && tied >= 0 && in) {
         int v = sgx_vcse_find(x, f, out, tied, in, imm);
         if (v) return v;
     }
-    if (f->feature & ~x->features & ~(unsigned)SGX_F_GPR)
+    if (f->feature & ~x->features & ~(unsigned)SGX_F_GPR) {
+#ifdef SGX_VF_LOWER
+        /* of registers, done by forms the host has: the machine's sequence of them, 0 where it has none for f */
+        if (mode == SGX_VM_NONE && out == 0 && in && (k = SGX_VF_LOWER(x, f, in, imm))) return k;
+#endif
+#ifdef SGX_VF_HELPER
+        /* of two XMM registers (and an immediate): the machine's helper of the instruction (x64.h's sgx_vf_helped),
+           the operands its first (the tied one, else the source) and second, the form's number and immediate its
+           desc */
+        k = sgx_vf_helped(f);
+        if (k >= 0 && mode == SGX_VM_NONE && out == 0 && in && (f->xmask & 3) == 3 && f->nops - !!f->imm_bytes == 2)
+            return sgx_vcold(x, sgx_bool(x, SGX_B_CONST, 1, 0), sgx_xconst(x, 0, 0), SGX_VF_HELPER,
+                             tied > 0 ? in[0] : in[1], in[1], 0, (SnxU32)k | (SnxU32)(imm & 0xFF) << 8);
+#endif
         sg_fail("an SSE form this host's processor lacks", (long long)f->feature, (long long)x->features);
+    }
     if (out < 0) sgx_flags_clobbered(x); /* a compare's flags end the ones before: their conditions kept first */
     i = sgx_append(x, SGX_K_VEC);
     i->vf = f;
@@ -831,6 +867,7 @@ static inline SgD sg_d_sext(SgCtx* g, SgD a, long long w) {
     return a;
 }
 
+static inline SgD sgx_cmp_flag_bits(SgX* x, int ins, int f);
 static inline SgD sg_d_slice(SgCtx* g, SgD a, long long hi, long long lo) {
     SgX* x = sgx(g);
     unsigned w = (unsigned)(hi - lo + 1);
@@ -855,10 +892,19 @@ static inline SgD sg_d_slice(SgCtx* g, SgD a, long long hi, long long lo) {
         for (j = 0; j < sgx_ndw(w); ++j) out[j] = sgx_dw_at(g, in, sgx_ndw(a.w), lo + 64ll * j);
         return sgx_of_dws(g, w, out);
     }
-    if (a.nzcv) {
-        /* a flag of NZCV not made yet (bit 3 N, 2 Z, 1 C, 0 V): its condition code */
-        sg_fail("a slice of NZCV", hi, lo);
+    if (a.nzcv && !x->ins[a.nzcv - 1].fsel) {
+        /* a compare's flags (bit 3 N, 2 Z, 1 C, 0 V): those of the slice alone, the top one first */
+        SgD r = sgx_const(32, 0);
+        long long k;
+        for (k = hi; k >= lo; --k) {
+            SgD f = sgx_cmp_flag_bits(x, a.nzcv - 1, (int)(3 - k));
+            f.w = 32;
+            r = sgx_is_const(&r) ? f : SGX_OP(x, or, 32, SGX_OP(x, lsl_i, 32, r, sgx_const(5, 1)), f);
+        }
+        r.w = w;
+        return r;
     }
+    if (a.nzcv) sg_fail("a slice of NZCV", hi, lo);
     if (sgx_is_const(&a)) return sgx_const(w, a.k >> lo);
     if (lo == 0 && !a.inv) {
         a.w = w;
@@ -1374,6 +1420,34 @@ static inline SgD sgx_cold_fp(SgX* x, SgB c, SgD tied, const char* sym, SgD* arg
     return cls ? sgx_xval(tied.w, i->def) : sgx_val(tied.w, i->def);
 }
 
+/* a floating-point compare of the XMM values a and b (w bits) whose result is the host's flags, Arm's flag f the AND of
+   the condition codes fcc[f][0] and fcc[f][1] (-1: none) on them, kept as bools (SgXIns' fb): in the hot code the
+   tests' jumps, the machine's compare and, where it is unordered, a jump to the cold path, which for snan (FCMP: only a
+   signalling NaN raises IOC) tests a and b for one first and goes back without the call where neither is. The call
+   sym(state, a, b, FPCR, k) gives the flags as the machine's flags register would hold them after its compare
+   (x64_asm.h: an RFLAGS image, loaded before going back), so the flags after it are the compare's on every path. Its
+   instruction's index, for sgx_nzcv */
+static inline int sgx_cold_cmp(SgX* x, int a, int b, unsigned w, int snan, const char* sym, long long k, int fpcr,
+                               int fpsr, const signed char fcc[4][2], const SgXTest* tests, int ntests) {
+    SgD args[2] = {sgx_xval(w, a), sgx_xval(w, b)};
+    int at, f, j;
+    SgXIns* i;
+    if (!ntests) sg_fail("a compare's cold path with no test", w, 0);
+    /* sgx_cold_fp's instruction, with no condition (its tests and the compare's jump take it there) and no value */
+    sgx_cold_fp(x, 0, args[0], sym, args, 2, 2, 3, k, fpcr, fpsr, 0, 0, tests, ntests);
+    at = x->n - 1;
+    i = &x->ins[at];
+    if (i->def == x->nv - 1) --x->nv;
+    i->in[0] = 0;
+    i->def = 0;
+    i->vflags = 3;
+    i->vout = (signed char)!!snan;
+    x->flags_ins = at;
+    for (f = 0; f < 4; ++f)
+        for (j = 0; j < 2; ++j) x->ins[at].fb[f][j] = fcc[f][j] < 0 ? 0 : sgx_bool(x, SGX_B_CC, at, fcc[f][j]);
+    return at;
+}
+
 /* the vector form of sgx_cold: when c holds, sym(state, &out, &a, &b, &d, desc) on the cold path, the XMM values a,
    b, d (0: a's) passed by their addresses and the result read from out's 16 bytes; else tied's */
 static inline int sgx_vcold(SgX* x, SgB c, int tied, const char* sym, int a, int b, int d, SnxU32 desc) {
@@ -1400,6 +1474,22 @@ static inline int sgx_vcold(SgX* x, SgB c, int tied, const char* sym, int a, int
     i->side = 1;
     i->def = sgx_xvreg(x, x->n - 1);
     return i->def;
+}
+
+/* sgx_vcold whose cold path tests first (zacc, the machine's sgx_cold_vwarm: x64_asm.h's says its bits) and goes back
+   to the hot code without the call where they all pass; FPCR and FPSR at fpcr and fpsr in the state, mask (0: none) a
+   vector of the hot code's whose set lanes are the call's */
+static inline int sgx_vcold_warm(SgX* x, SgB c, int tied, const char* sym, int a, int b, int d, SnxU32 desc,
+                                 unsigned zacc, int fpcr, int fpsr, int mask) {
+    int n = x->n, v = sgx_vcold(x, c, tied, sym, a, b, d, desc);
+    if (x->n > n) {
+        SgXIns* i = &x->ins[x->n - 1];
+        i->zacc = (unsigned char)zacc;
+        i->disp = fpcr;
+        i->mdisp = fpsr;
+        i->in[6] = mask;
+    }
+    return v;
 }
 
 static inline SgB sg_b_not(SgCtx* g, SgB a) {
@@ -1478,9 +1568,20 @@ static inline SgB sg_b_select(SgCtx* g, SgB c, SgB a, SgB b) {
     return sgx_bool(x, SGX_B_REG, sgx_reg(x, &r), 0);
 }
 
+/* a compare's NZCV (sgx_cold_cmp's) == 0010, greater (FCMGT's and FACGT's whole NZCV): UCOMISx b, a's CF without ZF,
+   on its flags where they are still its; -1 for another k, or flags no longer its (NZCV made whole and compared) */
+static inline SgB sgx_cmp_greater(SgCtx* g, int ins, SnxU64 k) {
+    SgX* x = sgx(g);
+    if (k != 2 || x->flags_ins != ins) return -1;
+    return sg_b_and(g, sgx_bool(x, SGX_B_CC, ins, 2), sgx_bool(x, SGX_B_CC, ins, 5)); /* B, NE */
+}
 /* a == b of bits: CMP (or TEST of a value with itself against 0), and the condition code the selection gives Arm's EQ
    on its flags */
 static inline SgB sg_d_eq(SgCtx* g, SgD a, SgD b) {
+    if (a.nzcv && !sgx(g)->ins[a.nzcv - 1].fsel && sgx_is_const(&b)) {
+        SgB r = sgx_cmp_greater(g, a.nzcv - 1, b.k);
+        if (r >= 0) return r;
+    }
     sgx_flat(sgx(g), &a);
     sgx_flat(sgx(g), &b);
 
@@ -1881,8 +1982,18 @@ static inline SgI sg_i_clz(SgCtx* g, SgD a) {
         return sgx_int(sg_d_sub(g, r.v, sgx_const(64, 32 - w)), 0);
     }
     if (w != 32 && w != 64) sg_fail("CLZ of a value not of 32 or 64 bits", w, 0);
-    if (!sgx_pick(x, SGX_TABLE(clz, w), SGX_TABLE_N(clz, w), 0, w, 0)) return sgx_int(sg_d_zext(g, sgx_clz_search(g, a), 64), 0);
-    return sgx_int(sg_d_zext(g, SGX_OP(x, clz, w, a), 64), 0);
+    if (sgx_pick(x, SGX_TABLE(clz, w), SGX_TABLE_N(clz, w), 0, w, 0))
+        return sgx_int(sg_d_zext(g, SGX_OP(x, clz, w, a), 64), 0);
+#ifdef SGX_HAS_HIGHEST
+    if (sgx_pick(x, SGX_TABLE(highest, w), SGX_TABLE_N(highest, w), 0, w, 0)) {
+        /* BSR's DEST is guarded by the SDM's SRC <> 0: test for 0 after the subtraction, so the CMOVcc reads
+           the test's flags, and CLZ(0) is W. W - 1 - index is unsigned at the operand's width */
+        SgD n = sg_d_sub(g, sgx_const(w, w - 1), SGX_OP(x, highest, w, a));
+        SgB zero = sg_d_is_zero(g, a);
+        return sgx_int(sg_d_zext(g, sg_d_select(g, zero, sgx_const(w, w), n), 64), 0);
+    }
+#endif
+    return sgx_int(sg_d_zext(g, sgx_clz_search(g, a), 64), 0);
 }
 
 /* ---- flags ----
@@ -1903,6 +2014,16 @@ static inline int sgx_arm_flag_cc(const SgXSel* fsel, int f) {
     int j = fsel->flag_of[f];
     if (j < 0) return -1;
     return ((fsel->flag_neg >> f) & 1 ? sgx_flag_ncc[j] : sgx_flag_cc[j]) | SGX_CC_EXTRA(fsel);
+}
+/* Arm's flag f of a compare whose flags are bools of its own (sgx_cold_cmp's fb), 0 or 1 in a register (32 bits) */
+static inline SgD sgx_cmp_flag_bits(SgX* x, int ins, int f) {
+    SgD r = sgx_bool_bits(x, x->ins[ins].fb[f][0]);
+    if (x->ins[ins].fb[f][1]) {
+        SgD o = sgx_bool_bits(x, x->ins[ins].fb[f][1]);
+        r = SGX_OP(x, and, 32, sgx_val(32, r.v), sgx_val(32, o.v)); /* the flags it ends: the others' SETcc first */
+    }
+    r.w = 1;
+    return r;
 }
 
 /* the machine's part, before an instruction makes flags it keeps for later (AddWithCarry's): what it would emit
@@ -2031,9 +2152,59 @@ static inline SgD sg_d_logic_flags(SgCtx* g, SgD r) {
 
 /* the instructions nothing reads are dropped; one whose result nothing reads but whose flags something does becomes
    its flags-only form (SUBS's result to the zero register: CMP) */
+/* whether nothing between instructions d and i may change the state's 16 bytes at disp: no store of them, no call,
+   no store at all of guest memory (it is not the state, but nothing here proves an address of it is not) */
+static inline int sgx_state_kept(const SgX* x, int d, int i, int disp) {
+    unsigned q = (unsigned)disp >> 2;
+    for (int j = d + 1; j < i; ++j) {
+        const SgXIns* s = &x->ins[j];
+        if (s->dead) continue;
+        if (s->kind == SGX_K_MACHINE || s->kind == SGX_K_COLD || s->kind == SGX_K_UNDEF || s->side) return 0;
+        if (s->kind == SGX_K_STORE || s->kind == SGX_K_STORE_FLAG) {
+            unsigned w0 = (unsigned)s->disp >> 2, nw = s->kind != SGX_K_STORE_FLAG && s->w == 64 ? 2 : 1;
+            if (w0 < q + 4 && q < w0 + nw) return 0;
+        }
+        if (s->kind == SGX_K_VEC && s->mstate && s->vout == s->mplace) return 0; /* a store of a V register */
+    }
+    return 1;
+}
+/* an AVX twin's operand 2 that a load of the state or of the constant pool made, read there alone: the load is its
+   memory operand ([base + disp] or [rip + k]), and no register holds it. The VEX forms take an operand at any
+   address, the SSE ones only a 16-byte aligned one, which nothing makes the state's V registers */
+static inline void sgx_fold_loads(SgX* x) {
+    unsigned char* uses = x->vlive; /* each value's readers, 2 for more than one; sgx_optimize clears it after */
+    memset(uses, 0, (size_t)x->nv + 1);
+    for (int i = 0; i < x->n; ++i) {
+        const SgXIns* s = &x->ins[i];
+        if (s->dead) continue;
+        for (int k = 0; k < SGX_INS_IN; ++k)
+            if (s->in[k] > 0 && s->in[k] < x->nv && uses[s->in[k]] < 2) ++uses[s->in[k]];
+    }
+    for (int i = 0; i < x->n; ++i) {
+        SgXIns* s = &x->ins[i];
+        int v = s->in[2];
+        if (s->dead || s->kind != SGX_K_VEC || !s->vfold || s->mplace >= 0 || v <= 0 || v >= x->nv || uses[v] != 1)
+            continue;
+        int d = x->v[v].def;
+        if (d < 0 || d >= i) continue;
+        SgXIns* l = &x->ins[d];
+        if (l->dead || l->kind != SGX_K_VEC || l->vf != SGX_VF_LD16 || l->def != v || !(l->mstate || l->mrip)) continue;
+        if (l->mstate && !sgx_state_kept(x, d, i, l->mdisp)) continue;
+        s->mplace = 2;
+        s->mstate = l->mstate;
+        s->mrip = l->mrip;
+        s->mdisp = l->mdisp;
+        s->kv[0] = l->kv[0];
+        s->kv[1] = l->kv[1];
+        s->in[2] = 0;
+        l->dead = 1;
+        for (int k = 0; k < SGX_INS_IN; ++k) l->in[k] = 0;
+    }
+}
 static inline void sgx_optimize(SgX* x) {
     unsigned char *vlive = x->vlive, *flive = x->flive; /* the region's part cleared */
     int i, k;
+    sgx_fold_loads(x);
     memset(vlive, 0, (size_t)x->nv + 1);
     memset(flive, 0, (size_t)x->n + 1);
     /* a store later ones to the same place overwrite, with no load of it and no call of the runtime (which reads the
@@ -2245,6 +2416,7 @@ typedef struct SgXAsm {
     SgXBuf* b;
     int owner[SGX_NREG]; /* the virtual register a host one holds, 0 for none, -1 a copy made for one instruction */
     int slots, slots_max;
+    int frame_off; /* the slots' offset from SGX_FRAME: past what the prologue saved below them (arm64 but Windows) */
     int xowner[SGX_NXREG]; /* the value an XMM register holds: a vector's (cls 1), or a general-purpose one spilled
                              there; 0 for none, -1 a copy made for one instruction (PBLENDVB's XMM0) */
     int* next_call;       /* for each instruction, the next one at or after it that calls out (x->n: none) */
@@ -2259,6 +2431,10 @@ typedef struct SgXAsm {
        registers pins hold, which no value is given (reserved, xreserved) */
     void (*pin_cs)(void* machine, int store);
     unsigned reserved, xreserved;
+    /* every host register a pin holds (pinned; the vector ones xpinned), and what the machine does where an instruction
+       writes one of its own fixed registers there, or one its sequence does not declare (fixed_fault, sgx_fixed_writes) */
+    unsigned pinned, xpinned;
+    void (*fixed_fault)(void* machine, int at, int reg, int xmm, int undeclared);
     unsigned xsaved; /* the callee's vector registers the function saved itself (x64.h's SGX_XCALLEE) */
     /* the constant pool (16 bytes each) the function's RIP-relative operands read, after its code
        (sgx_pool_emit), and where each such operand's displacement is */
@@ -2267,6 +2443,7 @@ typedef struct SgXAsm {
     struct SgXRip {
         size_t at, end;
         int idx;
+        unsigned char cold; /* at and end are the cold buffer's, until sgx_cold_emit puts it after the code */
     } * rips;
     int nrips, cap_rips;
     /* the cold paths (SGX_K_COLD's calls), after the function's code and before its pool (sgx_cold_emit): their
@@ -2337,6 +2514,30 @@ static inline void sgx_spill_at(SgXAsm* a, int r, int at) {
     a->owner[r] = 0;
 }
 static inline void sgx_spill(SgXAsm* a, int r) { sgx_spill_at(a, r, -1); }
+
+/* instruction at writes host registers m (the vector ones where xmm), which it needs for itself: an input moved into
+   its fixed register, a fixed result, what its sequence changes besides. Where one holds a pin, the function's code
+   would lose the guest register kept there for the whole function, so the recompile stops, the machine naming the
+   word, the register and the pin (fixed_fault): a defect of the pins' choice, never a game's */
+static inline void sgx_fixed_writes(SgXAsm* a, int at, unsigned m, int xmm) {
+    unsigned hit = m & (xmm ? a->xpinned : a->pinned);
+    if (!hit) return;
+    if (a->fixed_fault) a->fixed_fault(a->machine, at, __builtin_ctz(hit), xmm, 0);
+    sg_fail("a fixed register a pin holds", at, __builtin_ctz(hit));
+}
+
+/* machine instruction at, whose inline sequence writes general-purpose registers w (the machine's own count of them,
+   its result's included): each must be one its instruction declares (sgx_mach's clobber, SGX_RET, SGX_RET2), which the
+   allocator moved values out of, and none a pin's. Else the recompile stops, the machine naming the register */
+static inline void sgx_machine_declares(SgXAsm* a, int at, unsigned w) {
+    const SgXIns* i = &a->x->ins[at];
+    unsigned undeclared = w & ~(i->mclobber | (i->def ? 1u << SGX_RET : 0u) | (i->def2 ? 1u << SGX_RET2 : 0u));
+    if (undeclared) {
+        if (a->fixed_fault) a->fixed_fault(a->machine, at, __builtin_ctz(undeclared), 0, 1);
+        sg_fail("a register a machine sequence writes and does not declare", at, __builtin_ctz(undeclared));
+    }
+    sgx_fixed_writes(a, at, w, 0);
+}
 
 /* a host register free at instruction at, none of avoid's (a mask: the registers the instruction reads or writes):
    one whose value nothing reads after, or else the one whose value is read latest, spilled */
@@ -2507,6 +2708,11 @@ static inline void sgx_assemble_sel(SgXAsm* a, int at) {
     for (k = 0; k < 4; ++k)
         if (s->in[k] >= SGX_FIX) fixed |= 1u << (s->in[k] - SGX_FIX);
     if (s->out >= SGX_FIX) fixed |= 1u << (s->out - SGX_FIX);
+    /* what it writes of them: its clobbers, its fixed result, the zeroed place; and below, an input moved into its own */
+    sgx_fixed_writes(a, at,
+                     s->clobber | (s->out >= SGX_FIX ? 1u << (s->out - SGX_FIX) : 0u) |
+                         (zero_place >= SGX_FIX ? 1u << (zero_place - SGX_FIX) : 0u),
+                     0);
     held = sgx_inputs_in_regs(a, at, fixed);
     /* the inputs in their places: a fixed register's copied in first (what it held moved out of the way), then the
        others, which that may have moved */
@@ -2516,6 +2722,7 @@ static inline void sgx_assemble_sel(SgXAsm* a, int at) {
         if (!v || p < SGX_FIX) continue;
         if (x->v[v].reg != p - SGX_FIX) {
             int o = a->owner[p - SGX_FIX], j, reads = 0;
+            sgx_fixed_writes(a, at, 1u << (p - SGX_FIX), 0);
             for (j = 0; j < SGX_INS_IN && o > 0; ++j) reads |= i->in[j] == o;
             if (reads) {
                 /* another input of it (DIV's divisor in RDX): to a register, which its operand names. Spilled to a
@@ -2678,6 +2885,18 @@ static inline int sgx_pool_index(SgXAsm* a, SnxU64 lo, SnxU64 hi) {
     a->pool[a->npool][1] = hi;
     return a->npool++;
 }
+/* a pool operand's displacement at at, its instruction ending at end, in the buffer the assembler writes now */
+static inline void sgx_rip_add(SgXAsm* a, size_t at, size_t end, SnxU64 lo, SnxU64 hi) {
+    if (a->nrips == a->cap_rips) {
+        a->cap_rips = a->cap_rips ? 2 * a->cap_rips : 32;
+        a->rips = (struct SgXRip*)realloc(a->rips, (size_t)a->cap_rips * sizeof *a->rips);
+        if (!a->rips) sg_fail("out of memory", 0, 0);
+    }
+    a->rips[a->nrips].at = at;
+    a->rips[a->nrips].end = end;
+    a->rips[a->nrips].cold = a->b == &a->cold;
+    a->rips[a->nrips++].idx = sgx_pool_index(a, lo, hi);
+}
 /* a vector form (SGX_K_VEC): its operands in registers (a tied result copied from its input unless that dies here),
    a memory operand the state's (SGX_MEMR of the base), the constant pool's (SGX_POOLR, its displacement recorded for
    sgx_pool_emit to patch) or guest memory's (SGX_MEMR of in[5], b's index in[6] and disp) */
@@ -2695,6 +2914,7 @@ static inline void sgx_assemble_vec(SgXAsm* a, int at) {
     if (implicit >= 0 && i->in[implicit]) {
         int from = sgx_xin(a, i->in[implicit], at, 0);
         if (from != 0) {
+            sgx_fixed_writes(a, at, 1u, 1);
             int o = a->xowner[0];
             if (o > 0 && x->v[o].last >= at) { /* another operand of it, where it is last read here */
                 int to = sgx_xfree(a, at, 1u | (1u << from));
@@ -2776,16 +2996,7 @@ static inline void sgx_assemble_vec(SgXAsm* a, int at) {
     }
     f->enc(b, r, i->imm, 0);
     b->index = -1;
-    if (i->mrip) {
-        if (a->nrips == a->cap_rips) {
-            a->cap_rips = a->cap_rips ? 2 * a->cap_rips : 32;
-            a->rips = (struct SgXRip*)realloc(a->rips, (size_t)a->cap_rips * sizeof *a->rips);
-            if (!a->rips) sg_fail("out of memory", 0, 0);
-        }
-        a->rips[a->nrips].at = b->rip_at;
-        a->rips[a->nrips].end = b->n;
-        a->rips[a->nrips++].idx = sgx_pool_index(a, i->kv[0], i->kv[1]);
-    }
+    if (i->mrip) sgx_rip_add(a, b->rip_at, b->n, i->kv[0], i->kv[1]);
     for (k = 0; k < SGX_NREG; ++k)
         if (a->owner[k] == -1) a->owner[k] = 0;
     for (k = 0; k < SGX_NXREG; ++k)
@@ -2800,6 +3011,38 @@ static inline void sgx_assemble_vec(SgXAsm* a, int at) {
         }
         x->v[i->def].reg = (signed char)outreg;
     }
+}
+
+/* the bytes a field of value v takes stored packed: none for 0, else the shortest of 1, 2, 4 and 8 that hold it */
+static inline unsigned sgx_packed_int(long long v) {
+    if (!v) return 0;
+    if (v >= -128 && v < 128) return 1;
+    if (v >= -32768 && v < 32768) return 2;
+    return v >= -2147483647 - 1 && v <= 2147483647 ? 4 : 8;
+}
+/* the bytes instruction s would take stored packed, a count alone: its kind, width and condition and which fields
+   it has (3), each form it names as an index (2), each input as its distance back from the result (1, or 2 where
+   that is 128 or more, or it has no result), and only the fields it uses: its constants and displacements by their
+   length, a helper's name as an index (2), the host registers a machine's instruction fixes or changes (1 and 4), a
+   vector form's operands (1), each doubleword of a vector constant (8), a cold path's state (2) and tests (4 each),
+   and each flag it reads or carries (2) */
+static inline unsigned sgx_packed(const SgXIns* s) {
+    unsigned n = 3, k;
+    n += 2u * ((s->sel != NULL) + (s->vf != NULL) + (s->fsel && s->fsel != s->sel) + (s->alt != NULL));
+    for (k = 0; k < SGX_INS_IN; ++k)
+        if (s->in[k]) n += s->def > s->in[k] && s->def - s->in[k] < 128 ? 1u : 2u;
+    n += sgx_packed_int(s->imm) + sgx_packed_int(s->disp) + sgx_packed_int(s->mdisp);
+    n += s->cadd ? sgx_packed_int(s->cadd_k) : 0;
+    n += s->sym ? 2u : 0;
+    for (k = 0; k < SGX_MACHINE_IN; ++k) n += s->fixed[k] >= 0;
+    n += s->mclobber ? 4u : 0;
+    n += s->kind == SGX_K_VEC;
+    n += 8u * ((s->kv[0] != 0) + (s->kv[1] != 0));
+    n += s->kind == SGX_K_COLD ? 2u : 0;
+    n += 4u * s->ntests;
+    n += s->flags_from >= 0 ? 2u : 0;
+    for (k = 0; k < 8; ++k) n += s->fb[k / 2][k % 2] ? 2u : 0;
+    return n;
 }
 
 /* one region of code (the instructions in x since the last region): dropped what nothing reads, its values given
@@ -2820,6 +3063,8 @@ static inline void sgx_assemble_region(SgXAsm* a, SgX* x) {
         x->v[i].pinned = 0;
     }
     sgx_optimize(x);
+    for (i = 0; x->count && i < x->n; ++i)
+        if (!x->ins[i].dead) ++x->seen, x->seen_packed += sgx_packed(&x->ins[i]);
     a->next_call = x->next_call;
     a->next_call[x->n] = x->n;
     for (i = x->n - 1; i >= 0; --i)
@@ -2922,6 +3167,7 @@ static inline void sgx_assemble_region(SgXAsm* a, SgX* x) {
                         SgXV* vv = &x->v[s->in[k]];
                         int stack = s->fixed[k] >= SGX_NREG; /* on the stack: through a register, put there */
                         int fr = s->fixed[k] >= 0 && !stack ? s->fixed[k] : sgx_arg_free(a, held);
+                        sgx_fixed_writes(a, i, 1u << fr, 0);
                         if (vv->xmm >= 0) sgx_spill_x(a, 0, vv->xmm, fr);
                         else
                             sgx_mov_mem(a, 1, 64, fr, SGX_FRAME, 8 * vv->slot);
@@ -2932,6 +3178,7 @@ static inline void sgx_assemble_region(SgXAsm* a, SgX* x) {
                         held |= 1u << fr;
                         r[k] = (unsigned char)fr;
                     }
+                sgx_fixed_writes(a, i, (s->def ? 1u << SGX_RET : 0u) | (s->def2 ? 1u << SGX_RET2 : 0u), 0);
                 sgx_machine_ins(a, i, r);
                 for (k = 0; k < SGX_NREG; ++k) {
                     if (a->owner[k] > 0) x->v[a->owner[k]].reg = -1;
@@ -2952,6 +3199,7 @@ static inline void sgx_assemble_region(SgXAsm* a, SgX* x) {
                     int fr = s->fixed[k];
                     int v = s->in[k], from = sgx_in_reg(a, v, i, held | (1u << fr));
                     if (from != fr) {
+                        sgx_fixed_writes(a, i, 1u << fr, 0);
                         if (a->owner[fr] > 0) sgx_evict(a, fr, i - 1, held | (1u << fr) | (1u << from));
                         sgx_mov_rr(a, fr, from);
                         a->owner[fr] = -1;
@@ -2969,6 +3217,7 @@ static inline void sgx_assemble_region(SgXAsm* a, SgX* x) {
                moved out of the way */
             {
                 unsigned clob = s->mclobber | (s->def ? 1u << SGX_RET : 0) | (s->def2 ? 1u << SGX_RET2 : 0);
+                sgx_fixed_writes(a, i, clob, 0);
                 for (k = 0; k < SGX_NREG; ++k)
                     if (((clob >> k) & 1) && a->owner[k] > 0) {
                         /* read after: copied elsewhere (an input there is still there for the instruction to read) */
@@ -3017,6 +3266,17 @@ static inline SgD sgx_nzcv_bits(SgX* x, int ins) {
     const SgXSel* fs = x->ins[ins].fsel;
     SgD r = sgx_const(32, 0);
     int f;
+    if (!fs) {
+        /* a compare's (sgx_cold_cmp's): its flags' bools, each made 0 or 1 once */
+        for (f = 0; f < 4; ++f) {
+            SgD b = sgx_cmp_flag_bits(x, ins, f);
+            b.w = 32;
+            if (f < 3) b = SGX_OP(x, lsl_i, 32, b, sgx_const(5, (SnxU64)(3 - f)));
+            r = sgx_is_const(&r) ? b : SGX_OP(x, or, 32, r, b);
+        }
+        r.w = 4;
+        return r;
+    }
     if (x->flags_ins != ins) sg_fail("NZCV read as bits after the x86 flags that are them were overwritten", ins, 0);
     {
         /* every SETcc first, from the flags as they are, then the shifts and ORs */
@@ -3149,7 +3409,7 @@ static inline SgD sg_d_reduce_add(SgCtx* g, SgD x, unsigned size) {
     return sum;
 }
 
-/* ---- AArch32's builtins (core.h's, for LLVM) ---- */
+/* ---- AArch32's builtins (core.h's) ---- */
 
 /* IsZeroBit: '1' where x is zero */
 static inline SgD sg_d_is_zero_bit(SgCtx* g, SgD x) { return sgx_bool_bits(sgx(g), sg_d_is_zero(g, x)); }
@@ -3254,9 +3514,17 @@ static inline void sg_SignedSatQ(SgCtx* g, SgI i, long long n, SgD* result, SgB*
 static inline void sg_UnsignedSatQ(SgCtx* g, SgI i, long long n, SgD* result, SgB* saturated) {
     sg_SatQ(g, i, n, 1, result, saturated);
 }
-/* BitCount(x): the bits of each two, of each four, of each byte, then all the bytes' */
+/* BitCount(x): the bits of each two, of each four, of each byte, then all the bytes'. A host with POPCNT makes
+   the count in one instruction; the others keep this exact composition */
 static inline SgI sg_i_bitcount(SgCtx* g, SgD x) {
+    sgx_flat(sgx(g), &x);
+
     unsigned w = x.w;
+#if SGX_HAS_POPCNT
+    SgX* m = sgx(g);
+    if ((w == 32 || w == 64) && sgx_pick(m, SGX_TABLE(bitcount, w), SGX_TABLE_N(bitcount, w), 0, w, 0))
+        return sgx_int(sg_d_zext(g, SGX_OP(m, bitcount, w, x), 64), 0);
+#endif
     SgD v;
     if (w > 64) sg_fail("BitCount of over 64 bits", w, 0);
     v = sg_d_zext(g, x, 64);

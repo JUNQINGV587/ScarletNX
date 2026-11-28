@@ -53,10 +53,6 @@ only where you would run a program from the same source.
 
 ## Running an app
 
-Build it with LLVM 22 (`-DSNX_LLVM_CONFIG=` its `llvm-config`, [Build](../../dev/build.md)). The JIT compiles an app's
-native code with the LLVM the build links, and LLVM 19, FreeBSD's `llvm` package, crashes on some of an engine's code.
-The configure step warns when the Android driver is built with an older one.
-
 `build/scarletnx-android APP.apk` runs an app in a window, with the left mouse button as a finger and the keyboard
 as a hardware keyboard. `APP` can also be a bundle of a base APK and its splits (an XAPK or an APKS), which is
 installed first, as Android's package manager installs one: its APKs into `android/app/<package>/` of the data
@@ -93,8 +89,7 @@ These find what an app does when it stops or runs slowly:
 | `--log-level=L` | The least `android.util.Log` level printed: `V`, `D` (the default), `I`, `W`, `E` or `A`. It is also the least level `Log.isLoggable` is true for, as Android's `log.tag` property sets it; without it, `I`, as on Android |
 | `--sample` | Every 5 seconds, each guest thread's pc, x30 and HLE call, and the count of Vulkan presents |
 | `--log-signals` | Each guest signal action, send and delivery |
-| `--jit-verbose`, `--jit-opt=0` | Each unit the JIT compiles with its time, and its code at -O0, which compiles several times faster to test the JIT itself (2 is the default) |
-| `--jit-keep-ir=DIR` | The LLVM IR of each unit the JIT compiles, saved in DIR, so a unit that LLVM fails on can be compiled again by itself. `--jit-verbose` also says each unit's entry before it compiles, so a crash in LLVM names it |
+| `--jit-verbose` | Each unit the JIT compiles, before and after, with its time |
 | `--linker-verbose` | Each native library and its load address |
 | `--framework=JAR`, `--java-home=DIR` | The framework's jar and the JDK, in place of the ones beside the program and that the build found |
 
@@ -137,6 +132,15 @@ ART allows some things that the JVM verifier does not. The translator rewrites t
 - `invoke-super` of a method of an interface that is not a direct superinterface becomes an `invokespecial` of the
   superclass's method. JVM resolution from the superclass finds the default method that it inherits.
 - `fill-array-data` becomes a call to `snx.dalvik.Runtime.fillArrayData` with the payload in string constants.
+
+Some calls of the JDK behave otherwise on Android, and the translator sends them to the framework's own (its remap
+table): `System.loadLibrary` to the native bridge, `ByteBuffer.allocateDirect` to a buffer native code reaches, and
+what prints a double or a float (`Double.toString`, `Float.toString`, `String.valueOf`, `StringBuilder.append` and
+`insert`, `StringBuffer`'s, `PrintStream.print` and `PrintWriter.print`) to `snx.dalvik.Digits`. ART prints OpenJDK's
+digits from before JDK 19 (`Double.toString(1.0E23)` is `9.999999999999999E22`), and the JDK the shortest since
+(`1.0E23`): `Digits` calls the JDK's `jdk.internal.math.FloatingDecimal`, which still has the old ones, and which the
+driver exports to the framework. A box printed through `Object.toString`, `String.valueOf(Object)` or a `Formatter`'s
+`%s` has the JDK's digits.
 
 DEX annotations become JVM attributes, so that reflection finds them: the runtime-visible ones become
 `RuntimeVisibleAnnotations` and `RuntimeVisibleParameterAnnotations`, `dalvik.annotation.Signature` becomes

@@ -1,0 +1,55 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later
+   Copyright 2026 the ScarletNX contributors */
+/* The runtime JIT's cache file. Later runtime sessions load compatible units from it (jit_service.c). The AOT
+   build can also link its objects into the game module and put its metadata in the module's variant table. */
+#ifndef SNX_JIT_CACHE_H
+#define SNX_JIT_CACHE_H
+#include "common/cpu/recompiler/variants.h"
+#include "common/utilities/common.h"
+#include <stddef.h>
+
+#define SNX_JIT_CACHE_MAGIC  "SNXJIT01"
+#define SNX_JIT_RECORD_MAGIC 0x524A4E53u         /* "SNJR" */
+#define SNX_JIT_CACHE_MAX    ((size_t)256 << 20) /* a larger file is refused */
+
+typedef struct SnxJitCache SnxJitCache;
+
+typedef struct {
+    SnxU64 start;
+    size_t leader_count;
+    const SnxU64* leaders;
+    size_t run_count;
+    const SnxVariantRun* runs;
+    SnxU64 h1, h2;
+} SnxJitCacheFunction;
+
+typedef struct {
+    const char* name;
+    size_t function_count;
+    const SnxJitCacheFunction* functions;
+    const unsigned char* object;
+    size_t object_size;
+} SnxJitCacheRecord;
+
+/* What the objects depend on beyond the code: the ABI, the native back end that
+   makes them, the version of its code (mach/native.h's snx_native_code) and the
+   host's features it makes the code for, the runtime library, the -O level the
+   launcher reads (gui/aot.c), hooked direct calls, direct SVCs, the guest's A64
+   features (0: the Switch's) and the decoder's tables. The profile run and the
+   AOT build must pass the same. */
+char* snx_jit_cache_key(char opt, int hook, int svc, SnxU64 features);
+/* How the key a file was made with (was, length bytes) and key differ, the
+   first field where they do, into out (size bytes): "made for opt=3, and this
+   build makes opt=2" */
+void snx_jit_cache_key_change(const char* was, size_t length, const char* key, char* out, size_t size);
+
+/* Opens and validates the whole file: a wrong key (the error says the field it
+   differs in), a corrupt record, or a trailing unfinished record returns NULL
+   with the reason in error. An empty cache (the header and no records) opens
+   with count 0. */
+SnxJitCache* snx_jit_cache_open(const char* path, const char* key, char* error, size_t error_size);
+void snx_jit_cache_close(SnxJitCache* cache);
+size_t snx_jit_cache_count(const SnxJitCache* cache);
+const SnxJitCacheRecord* snx_jit_cache_record(const SnxJitCache* cache, size_t index);
+
+#endif

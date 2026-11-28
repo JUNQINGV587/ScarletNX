@@ -43,8 +43,7 @@ expanded page-packed code is 1,630,208 bytes.
 
 ## Reproduce
 
-A 64-bit Linux or Windows host, a supported Clang and an LLVM SDK are required.
-LLVM 19.1.7 and 23 were tested; use `SNX_LLVM_CONFIG` for a non-system SDK.
+A 64-bit Linux or Windows host and a supported Clang are required.
 
 ```sh
 cmake -S . -B build/ctr-aot \
@@ -157,7 +156,7 @@ been checked again since main's entry moved. The later two use test-scripted HLE
 CPU consistency under those transcripts, **not independent hardware service
 policy**. The runtime never invokes Unicorn or those scripted replies.
 ARM11 packed-byte tests separately compare condition codes, GE flags and
-register aliasing at O0/O2. Real service/kernel tests cover rollback and waits;
+register aliasing of the native back end's blocks. Real service/kernel tests cover rollback and waits;
 an asset-free native CIA proves a worker actually wakes and resumes main.
 A second native CIA opens RomFS through real CTR IPC, reads its metadata and
 resolves/verifies `hello.txt` from the extracted host tree before exiting.
@@ -166,15 +165,14 @@ checks both shared mappings and forced on-demand IO, EOF, failed-read atomicity,
 whole-buffer RAM/MMIO/permission checks, quotas, rollback and handle lifetime.
 Existing NX tree/service/raw-image fixtures run in CTR-only builds as well.
 
-`arm11_vfp_differential` compares 52,480 exact instruction/state cases against
-Unicorn's ARM11 MPCore at O0/O2, flat and checked, including registers, FPSCR,
+`arm_native_arm11_vfp` compares 52,800 exact instruction/state cases against
+Unicorn's ARM11 MPCore, flat and checked, with all the host registers and with three, including registers, FPSCR,
 conditions, aliases, DN/FZ and rounding modes. Checked callbacks forbid direct
 pointer bypasses; negative tests verify fault rollback and unsupported controls,
 legacy format-word saves and wide transfers. Native CTR tests cover atomic RAM
 transfers and real FP helper linkage. The installed offline compiler embeds the
 project's PIC semantic archive, stages it only for offline linking and needs no
-build-tree archive lookup. Generated modules do not depend on LLVM. Default
-A57 ARM/Thumb O0/O2 objects remain byte-identical. The public CPU, checked and
+build-tree archive lookup. The public CPU, checked and
 module ABIs are 3, 1 and 1 (`SNX_ARM_ABI`, `SNX_ARM_CHECKED_ABI`,
 `SNX_CTR_MODULE_ABI`).
 

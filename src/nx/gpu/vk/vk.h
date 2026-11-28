@@ -1911,8 +1911,8 @@ int vk_bl_move_src(VkCommandBuffer cb, const VkBlMove* m, const VkBlSrc* s, VkBu
 void vk_bl_barrier(VkCommandBuffer cb, int before);
 void vk_bl_scratch_reuse(VkCommandBuffer cb);
 /* a device-local buffer of size bytes or more for the linear side, *cap of them, the same one until a bigger one is
-   asked for (vk_bl_barrier orders its uses; the old one lives until the frame's work is done); VK_NULL_HANDLE past
-   g_vk.alloc_cap or when memory ran out. vk_bl_scratch_asked: the most bytes asked of it since the last call, which
+   asked for (vk_bl_barrier orders its uses; the old one lives until the frame's work is done); VK_NULL_HANDLE with *cap
+   0 past g_vk.alloc_cap or when memory ran out, the one there was kept for what fits it. vk_bl_scratch_asked: the most bytes asked of it since the last call, which
    counts again from 0: what a test sees of a request the buffer already held */
 VkBuffer vk_bl_scratch(u64 size, u64* cap);
 u64 vk_bl_scratch_asked(void);
@@ -3850,7 +3850,7 @@ void vk_gpuprof_cb_begin(VkCommandBuffer cb);
 void vk_gpuprof_cb_end(VkCommandBuffer cb, int why, u64 value);
 void vk_gpuprof_waited(u64 value, int kind);
 void vk_gpuprof_frame_done(u32 slot);
-/* The stats box's GPU line (runtime/platform/stats.c): while stats is on, each command buffer of the frame gets a
+/* The stats box's GPU line (common/utilities/stats.c): while stats is on, each command buffer of the frame gets a
    timestamp at its begin and its end, and no pass does unless the profile asks. vk_gpuprof_timed: whether the graphics
    queue can be timed. vk_gpuprof_busy_ns: the time it was busy with the frames timed, summed, read when each frame
    slot is reused (its work is done then: no wait). g_vk_timestamps: the timestamps written, none while stats and the

@@ -4,12 +4,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "common/cpu/recompiler/llvm/jit_cache.h"
+#include "common/cpu/recompiler/jit/jit_cache.h"
 #include "common/utilities/common.h"
 #include "common/utilities/game_ini.h"
 #include "common/utilities/endian.h"
 
-#define AOT_KEY_MAX 8192 /* the key names the host, LLVM and its features: far less */
+#define AOT_KEY_MAX 8192 /* the key names the host, its code generator and their features: far less */
 
 char* gui_game_kind_dir(const char* folder, const char* name, int kind) {
     static const char* const keys[] = {"config", "state", "cache"}; /* SNX_USER_CONFIG's on */

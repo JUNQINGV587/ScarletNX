@@ -63,7 +63,7 @@ parsing is unchanged. Restaging an NRO without embedded RomFS removes the genera
   staging paths, BSS clearing, asset exclusion, permissions, short files, overflowing
   sizes and descriptor mismatches. Exact-sized allocations allow ASan to detect reads
   beyond a truncated file.
-- `native_recompiler`: synthetic NRO through LLVM IR to native module execution,
+- `native_recompiler`: synthetic NRO through the native back end to native module execution,
   plus removal of stale embedded RomFS when an asset-free NRO is staged.
 
 These tests do not establish compatibility with a particular homebrew application or game.
@@ -113,7 +113,7 @@ An NRO the recompiler found in the game's RomFS has its code made ahead of time
 ([below](#nros-made-ahead-of-time)). The code of any other NRO is compiled by the runtime JIT. When LoadNro maps
 such an NRO, its text joins
 the JIT's images (`jit_code_added` in `src/nx/runtime/guest_jit.c`, `snx_jit_add_image` in
-`src/common/cpu/recompiler/llvm/jit_service.c`). Its pcs lie outside `CPU.disp`, so a call into it misses in
+`src/common/cpu/recompiler/jit/jit_service.c`). Its pcs lie outside `CPU.disp`, so a call into it misses in
 `snx_lookup` and reaches `RtAPI.miss`. Resolution first checks any compatible AOT variants through `variant_resolve`,
 then `snx_jit_resolve` reads the JIT's own table for that image without a lock. A resolved call therefore includes
 the miss path and applicable variant lookup as well as the JIT-table load. The first call to a function waits for its compile,
@@ -234,7 +234,7 @@ the table from an image inside it.
 It covers PID placeholders, initialization/handle validation, malformed ranges/headers/hash lists, hash snapshots,
 unauthorized/duplicate images, commit failure rollback, permissions, preserved bytes/BSS, no premature
 relocations, unload-by-base, copy-back, reloading, session cleanup, simultaneous loads, and both capacity limits.
-Running code the module lacks (an NRO's, through `RtAPI.miss`) is `llvm_module`'s.
+Running code the module lacks (an NRO's, through `RtAPI.miss`) is `native_module`'s.
 SHA-256 has independent standard test vectors. Platform backing and IPC transport are test doubles.
 
 Validation in the coding container: these three CTest targets passed using Clang 22. Service/memory tests passed

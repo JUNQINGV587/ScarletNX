@@ -57,7 +57,7 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
 - A gamepad drives the menu as the keys do (`src/gui/pad_menu.c`): the D-pad and the left stick are the arrows, the
   button labelled A (or Cross) is Enter, B (or Circle) ESC, X (or Square) Del and Y (or Triangle) R, wherever the pad
   has them (a Switch pad's A is east, its X north), LB and RB are Shift+Tab and Tab, LT and RT are PgUp and PgDn, L3
-  and R3 are M and B (Games' mods, a 3DS game's own Settings, and AOT pack), the right stick pushed any way is L (Games' Play, once until it is
+  and R3 are M and B (Games' mods, another console's game's own Settings, and AOT pack), the right stick pushed any way is L (Games' Play, once until it is
   back), Start is F5 and Back (View, Minus, Select) F1. On Games, X opens
   the focused game's save states, as S does, and in that box it deletes one, as Del does. A held arrow or
   page repeats. A press on the pad hides the mouse's cursor and the foot names the pad's buttons, a PlayStation pad's
@@ -149,7 +149,7 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   **Keys already setup. This will overwrite the previous ones**. The screen then says what the try
   did, *Installed* or *Not installed* and why, and goes back to the menu by itself after 3 seconds
   (10 after a failure, while another file can still be picked); ESC cancels without changing them.
-- **Settings** opens on its groups, Enter opening one and ESC coming back: **App**, then
+- **Settings** opens on its groups, Enter opening one and ESC coming back: **Search** first (below), **App**, then
   **Launch** (the launcher's own and the recompiler's, from `src/nx/runtime/settings.txt`), then a group per section of the game's `.ini` (Display,
   Graphics, Audio, Performance, Overlay, Controllers, Network, Debug; Overlay is the runtime's On-screen controls, the
   name its page in the game and `settings.ini` keep), as `scarletnx --settings`
@@ -192,6 +192,12 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   picked; *Gentle*, `gentle`: as many as the memory holds, up to half of them (`--aot-threads=0 --aot-threads-most=N` to the game's driver, whichever console's; a GBA ROM
   compiles on one thread either way), at a low priority, ten steps of nice under the launcher's, on Windows the
   class under the launcher's, for using the computer meanwhile; [the Compile tab](#the-compile-tab)),
+  **Check for updates** (*Ask*, `check_updates = ask` in `app.ini`, the default: the first free moment of a start asks
+  *Check for new nightlies?* before anything goes to the network: *Yes* makes it *On* and looks now, *No* asks again at
+  the next start, *Don't Ask Again* makes it *Off*; *On*, `on`: each start asks GitHub for scarletnx/nightly's latest
+  release, the daily nightly, and a newer one than this build, by its day, or its commit's day for a build that is no
+  nightly, comes as a box with what changed and *Open Page*; nothing is downloaded, and a look that fails says why in
+  the message line; *Off*, `off`: it never looks),
 **Theme Editor**, which comes
   back to App, and **Folders**, every folder on one screen, the whole of it, a box a group:
   - **App Folders**: **Data** (`recompiled/`, `dumps/`, `themes/` and `prod.keys`), **Settings**, shown only
@@ -232,7 +238,7 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   game whose package does not load stops, saying why, and so does one whose package lists no Vulkan device, a driver
   for another GPU. Under them, **Amberlith Mode** (Quick, the default:
   `notime cpu graphics hooks`; Full adds `fs video audio kernel display`) and **Run Amberlith**, which plays
-  [Amberlith](../dev/edenprobe.md)'s probes as a game with the GPU driver picked here, from `probe/amberlith.nro` of the
+  [Amberlith](../dev/amberlith.md)'s probes as a game with the GPU driver picked here, from `probe/amberlith.nro` of the
   Logs folder (a release's `amberlith-<version>.nro` saved under that name; an older `probe/edenprobe.nro` when only
   that one is there), in a data folder of its own there (`probe/.scarletnx`: none of your settings, saves or users)
   with the default settings, and the build as the probe's machine (`machine=scarletnx@<commit>`), whose ban list then
@@ -280,9 +286,10 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   Nothing is moved, the folder before keeps what it has. The menu's own files stay where they are. **Clean Old Settings** asks first, with
   how many it would take out, then takes out the settings nothing reads any more: the `[Deprecated]` section the runtime
   gives a game's `.ini` for the keys it no longer uses (in the config folder's `recompiled/`, in `recompiled/`
-  and in the player's folders), the keys of `settings.ini` that no setting of the runtime's takes
-  (only while the runtime lists its settings) and those of `app.ini` the menu does not know. While a game's own
-  picks (`<id>.picks`, [Settings](settings.md)) keep keys no setting takes, the question says how many and its
+  and in the player's folders), and the keys of `settings.ini` an older version wrote that this one dropped
+  (only while the runtime lists its settings). Another version's keys stay in every file
+  ([Settings](settings.md#how-a-settings-file-is-read)). While a game's own
+  picks (`<id>.picks`, [Settings](settings.md)) keep keys an older version wrote, the question says how many and its
   choices are **Keep the Games' Own** and **With the Games' Own**, in focus, which writes each of those files again
   without them (removed with no pick left); Back takes out nothing. A box
   over the screen then lists each file and what was done to it, or why not, Up/Down and the wheel going over those
@@ -310,10 +317,16 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   (`20 is not a number from 0.25 to 16, two decimals at most`, `Ab is not a nickname: ...`). A setting that is a path
   (a shader corpus's folder, a branch profile's file, a stats file to write) is picked: Enter opens the system's
   folder, file or save dialog over the path it has, Ctrl+V and a drop give it a path too, Del takes it off; on iOS, and
-  after a dialog that could not open (said), Enter types it. A setting's words are
+  after a dialog that could not open (said), Enter types it. A row of three words or more is a list: Alt+Down, a right
+  click, a finger held half a second or a pad's A held as long opens its words in a box, the one it has in focus, and
+  the foot says how while the focus is on one (*Alt+Down/right click: list.*); Enter, a click or a tap takes one, ESC
+  or a click off the box leaves the row as it was. A row that takes a value of its own has **Other...** last, which
+  types it in the dialog of a typed value, one the row does not take said with the value it keeps (`300 is no value of
+  FPS limit: it keeps 120`). A row of two words goes on stepping, a slider sliding, a row of boxes opening its form;
+  Alt+Down there says it has no list. A setting's words are
   its values alone, the runtime's default marked `[default]` (*Off [default]*, *On*); one typed shows its default and
   `[default]` while it is empty (*1 [default]*). At its default the run takes the game's `.ini`'s, which starts as
-  that. Where a row's default is none of its words (a control not yet shown or hidden, LLVM's own options),
+  that. Where a row's default is none of its words (a control not yet shown or hidden),
   `[default]` is a value of its own, the same way. Another value, and a number typed even as its default (Current
   user 1 over a game's `.ini` that has another), goes to every Switch run as `--key=value`, over the `.ini`
   ([Usage](usage.md)), and is kept for every game:
@@ -344,15 +357,25 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   game reads its ExeFS and RomFS out of the dump on the fly, decrypting them as it reads ([Usage](usage.md)). A CIA
   is read the same way. On, a dump is extracted as before, into the game's folder or with *Extract to tmpfs* into
   tmpfs, which implies it; an extracted game's folder is read in place all the same, and copied only into tmpfs. Turning it off again takes a game's extraction away on its next run.
-  **Optimization level** (0, 1, 2, 3 or z, 2 by default) is LLVM's level for the game's code, **AOT threads** the
-  threads compiling it (0, the default Auto: the machine's cores with a quarter left free, the physical cores
-  where it says them, at most 75%, so a recompile does not make the computer stutter), **Unit cache limit** the GB
-  the compiled code units kept
-  for the next recompile may hold (20 by default, 0 for no limit; [Usage](usage.md)), and the **LLVM Internals** page
-  turns each pass of LLVM's pipelines off and sets the options LLVM's C API takes, its **All** stepping every row. They
-  are passed as `--key=value` when the game is recompiled: by **R**, or by a run that has to (a dump played the first
-  time, an NRO each time). A game made already keeps its code until then. The first two settings and these reach
+  **AOT threads** are the threads compiling the game's code (0, the default Auto: the machine's cores with a quarter
+  left free, the physical cores where it says them, at most 75%, so a recompile does not make the computer stutter),
+  **AOT threads at most** the most Auto opens, **Unit size** the instructions of a code unit, and **Unit cache
+  ceiling** the MB the units held in memory may take (512 by default, 0 for none; [Usage](usage.md)). They are passed
+  as `--key=value` when the game is recompiled: by **R**, or by a run that has to (a dump played the first time, an
+  NRO each time). A game made already keeps its code until then. The first two settings and these reach
   neither the Linux nor the 3DS driver.
+- Settings' **Search**, the row over the groups (Up from App, a click or a tap on it), Ctrl+F on the groups, a group,
+  App or User, or a pad's Y: a dialog where what is typed is looked for as it is typed, every word of it, whatever its
+  case and accents, in each row's name, `.ini` key, group, page and words, and its help, in the menu's language and in
+  English. The rows found show beside the groups, the best first (a name that starts with a word, a name with it, the
+  key, the group or page, a word, the help), each with where it is at its end (`Graphics > Vulkan Extensions`,
+  `Controllers > Player 3`), 24 at most (`24 of 61 settings: type more to see the rest`), App's rows and User's Current
+  user among them. Enter takes the dialog away and goes to the rows, which change where they are as in their group:
+  Left/Right, Enter, Del; a page's row, a row of boxes, a player's button map, an App row or Current user open their
+  screen, and ESC there comes back to the search as it was. **G** (a pad's L3, a finger's *Its group*) opens the row's
+  group, page or player on it instead, ESC from there going to the groups. Ctrl+F again types more, ESC in the dialog
+  putting back what it had; with nothing that matches the rows say so and keys do nothing on them; ESC on the rows goes
+  back to the groups, on Search.
 - The Status box, after the RAM and the CPU, says what ScarletNX's folders take (recompiled/,
   work/ and themes/ of the data folder, and on Linux its config, state and cache folders, else
   the menu's own) and what is left on that disk, counted as the menu opens and after each run. While a recompile of
@@ -372,7 +395,9 @@ built in, drawn at the window's size ([lunasvg](https://github.com/sammycage/lun
   said once), `background_recompile` (`auto`, the default, `full` or `gentle`; a word it does not know named
   with the one kept, `background_recompile = slow (it keeps auto)`; `recompile_background` before it, still read
   while it has none: its `full`, the default every `app.ini` wrote, is `auto`, its `gentle` `gentle`, written again
-  as `background_recompile`, said once), `dumps_subfolders` (`on`, the default: dumps/'s
+  as `background_recompile`, said once), `check_updates` (`ask`, the default, `on` or `off`, Check for updates'; a
+  word it does not know named with the one kept, `check_updates = yes (it keeps ask)`), `dumps_subfolders` (`on`, the
+  default: dumps/'s
   subfolders' dumps listed too; `off`: its own alone; Folders' row of it switches it), `dumps_main` (`on`, the default:
   dumps/ listed and made as ScarletNX starts; `off`: neither, Remove from Library's), `recompiled_main` (`on`, the
   default; `off`: recompiled/ not listed, new games going to an Extra), `gpu_driver` (GPU Drivers' pick, a folder of
@@ -516,8 +541,8 @@ question and choices come as the theme's `[body] options-dialog` places a questi
 without darkening them; its tip, and what a choice did or why it did not, are in the foot. Up/Down (or the mouse)
 move between the choices, Enter takes one and ESC goes back a page, on the first page asking whether to exit. The
 notices come one a page, numbered (Changed 1/8), each read before the setup goes on: Next the next one, Back (from the
-second) the one before, and OK on the last. While a game's `.ini` keeps keys under `[Deprecated]` (or the menu's own
-files keys nothing reads), the last asks what Settings > App's Clean Old Settings would take out (`Clean Old Settings?
+second) the one before, and OK on the last. While a game's `.ini` keeps keys under `[Deprecated]` (or `settings.ini`
+keys an older version wrote), the last asks what Settings > App's Clean Old Settings would take out (`Clean Old Settings?
 [Deprecated] in 2 .ini`): **Clean Now**, in focus, takes them out there, the box then saying each file and what was
 done to it, and OK goes on; **Not Now** goes on, App's row still there. Clean Now comes under Back, Not Now and Skip, a
 row apart: the choices that act on the player's files in a group of their own, as on Old Files' last page, Up/Down
@@ -683,7 +708,7 @@ cannot be read is named and the others still listed.
 - A finger held on a game half a second without moving, or a right click on it, opens its box: **Play** (**View
   Progress** for a game of the queue, which shows it on the Compile tab as Enter does), **Recompile** (R), and for a
   recompiled Switch game **Mods** (M), **Save States** (S) and **Settings**, its own (below), Back from them to
-  Games, for a made 3DS game its own **Settings** (M, below), **Export Saves** and **Import Saves**, then **AOT Pack**
+  Games, for a made 3DS, Vita, GBA or DS game its own **Settings** (M, below), **Export Saves** and **Import Saves**, then **AOT Pack**
   (B) where B builds one, and on Android **Add to Home Screen** for a game whose folder its
   title ID names ([The Android app](../hosts/android-app.md)). The finger's lift then taps nothing.
 - **M** (on Android a tap on *Mods* at the foot) opens the box of the recompiled Switch game in focus, recent or on
@@ -714,7 +739,9 @@ cannot be read is named and the others still listed.
 - On a made 3DS game **M** (on Android a tap on *Settings* at the foot) opens its own Settings, Back from them to
   Games: **Console**, alone in the 3DS group, **Global** with the launcher's (*Global (Auto [default])*), Old 3DS or
   New 3DS, which that game then runs on from the launcher and from a terminal ([Settings](settings.md)), and
-  **Reset to Global**, as a Switch game's.
+  **Reset to Global**, as a Switch game's. On a made Vita, GBA or DS game it opens the same with the Overlay group
+  alone: the on-screen controls' rows its console has something for, each control by the console's name for it
+  (*Start*, *Circle*), and the touch screen's where it has one.
 - The list is one page that scrolls, by pixels: past its height a scroll bar at its right, as every list has (below),
   which a click and a finger take. Up/Down move the focus
   and the rows glide to show it (at once with Animations off); Left/Right and PgUp/PgDn move it a screen of rows,
@@ -729,8 +756,9 @@ when another build did, or other mods, it compiles first, where it is, in the qu
 an older version laid out beside the others runs directly, as every game does on iOS. A game another console's
 driver made says so in its `.ini` (`system=` of `[Game]`: `3ds`, `vita` or `gba`; an older one by
 its layout, a 3DS `.ini`'s `model=`, a Vita folder's `ux0/`): its row says "3DS game, ready to run" and the like, and
-Enter and R go through that driver, in the game's folder (`--game=`), with none of the Switch's Settings. A CIA goes
-to `scarletnx-3ds`, which is never executed on it directly. Output capture, resource accounting and the return to
+Enter and R go through that driver, in the game's folder (`--game=`), with the Settings that driver takes alone: a
+Vita, GBA or DS game's on-screen controls and touch screen among them, under what the game's own Settings pick. A CIA
+goes to `scarletnx-3ds`, which is never executed on it directly. Output capture, resource accounting and the return to
 the main menu work as for a file picked by a load.
 
 ### The Compile tab

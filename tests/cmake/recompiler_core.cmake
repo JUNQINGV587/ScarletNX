@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright 2026 the ScarletNX contributors
+# The recompiler's core (snx_recompiler_core, src/common/cpu/recompiler/CMakeLists.txt): tests/CMakeLists.txt includes it
+# in every build of the tests
+
+# what the core's archive needs from outside it: the decoders and the host calls (snx_recompiler_base, snx_arm_decode)
+# and the system's libraries, no LLVM (tests/recompiler_symbols.cmake). Its program links every object of the archive
+# with those, named here rather than taken from the core's own link line
+add_executable(snx-test-recompiler-core-symbols EXCLUDE_FROM_ALL
+               "${PROJECT_SOURCE_DIR}/tests/recompiler_symbols.c")
+set_target_properties(snx-test-recompiler-core-symbols PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
+target_compile_options(snx-test-recompiler-core-symbols PRIVATE -pedantic-errors -Wall -Wextra -Werror)
+add_dependencies(snx-test-recompiler-core-symbols snx_recompiler_core)
+target_link_libraries(snx-test-recompiler-core-symbols PRIVATE
+                      "$<LINK_LIBRARY:WHOLE_ARCHIVE,$<TARGET_FILE:snx_recompiler_core>>" snx_recompiler_base
+                      snx_arm_decode Threads::Threads ${CMAKE_DL_LIBS})
+if(NOT WIN32)
+    target_link_libraries(snx-test-recompiler-core-symbols PRIVATE m)
+endif()
+snx_test_sanitize(snx-test-recompiler-core-symbols) # the sanitizers' runtime, which the archive's objects call there
+add_test(NAME recompiler_core_symbols COMMAND "${CMAKE_COMMAND}" "-DBUILD=${PROJECT_BINARY_DIR}"
+         -DTARGET=snx-test-recompiler-core-symbols "-DARCHIVE=$<TARGET_FILE:snx_recompiler_core>" "-DNM=${CMAKE_NM}"
+         "-DCONFIG=$<CONFIG>" "-DLIBRARIES=snx_recompiler_base's, snx_arm_decode's or the system's"
+         "-DRULE=The recompiler's core builds and links without LLVM (src/common/cpu/recompiler/CMakeLists.txt)"
+         -P "${PROJECT_SOURCE_DIR}/tests/recompiler_symbols.cmake")
+
+# the version of the native back ends' code that the JIT cache's key names (cmake/native_code_hash.cmake)
+add_test(NAME native_code_hash COMMAND "${CMAKE_COMMAND}" "-DSCRIPT=${PROJECT_SOURCE_DIR}/cmake/native_code_hash.cmake"
+         "-DWORK=${CMAKE_CURRENT_BINARY_DIR}/native-code-hash"
+         -P "${PROJECT_SOURCE_DIR}/tests/native_code_hash_test.cmake")
+
+# the recompiler's library (library.c) with no LLVM: its sources, the JIT's and the AArch32 executor beside them
+# (cpu/arm/exec.c), and the program that recompiles and runs through it
+set(target snx-test-recompiler-library-none)
+set(jit "${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler/jit")
+add_executable(${target} "${PROJECT_SOURCE_DIR}/tests/recompiler_library_none.c"
+                         "${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler/library.c" "${jit}/jit_service.c"
+                         "${jit}/jit_cache.c" "${jit}/jit_cache_key.c"
+                         "${PROJECT_SOURCE_DIR}/src/common/cpu/arm/exec.c")
+snx_test_target(${target} gnu23)
+target_link_libraries(${target} PRIVATE snx_recompiler_core snx_arm_rt Threads::Threads ${CMAKE_DL_LIBS})
+if(NOT WIN32)
+    target_link_libraries(${target} PRIVATE m)
+endif()
+add_test(NAME recompiler_library_none COMMAND ${target})

@@ -25,7 +25,7 @@ int main(void) {
     assert(gui_steps_percent(&s) == 0);
     feed(&s, "  compiled block 1/4: code_000 (1.0 s)\n", 30);
     assert(at(&s, 3)->value == 1 && at(&s, 3)->total == 4 && gui_steps_percent(&s) == 25);
-    feed(&s, "  compiled block 3/4: code_002 (1.0 s)\nLLVM module: 1.1 MB\nBuilt /games/Game\n", 40);
+    feed(&s, "  compiled block 3/4: code_002 (1.0 s)\nx86-64 module: 1.1 MB\nBuilt /games/Game\n", 40);
     assert(s.count == 5 && at(&s, 3)->state == GUI_STEP_DONE && !strcmp(at(&s, 4)->label, "BUILD"));
     assert(at(&s, 4)->state == GUI_STEP_DONE && gui_steps_percent(&s) == 100);
     {
@@ -47,7 +47,7 @@ int main(void) {
     n = gui_step_notes(&s, at(&s, 3), notes, 8);
     assert(n == 4 && !strcmp(notes[0]->text, "Functions: 9  instructions: 99"));
     assert(!strcmp(notes[1]->text, "compiled block 1/4: code_000 (1.0 s)") &&
-           !strcmp(notes[3]->text, "LLVM module: 1.1 MB"));
+           !strcmp(notes[3]->text, "x86-64 module: 1.1 MB"));
     assert(notes[0]->shown_ms == 20 && notes[1]->shown_ms == 30);
     n = gui_step_notes(&s, at(&s, 3), notes, 2);
     assert(n == 2 && !strcmp(notes[0]->text, "compiled block 3/4: code_002 (1.0 s)"));
@@ -55,6 +55,36 @@ int main(void) {
     n = gui_step_notes(&s, at(&s, 6), notes, 8); /* the second device line is the GPU step's too */
     assert(n == 2 && !strcmp(notes[0]->text, "vulkan: pipeline cache loaded (662 KB)"));
     assert(gui_step_notes(&s, at(&s, 0), notes, 8) == 0 && gui_step_notes(&s, at(&s, 4), notes, 8) == 0);
+
+    /* a recompile refused, the host below its back end's floor (nx/runtime/driver/recompile.c): what it lacks is the
+       failed step's note, the longest of them (tests/native_floor.c) whole */
+    {
+        static const char refused[] = "cpu: needs SSE2, this host has none";
+        GuiSteps below;
+        char text[160];
+        gui_steps_reset(&below);
+        snprintf(text, sizeof text, "Recompiling Game (1 modules)\nscarletnx: %s\n", refused);
+        feed(&below, text, 10);
+        gui_steps_finish(&below, 0);
+        assert(below.count == 1 && at(&below, 0)->state == GUI_STEP_FAILED);
+        assert(gui_step_notes(&below, at(&below, 0), notes, 8) == 1 && !strncmp(notes[0]->text, "scarletnx: ", 11) &&
+               !strcmp(notes[0]->text + 11, refused));
+        /* said after how it ended, a theme without the notes too; a driver's other lines are none of it */
+        assert(!strcmp(below.refused, refused));
+        gui_steps_failure(&below, "Recompile failed (status 1).", text, sizeof text);
+        assert(!strncmp(text, "Recompile failed (status 1). ", 29) && !strcmp(text + 29, refused));
+        gui_steps_reset(&below);
+        feed(&below, "scarletnx-3ds: abi: needs ELFv2, this build has ELFv1\n", 10);
+        assert(!strcmp(below.refused, "abi: needs ELFv2, this build has ELFv1"));
+        gui_steps_reset(&below);
+        feed(&below,
+             "jit: cannot start (cpu: needs POPCNT, this host has SSE3), so only the AOT pack can run\n"
+             "scarletnx: cannot create /games\n",
+             10);
+        assert(!below.refused[0]); /* the JIT's line is no driver's refusal */
+        gui_steps_failure(&below, "Recompile failed (status 1).", text, sizeof text);
+        assert(!strcmp(text, "Recompile failed (status 1)."));
+    }
 
     /* a collection's program that starts another: a PROGRAM step, the switch under way until the program's window
        opens (its recompile in between when it is not made), and nothing once it has */

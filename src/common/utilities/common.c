@@ -12,10 +12,11 @@
 #define _DARWIN_C_SOURCE
 #endif
 #include "common/utilities/common.h"
+#include "common/platform/thread.h"
 #include "common/utilities/ascii.h"
 #include "common/utilities/bits.h"
 #include "common/utilities/endian.h"
-#include "common/utilities/ini_lines.h"
+#include "common/utilities/config_file.h"
 #include "common/platform/time.h"
 #include "common/platform/vm.h"
 #include <libdeflate.h>
@@ -51,6 +52,7 @@
 
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #include <sys/param.h>
+#include <sys/resource.h> /* the resident set's peak (snx_footprint_peak) */
 #endif
 #ifdef __FreeBSD__
 #include <sys/types.h>
@@ -101,9 +103,8 @@ int snx_path_format(char* out, size_t size, const char* fmt, ...) {
     snx_path_native(out);
     return 0;
 }
-/* the kinds whose folder app.ini names wrongly, and the options given by an older name, said once */
+/* the options given by an older name, said once */
 static struct {
-    unsigned said_kinds;
     const char* renamed[16];
     size_t renamed_count;
     volatile int abort_requested; /* snx_abort_request's, from another thread than the one that asks */
@@ -1181,24 +1182,26 @@ char* snx_app_kind_default(const char* app, int kind) {
 }
 /* the folder of kind the app.ini in config names in [folders] (Settings > App > Folders' Logs and Caches): 1 with *dir
    a full path, -1 with *dir a value that is not one, 0 for none (no file, no key, an empty one) */
+typedef struct {
+    const char* wanted;
+    char* dir;
+    int found;
+} PickedKind;
+static void picked_take(void* ctx, const char* section, const char* key, const char* value, int line) {
+    PickedKind* p = (PickedKind*)ctx;
+    (void)line;
+    if (strcmp(section, "folders") || strcmp(key, p->wanted)) return;
+    free(p->dir); /* the last one, as the launcher reads it */
+    p->dir = *value ? snx_strdup(value) : NULL;
+    p->found = !*value ? 0 : snx_path_is_full(value) ? 1 : -1;
+}
 static int picked_kind(const char* config, int kind, char** dir) {
-    size_t size;
-    char *path = snx_path_join(config, "app.ini"), *text = path ? (char*)snx_read_file(path, &size) : NULL, *key,
-         *value;
-    const char* wanted = kind == SNX_USER_STATE ? "state" : "cache";
-    int found = 0;
-    SnxIni ini;
-    *dir = NULL;
-    if (text) snx_ini_start(&ini, text);
-    while (text && snx_ini_next(&ini, &key, &value))
-        if (!strcmp(ini.section, "folders") && !strcmp(key, wanted)) { /* the last one, as the launcher reads it */
-            free(*dir);
-            *dir = *value ? snx_strdup(value) : NULL;
-            found = !*value ? 0 : snx_path_is_full(value) ? 1 : -1;
-        }
-    free(text);
+    char* path = snx_path_join(config, "app.ini");
+    PickedKind p = {kind == SNX_USER_STATE ? "state" : "cache", NULL, 0};
+    if (path) snx_config_keys(path, picked_take, &p); /* one it cannot read said, once */
     free(path);
-    return found;
+    *dir = p.dir;
+    return p.found;
 }
 char* snx_app_kind_dir(const char* app, int kind) {
     char *dir = snx_app_kind_default(app, kind), *picked;
@@ -1209,11 +1212,13 @@ char* snx_app_kind_dir(const char* app, int kind) {
         free(dir);
         dir = picked;
         picked = NULL;
-    } else if (found < 0 && !(g_common.said_kinds & 1u << kind)) {
-        g_common.said_kinds |= 1u << kind;
-        snx_error("%s/app.ini: [folders] %s = %s is not a full path: the %s go in %s", config,
-                  kind == SNX_USER_STATE ? "state" : "cache", picked, kind == SNX_USER_STATE ? "logs" : "caches",
-                  dir ? dir : "(none)");
+    } else if (found < 0) {
+        const char* name = kind == SNX_USER_STATE ? "state" : "cache";
+        char* what = snx_format("app.ini [folders] %s = %s", name, picked);
+        if (snx_config_first(config, what)) /* once a run for each app.ini and value, as every settings file */
+            snx_error("%s/app.ini: [folders] %s = %s is not a full path: the %s go in %s", config, name, picked,
+                      kind == SNX_USER_STATE ? "logs" : "caches", dir ? dir : "(none)");
+        free(what);
     }
     if (found) free(picked);
     free(config);
@@ -1499,7 +1504,7 @@ static unsigned snx_physical_cores(void) {
 /* The threads an AOT pass (a game's recompile) is given when its count is left open, the recompile setting's Auto: a
    core each, the physical cores where the system says them, else the processors, capped so a part of the machine
    stays free for the rest of it. A pass that took every core would make the computer it shares stutter for the
-   minutes a large game's recompile runs and heat a phone, and an LLVM pass gains little from a hyperthread anyway:
+   minutes a large game's recompile runs and heat a phone, and a compile gains little from a hyperthread anyway:
    two threads on one physical core only split its throughput. The cap is a reserve of one whole core, or a quarter
    of the machine where that is more, which is at most 75% rounded down: a machine of 4 keeps a thread off, 6 and 8
    keep two, 16 keep four, 32 keep eight. Never 0, and never more than the online processors */
@@ -1628,6 +1633,50 @@ SnxU64 snx_footprint(void) {
 #else
     return 0;
 #endif
+}
+SnxU64 snx_footprint_peak(void) {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS info;
+    return GetProcessMemoryInfo(GetCurrentProcess(), &info, sizeof info) ? (SnxU64)info.PeakWorkingSetSize : 0;
+#elif defined(__linux__) || defined(__APPLE__) || defined(__FreeBSD__)
+    struct rusage usage;
+    if (getrusage(RUSAGE_SELF, &usage) || usage.ru_maxrss <= 0) return 0;
+#ifdef __APPLE__
+    return (SnxU64)usage.ru_maxrss; /* bytes there, KiB on the others */
+#else
+    return (SnxU64)usage.ru_maxrss << 10;
+#endif
+#else
+    return 0;
+#endif
+}
+void snx_phases_line(char* out, size_t size, const SnxRecompilePhases* p) {
+    char peak[64], end[96];
+    if (p->peak)
+        snprintf(peak, sizeof peak, "peak %llu MiB", (unsigned long long)(p->peak >> 20));
+    else
+        snprintf(peak, sizeof peak, "the system does not say the peak");
+    if (p->pack)
+        snprintf(end, sizeof end, "pack %.1f s", p->link);
+    else if (p->streamed)
+        snprintf(end, sizeof end, "link and write %.1f s", p->link + p->write);
+    else
+        snprintf(end, sizeof end, "link %.1f s, write %.1f s", p->link, p->write);
+    snprintf(out, size,
+             "code: discovery %.1f s, compile %.1f s (%.1f s of units on %u thread%s), descriptor %.1f s, %s; %s",
+             p->discovery, p->compile, p->units, p->threads, p->threads == 1u ? "" : "s", p->descriptor, end, peak);
+}
+void snx_ssa_line(char* out, size_t size, const SnxSsaCount* ssa, SnxU64 guest) {
+    snprintf(out, size,
+             "ssa: %llu instructions for %llu guest instructions (%.2f each), %.1f MiB as the back end holds it, "
+             "%.1f MiB packed",
+             (unsigned long long)ssa->instructions, (unsigned long long)guest,
+             guest ? (double)ssa->instructions / (double)guest : 0.0, (double)ssa->bytes / 1048576.0,
+             (double)ssa->packed / 1048576.0);
+}
+void snx_recompile_line(char* out, size_t size, double before, double code, double after) {
+    snprintf(out, size, "recompile: %.1f s in all: %.1f s before the code, %.1f s the code, %.1f s after it",
+             before + code + after, before, code, after);
 }
 void snx_unit_line(char* out, size_t size, size_t done, size_t count, const char* name, const char* label, int cached,
                    double seconds, SnxU64 used) {
@@ -1766,6 +1815,10 @@ void snx_thread_clock_close(SnxU64 clock) {
 #else
     (void)clock;
 #endif
+}
+int plat_cpu_count(void) {
+    int ids[1024], n = plat_cpus(ids, 1024);
+    return n > 0 ? n : (int)snx_cpu_count();
 }
 void snx_thread_name_get(char* out, size_t n) {
     if (!n) return;

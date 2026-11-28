@@ -9,8 +9,8 @@
    R_LARCH_CALL36 (PCADDU18I and JIRL, a tail call's of t8 and zero), resolved here where the callee is this object's
    own; snx_stale's address an R_LARCH_64 in the code */
 #include "common/cpu/recompiler/la64/la64_codegen.h"
-#include "common/cpu/recompiler/llvm/link.h"
-#include "common/cpu/recompiler/llvm/elf_object.h"
+#include "common/cpu/recompiler/object/link.h"
+#include "common/cpu/recompiler/object/elf_object.h"
 #include "common/cpu/aarch64/a64_decoder.h"
 #include "common/cpu/aarch64/cpu.h"
 #include "common/runtime/interface.h"
@@ -45,7 +45,7 @@ static inline void sgx_machine_op(SgXAsm* a, int at, const unsigned char* r);
 
 /* ---- what mach_codegen.inc asks of the machine ---- */
 #define MG_EM EM_LOONGARCH
-#define MG_ELF_FLAGS 0x43 /* the LP64D ABI, object file v1: LLVM's loongarch64 objects' */
+#define MG_ELF_FLAGS  0x43 /* the LP64D ABI, object file v1 */
 #define MG_R_ABS64 SNX_LA_64
 #define MG_R_LITERAL SNX_LA_64_PCREL
 #define MG_R_CALL SNX_LA_CALL36

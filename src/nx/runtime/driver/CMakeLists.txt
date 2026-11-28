@@ -10,7 +10,7 @@ target_link_libraries(snx_nx_module PUBLIC scarletnx-common)
 include("${PROJECT_SOURCE_DIR}/cmake/hookgen.cmake")
 snx_hook_routes(snx_nx_module)
 add_library(snx_driver STATIC driver.c container.c extract.c game_name.c fabricate.c nros.c pack.c recompile.c setup.c toolchain.c mcp.c
-                              mcp_edenprobe.c mcp_gdb.c ../../loader/loader.c ../../loader/match.c ../../loader/relocate.c)
+                              mcp_amberlith.c mcp_gdb.c disasm.c ../../loader/loader.c ../../loader/match.c ../../loader/relocate.c)
 set_target_properties(snx_driver PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS OFF)
 target_compile_definitions(snx_driver PRIVATE
     SNX_SOURCE_DIR="${PROJECT_SOURCE_DIR}" SNX_BUILD_DIR="${PROJECT_BINARY_DIR}" _CRT_SECURE_NO_WARNINGS
@@ -26,25 +26,22 @@ endif()
 if(NOT SNX_TOOLS_ONLY)
     target_compile_definitions(snx_driver PRIVATE SNX_WITH_RUNTIME)
 endif()
-include("${PROJECT_SOURCE_DIR}/cmake/llvm.cmake")
-add_subdirectory("${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler/llvm" llvm-backend)
-# the NX game module through the LLVM backend; GNU C23 for the LLVM-C headers, the driver itself stays ISO C23
-add_library(snx_driver_llvm STATIC ../../loader/module_llvm.c ../../loader/module_x64.c ../../loader/module_variants.c ../../loader/module_arm.c
-                                   llvm_tuning.c disasm.c "${SNX_SETTINGS_LLVM}")
-set_target_properties(snx_driver_llvm PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS ON)
-target_compile_options(snx_driver_llvm PRIVATE -Wall -Wextra -Werror=missing-prototypes)
-target_link_libraries(snx_driver_llvm PUBLIC snx_llvm snx_arm_llvm snx_nx_module snx_settings)
-# the A64 Sail's encoders: the arm64 host's descriptor functions (module_x64.c)
+# the recompiler, and the library of it (snx_recompiler.h)
+add_subdirectory("${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler" recompiler)
+# the descriptor of a module of the native back end's code (loader/module_x64.c), and the A64 Sail's encoders: the
+# arm64 host's descriptor functions
+add_library(snx_nx_descriptor STATIC ../../loader/module_x64.c)
+set_target_properties(snx_nx_descriptor PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS ON)
+target_compile_options(snx_nx_descriptor PRIVATE -Wall -Wextra -Werror=missing-prototypes)
+target_link_libraries(snx_nx_descriptor PUBLIC snx_recompiler_core snx_nx_module)
 include("${PROJECT_SOURCE_DIR}/cmake/sailgen.cmake")
-snx_sailgen_a64_encoders(snx_driver_llvm)
-# scarletnx --mcp's disassembler (disasm.c), where LLVM has its AArch64 target (cmake/llvm.cmake)
-if(SNX_LLVM_A64_DISASM)
-    target_compile_definitions(snx_driver_llvm PRIVATE SNX_A64_DISASM)
-    target_link_libraries(snx_driver_llvm PUBLIC ${SNX_LLVM_DISASM_LIBS})
-endif()
-target_link_libraries(snx_driver PUBLIC snx_driver_llvm)
-# the recompiler as a library (snx_recompiler.h), over the backends configured above
-add_subdirectory("${PROJECT_SOURCE_DIR}/src/common/cpu/recompiler" recompiler-library)
+snx_sailgen_a64_encoders(snx_nx_descriptor)
+# the NX game module ahead of time (loader/module_a64.c, module_arm.c): the native back end's code
+add_library(snx_nx_aot STATIC ../../loader/module_a64.c ../../loader/module_arm.c)
+set_target_properties(snx_nx_aot PROPERTIES C_STANDARD 23 C_STANDARD_REQUIRED ON C_EXTENSIONS ON)
+target_compile_options(snx_nx_aot PRIVATE -Wall -Wextra -Werror=missing-prototypes)
+target_link_libraries(snx_nx_aot PUBLIC snx_nx_descriptor snx_recompiler_jit snx_nx_module snx_settings)
+target_link_libraries(snx_driver PUBLIC snx_nx_aot)
 # a build of the host tools: the Switch driver scarletnx runs (src/multicall) is the driver alone, which plays nothing
 if(SNX_TOOLS_ONLY)
     add_library(snx_switch_program STATIC main.c)

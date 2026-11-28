@@ -1,20 +1,29 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
    Copyright 2026 the ScarletNX contributors */
-/* sailgen's x86-64 back end (tools/sailgen/x64.h, its instruction selection derived from the Intel SDM) against its
-   LLVM back end, word by word: every word of the decoder's rows (llvm_qemu_words.c, decoded for the ounce target, each
-   again with Rd, Rn and Rm 31) that the x86-64 back end's roots (a64_x64.roots) take becomes x86-64 code for u64
-   step(CPU*), once with the host's BMI1, BMI2 and LZCNT and once with none (the candidates without them), and an LLVM
-   step (llvm_steps.c, the generated LLVM emitters); both run from the same random states, and every register, the
-   flags, the next pc and the runtime's UNDEF must match. Then sequences of two to four of those words (--sequences N)
-   become one block each, one SSA (a register read once, a compare's flags read by the next word's condition, the stores
-   a later one overwrites dropped), run beside the LLVM steps of the words one after another, each at its pc.
-     snx-test-sail-x64 [--states N] [--samples N] [--sequences N] [--pool N] [--xmm N] [--verbose] [--dump WORD...]
+/* sailgen's x86-64 back end (tools/sailgen/x64.h, its instruction selection derived from the Intel SDM) against QEMU,
+   word by word: every word of the decoder's rows (native_qemu_words.c, decoded for the ounce target, each again with
+   Rd, Rn and Rm 31) that the x86-64 back end's roots (a64_x64.roots) take becomes x86-64 code for u64 step(CPU*), once
+   with the host's BMI1, BMI2 and LZCNT and once with none (the candidates without them); both run from the states of
+   the word's own seed (sail_qemu.h) beside qemu-aarch64 -cpu max (tests/qemu_ref), and every register, the flags, FPCR,
+   FPSR, the vector registers, the memory it changed and how it ended (the next pc, UNDEF) must be QEMU's. A host where
+   QEMU can't run beside the test (Windows) holds them to a reference of QEMU's ends that the qemu-reference job records
+   (--record): the hash of each word's every state. The words QEMU can't stand for, and a store-exclusive whose monitor
+   is armed where the memory changed, are held to what LLVM's steps made of them, frozen (--frozen FILE, sail_qemu.h).
+   Then sequences of two to four of those words (--sequences N) become
+   one block each, one SSA (a register read once, a compare's flags read by the next word's condition, the stores a
+   later one overwrites dropped), run beside the code of each word alone at its pc, one after another.
+     snx-test-sail-x64 (--qemu QEMU RUNNER DIR [--record FILE] | --reference[-if-there] FILE | --skip REASON)
+                       [--frozen FILE] [--states N] [--samples N] [--sequences N] [--pool N] [--xmm N] [--verbose]
+                       [--dump WORD...] [--counts FILE]
+   --counts FILE: no state run, no QEMU: one line per word the back end makes, the word, its op, and the hex bytes of
+   its step on this host's features and on the plain host's ("-" where none), which x64_density.py --sail counts
    --pool N gives the back end N host registers of its nine, so it spills (ctest runs it with 3 too), --xmm N of its
-   sixteen vector ones (ctest: 6 with 3)
+   sixteen vector ones (ctest: 6 with 3). --record also writes QEMU's ends of every word a host of any feature makes;
+   --reference-if-there skips (77) where the file is not there
    A word the x86-64 back end takes but can't make (its sg_fail) is a failure too, named with why */
 #include "sail_x64_emit.h"
-#include "llvm_steps.h"
-#include "llvm_qemu_words.h"
+#include "sail_qemu.h"
+#include "native_qemu_words.h"
 #include "common/cpu/aarch64/a64_decoder.h"
 #include <math.h>
 #include <setjmp.h>
@@ -42,7 +51,7 @@ typedef jmp_buf sigjmp_buf;
 
 #define TARGET SNX_A64_TARGET_OUNCE
 #define CODE_MAX 8192
-/* guest memory for the loads and stores, as llvm_sail_ir.c's: each side's own, guest address 0 MEMORY_ZERO bytes in,
+/* guest memory for the loads and stores: each side's own, guest address 0 MEMORY_ZERO bytes in,
    the same random bytes, every access below MEMORY_TOUCHED (the address registers point at 0x1000 to 0x1ff0) */
 #define MEMORY_SIZE    (4u << 20)
 #define MEMORY_ZERO    (2u << 20)
@@ -58,7 +67,8 @@ static struct {
     unsigned sev, wfe;
     /* what run allocates, which main frees after every one of its ways out */
     u32* rows;
-    size_t (*offset)[2]; /* and the words after them */
+    void* words; /* run's Words */
+    size_t made_bytes; /* make's last code's bytes, which --counts writes */
     void* sequences;
 } g_test;
 
@@ -94,20 +104,6 @@ static void fp_state(CPU* c, unsigned s) {
     c->fpcr = s & 1 ? (u32)rnd() & (3u << 22 | 1u << 24 | 1u << 25 | 1u << 26 | 1u << 19) : 0;
     c->fpsr = (u32)rnd() & 0x9f;
 }
-/* --verbose: the SIMD&FP registers, FPSR and FPCR where the ends differ */
-static void fp_report(const CPU* a, const CPU* b, const CPU* start) {
-    unsigned r;
-    for (r = 0; r < 32; ++r)
-        if (memcmp(&a->v[r], &b->v[r], sizeof a->v[r]))
-            fprintf(stderr, "  v%u: llvm %016llx:%016llx x64 %016llx:%016llx (was %016llx:%016llx)\n", r,
-                    (unsigned long long)a->v[r].d[1], (unsigned long long)a->v[r].d[0],
-                    (unsigned long long)b->v[r].d[1], (unsigned long long)b->v[r].d[0],
-                    (unsigned long long)start->v[r].d[1], (unsigned long long)start->v[r].d[0]);
-    if (a->fpsr != b->fpsr || a->fpcr != b->fpcr)
-        fprintf(stderr, "  fpsr: llvm %08x x64 %08x (was %08x); fpcr: llvm %08x x64 %08x\n", a->fpsr, b->fpsr,
-                start->fpsr, a->fpcr, b->fpcr);
-}
-/* the SIMD&FP state two ends differ in */
 static int fp_differs(const CPU* a, const CPU* b) {
     return memcmp(a->v, b->v, sizeof a->v) || a->fpsr != b->fpsr || a->fpcr != b->fpcr;
 }
@@ -167,35 +163,6 @@ static void on_undef(CPU* c, u64 pc, u32 word) {
     (void)pc;
     (void)word;
     ++g_test.undef;
-}
-
-/* a load's or a store's: the address registers into the memory, and for a store-exclusive an armed monitor half the
-   time (as llvm_sail_ir.c's ldst_start) */
-static int is_ldst(u32 word) {
-    const char* n = op_name(word);
-    return n && (!strncmp(n, "LD", 2) || !strncmp(n, "ST", 2) || !strncmp(n, "CAS", 3) || !strncmp(n, "SWP", 3) ||
-                 !strncmp(n, "PRF", 3));
-}
-static void ldst_start(CPU* c, u32 word, unsigned s) {
-    SnxA64Insn insn;
-    u64 address;
-    snx_a64_decode_word(word, TARGET, &insn);
-    c->x[31] = 0x1000 + (rnd() & 0xff0);
-    c->x[insn.args.rn] = 0x1000 + (rnd() & 0xff0);
-    c->x[insn.args.rm] = 0x1000 + (rnd() & 0xff0);
-    if (insn.op == SNX_A64_OP_LDAPR_i || insn.op == SNX_A64_OP_STLR_i)
-        c->x[insn.args.rn] -= (c->x[insn.args.rn] + (u64)(int64_t)insn.args.imm) & ((1u << insn.args.sz) - 1);
-    address = c->x[insn.args.rn];
-    c->excl_on = 0;
-    if (!(s & 1)) return;
-    if (insn.op == SNX_A64_OP_STXR || (insn.op == SNX_A64_OP_STXP && insn.args.sz == 3)) {
-        c->excl_on = 1;
-        c->excl_addr = address;
-        memcpy(&c->excl_val, g_test.memory[2] + MEMORY_ZERO + address, 8);
-        memcpy(&c->excl_val2, g_test.memory[2] + MEMORY_ZERO + address + 8, 8);
-        if (s & 2) c->excl_val = ~c->excl_val;
-        c->excl_size = insn.op == SNX_A64_OP_STXP ? 0x13 : (u32)insn.args.sz;
-    }
 }
 
 typedef u64 (*Step)(CPU* c);
@@ -328,6 +295,138 @@ static size_t check_fz_hot(void) {
     return failures;
 }
 
+/* FCMP and FCMPE's flags inline (x64_a64.h's sg_FPCompare): an ordered compare, and FCMP's of a quiet NaN, take no
+   helper call; a signalling NaN (FCMP), any NaN (FCMPE) or a denormal FZ flushes take the helper, which raises IOC or
+   IDC, and its flags come back by the cold path's POPFQ. NZCV and FPSR as the console gives them, from FPSR clear */
+static size_t check_fcmp_paths(void) {
+    static const struct {
+        u32 word;
+        const char* text;
+        u64 v1, v2;
+        u32 fpcr;
+        u32 nzcv, fpsr;
+        int cold;
+    } cases[] = {
+        {0x1E222020u, "FCMP s1, s2 of 1.5 and 2.25", 0x3FC00000u, 0x40100000u, 0, 0x8, 0, 0},
+        {0x1E222020u, "FCMP s1, s2 of equals", 0x40100000u, 0x40100000u, 0, 0x6, 0, 0},
+        {0x1E222020u, "FCMP s1, s2 of -0 and 0", 0x80000000u, 0, 0, 0x6, 0, 0},
+        {0x1E222020u, "FCMP s1, s2 of 2.25 and 1.5", 0x40100000u, 0x3FC00000u, 0, 0x2, 0, 0},
+        {0x1E222020u, "FCMP s1, s2 of -inf and inf", 0xFF800000u, 0x7F800000u, 0, 0x8, 0, 0},
+        {0x1E222020u, "FCMP s1, s2 of a quiet NaN", 0x7FC00000u, 0x3F800000u, 0, 0x3, 0, 0},
+        {0x1E222020u, "FCMP s1, s2 of 1 and a quiet NaN", 0x3F800000u, 0xFFC00001u, 0, 0x3, 0, 0},
+        {0x1E222020u, "FCMP s1, s2 of a signalling NaN", 0x7FA00000u, 0x3F800000u, 0, 0x3, 0x1, 1},
+        {0x1E222020u, "FCMP s1, s2 of 1 and a signalling NaN", 0x3F800000u, 0xFF800001u, 0, 0x3, 0x1, 1},
+        {0x1E222030u, "FCMPE s1, s2 of a quiet NaN", 0x7FC00000u, 0x3F800000u, 0, 0x3, 0x1, 1},
+        {0x1E222030u, "FCMPE s1, s2 of 1.5 and 2.25", 0x3FC00000u, 0x40100000u, 0, 0x8, 0, 0},
+        {0x1E222020u, "FCMP s1, s2 of a denormal and 0", 0x00000001u, 0, 0, 0x2, 0, 0},
+        {0x1E222020u, "FCMP s1, s2 of a denormal and 0 under FZ", 0x00000001u, 0, 1u << 24, 0x6, 0x80, 1},
+        {0x1E622020u, "FCMP d1, d2 of 1.5 and 2.25", 0x3FF8000000000000ull, 0x4002000000000000ull, 0, 0x8, 0, 0},
+        {0x1E622020u, "FCMP d1, d2 of a quiet NaN", 0x3FF8000000000000ull, 0x7FF8000000000000ull, 0, 0x3, 0, 0},
+        {0x1E622020u, "FCMP d1, d2 of a signalling NaN", 0x7FF4000000000000ull, 0x3FF8000000000000ull, 0, 0x3, 0x1, 1},
+        {0x1E622030u, "FCMPE d1, d2 of a quiet NaN", 0xFFF8000000000001ull, 0x3FF8000000000000ull, 0, 0x3, 0x1, 1},
+        {0x1E622020u, "FCMP d1, d2 of denormals under FZ", 0x8000000000000001ull, 1, 1u << 24, 0x6, 0x80, 1},
+        {0x1E622020u, "FCMP d1, d2 of 2.25 and 1.5 under FZ", 0x4002000000000000ull, 0x3FF8000000000000ull, 1u << 24,
+         0x2, 0, 0},
+    };
+    unsigned char* code = snx_test_pages(CODE_MAX);
+    size_t failures = 0, k;
+    if (code == NULL) {
+        fprintf(stderr, "FAIL: FCMP's paths: no memory for the code\n");
+        return 1;
+    }
+    for (k = 0; k < sizeof cases / sizeof *cases; ++k) {
+        CPU c;
+        unsigned long calls;
+        u32 nzcv;
+        int cold;
+        if (snx_test_pages_exec(code, CODE_MAX, 0) ||
+            !snx_x64_step(cases[k].word, 0x1000, TARGET, host_features(), code, CODE_MAX) ||
+            snx_test_pages_exec(code, CODE_MAX, 1)) {
+            fprintf(stderr, "FAIL: %s %08x: not made\n", cases[k].text, (unsigned)cases[k].word);
+            ++failures;
+            continue;
+        }
+        memset(&c, 0, sizeof c);
+        c.v[1].d[0] = cases[k].v1;
+        c.v[2].d[0] = cases[k].v2;
+        c.fpcr = cases[k].fpcr;
+        c.n = c.z = c.cf = c.vf = 1; /* each written */
+        c.pc = 0x1000;
+        calls = snx_x64_fp_calls();
+        run_step((Step)(void*)code, &c);
+        cold = snx_x64_fp_calls() != calls;
+        nzcv = (u32)(c.n << 3 | c.z << 2 | c.cf << 1 | c.vf);
+        if (nzcv != cases[k].nzcv || c.fpsr != cases[k].fpsr || cold != cases[k].cold) {
+            fprintf(stderr, "FAIL: %s: NZCV %x (want %x), FPSR %08x (want %08x), %s the helper (want %s)\n",
+                    cases[k].text, nzcv, cases[k].nzcv, c.fpsr, cases[k].fpsr, cold ? "through" : "without",
+                    cases[k].cold ? "through" : "without");
+            ++failures;
+        }
+    }
+    snx_test_pages_free(code, CODE_MAX);
+    printf("sail_x64: FCMP's paths, %zu cases\n", sizeof cases / sizeof *cases);
+    return failures;
+}
+
+/* the compare helper's flags for the native cold path (desc bit 9): the RFLAGS UCOMISx b, a leaves, of the operands
+   as FPCR.FZ flushes them (bits 1 and 9 set), for every pair of these floats, FCMP's and FCMPE's, FZ clear and set */
+u64 snx_x64_fp_compare(CPU* c, u64 a, u64 b, u64 fpcr, u32 desc);
+static size_t check_fcmp_image(void) {
+    size_t failures = 0;
+#if defined(__x86_64__)
+    static const u64 k[2][10] = {
+        {0, 0x80000000u, 0x3F800000u, 0xBFC00000u, 0x7F800000u, 0xFF800000u, 0x7FC00000u, 0x7FA00000u, 0x00000001u,
+         0x807FFFFFu},
+        {0, 0x8000000000000000ull, 0x3FF0000000000000ull, 0xBFF8000000000000ull, 0x7FF0000000000000ull,
+         0xFFF0000000000000ull, 0x7FF8000000000000ull, 0x7FF4000000000000ull, 1, 0x800FFFFFFFFFFFFFull},
+    };
+    for (int dbl = 0; dbl < 2; ++dbl)
+        for (int fz = 0; fz < 2; ++fz)
+            for (int signal = 0; signal < 2; ++signal)
+                for (int i = 0; i < 10; ++i)
+                    for (int j = 0; j < 10; ++j) {
+                        u64 a = k[dbl][i], b = k[dbl][j], fa = a, fb = b, sign = dbl ? 1ull << 63 : 1ull << 31;
+                        u64 exp = dbl ? 0x7FF0000000000000ull : 0x7F800000u;
+                        unsigned char cf, zf, pf;
+                        CPU c;
+                        if (fz && !(a & exp)) fa = a & sign; /* a denormal (or zero) as FZ flushes it */
+                        if (fz && !(b & exp)) fb = b & sign;
+                        if (dbl) {
+                            double x, y;
+                            memcpy(&x, &fa, 8);
+                            memcpy(&y, &fb, 8);
+                            __asm__("ucomisd %3, %4\n\tsetc %0\n\tsetz %1\n\tsetp %2"
+                                    : "=q"(cf), "=q"(zf), "=q"(pf)
+                                    : "x"(x), "x"(y)
+                                    : "cc");
+                        } else {
+                            u32 ua = (u32)fa, ub = (u32)fb;
+                            float x, y;
+                            memcpy(&x, &ua, 4);
+                            memcpy(&y, &ub, 4);
+                            __asm__("ucomiss %3, %4\n\tsetc %0\n\tsetz %1\n\tsetp %2"
+                                    : "=q"(cf), "=q"(zf), "=q"(pf)
+                                    : "x"(x), "x"(y)
+                                    : "cc");
+                        }
+                        memset(&c, 0, sizeof c);
+                        u64 want = 0x202u | cf | (u64)pf << 2 | (u64)zf << 6;
+                        u64 got = snx_x64_fp_compare(&c, a, b, fz ? 1u << 24 : 0,
+                                                     (dbl ? 64u : 32u) | (u32)signal << 8 | 1u << 9);
+                        if (got != want) {
+                            fprintf(stderr,
+                                    "FAIL: the compare's flags of %016llx and %016llx (%s, FZ %d, %s): %03llx, "
+                                    "UCOMIS's %03llx\n",
+                                    (unsigned long long)a, (unsigned long long)b, dbl ? "doubles" : "singles", fz,
+                                    signal ? "FCMPE" : "FCMP", (unsigned long long)got, (unsigned long long)want);
+                            ++failures;
+                        }
+                    }
+    printf("sail_x64: the compare's flags image, 800 pairs\n");
+#endif
+    return failures;
+}
+
 /* ---- the floating-point guards: which path an operation takes, for every pair (or triple) of the operands that tell
    them apart, FPCR's rounding and FZ, and FPSR's IXC ---- */
 
@@ -371,6 +470,8 @@ static u64 guard_bits(double v, unsigned w) {
 static int guard_nan(u64 v, unsigned w) {
     return w == 64 ? v << 1 > 0xFFE0000000000000ull : (u32)(v << 1) > 0xFF000000u;
 }
+/* a NaN whose quiet bit is clear */
+static int guard_snan(u64 v, unsigned w) { return guard_nan(v, w) && !(v >> (w == 64 ? 51 : 22) & 1); }
 static int guard_zero(u64 v, unsigned w) { return !(w == 64 ? v << 1 : (u32)(v << 1)); }
 static int guard_denormal(u64 v, unsigned w) {
     u64 m = w == 64 ? v & 0x7FFFFFFFFFFFFFFFull : v & 0x7FFFFFFFu;
@@ -405,9 +506,10 @@ static u64 guard_host(const GuardCase* g, const u64* v) {
 /* whether the operation may take the inline code alone (v in the operands' order: FMADD's n, m, a) */
 static int guard_hot(const GuardCase* g, const u64* v, u32 fpcr, u32 fpsr) {
     unsigned k, w = g->w;
-    int nan = 0, flushed = 0, rounds = (fpcr >> 22 & 3) == 0, ixc = fpsr >> 4 & 1;
+    int nan = 0, snan = 0, flushed = 0, rounds = (fpcr >> 22 & 3) == 0, ixc = fpsr >> 4 & 1;
     for (k = 0; k < g->nops; ++k) {
         nan |= guard_nan(v[k], w);
+        snan |= guard_snan(v[k], w);
         flushed |= (fpcr >> 24 & 1) && guard_denormal(v[k], w);
     }
     if (flushed) return 0;
@@ -415,8 +517,8 @@ static int guard_hot(const GuardCase* g, const u64* v, u32 fpcr, u32 fpsr) {
         case G_MAX:
         case G_MIN:
         case G_ROUND:
-        case G_CONVERT:
-        case G_COMPARE: return !nan;
+        case G_CONVERT: return !nan;
+        case G_COMPARE: return !snan; /* FCMP's: a quiet NaN's flags (unordered) are the inline code's too */
         case G_TO_INT: {
             double d = guard_value(v[0], w);
             return ixc && !nan && d > -2147483649.0 && d < 2147483648.0;
@@ -693,22 +795,98 @@ static size_t check_fp_rows(void) {
     return failures;
 }
 
+#define USAGE                                                                                                           \
+    "usage: snx-test-sail-x64 (--qemu QEMU RUNNER DIR [--record FILE] | --reference[-if-there] FILE | --skip REASON)\n" \
+    "                         [--frozen FILE] [--states N] [--samples N] [--sequences N] [--pool N] [--xmm N]\n"        \
+    "                         [--verbose] [--counts FILE]\n"
+/* whether path is there to read */
+static int there(const char* path) {
+    FILE* f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+/* every feature the back end has a form for: a reference's words are those made with them too, beside this host's and
+   the plain one's, so that a host with features this one lacks finds its words in it */
+#define SNX_X64_EVERY                                                                                                  \
+    (SNX_X64_BMI1 | SNX_X64_BMI2 | SNX_X64_LZCNT | SNX_X64_SSE3 | SNX_X64_SSSE3 | SNX_X64_SSE41 | SNX_X64_SSE42 |      \
+     SNX_X64_PCLMUL | SNX_X64_F16C | SNX_X64_POPCNT | SNX_X64_AVX | SNX_X64_FMA | SNX_X64_ABI)
+#define NONE ((size_t)-1)
+
+/* a word: its code on this host and the plain one, at SAIL_PC, and a store-exclusive's after its load-exclusive */
+typedef struct {
+    u32 word;
+    size_t code[2];    /* NONE where not made */
+    size_t bytes[2];   /* each form's code's bytes (--counts), 0 where not made */
+    size_t pair[2][2]; /* the load-exclusive at SAIL_PAIR_PC, the word at SAIL_PAIR_PC + 4 */
+} Word;
+
+/* what run_native reaches: the words, their code */
+typedef struct {
+    const Word* words;
+    const unsigned char* code;
+} Made;
+/* word's code at pc for host on code's next bytes: its offset, NONE where the back end makes none; *failed where it
+   takes the word but can't make it */
+static size_t make(u32 word, u64 pc, unsigned host, unsigned char* code, size_t* at, size_t cap, int* failed) {
+    size_t got = 0, where = *at;
+    g_test.jumping = 1;
+    if (sigsetjmp(g_test.jump, 1))
+        *failed = 1;
+    else
+        got = snx_x64_step(word, pc, TARGET, host, code + where, cap - where);
+    g_test.jumping = 0;
+    if (*failed || !got) return NONE;
+    *at += (got + 15) & ~(size_t)15;
+    g_test.made_bytes = got;
+    return where;
+}
+
+static int has_code(void* user, size_t i, unsigned form) { return ((const Made*)user)->words[i].code[form] != NONE; }
+/* the native end of word i's code of form in state s from start, its memory in work */
+static void run_native(void* user, size_t i, unsigned form, unsigned s, const CPU* start, u8* work, const u8* initial,
+                       SailEnd* e) {
+    const Word* w = &((const Made*)user)->words[i];
+    const unsigned char* code = ((const Made*)user)->code;
+    CPU c = *start;
+    u64 next, pc = SAIL_PC;
+    const int pair = start->pc == SAIL_PAIR_PC;
+    (void)s;
+    sail_window_start(work, initial, w->word, pair);
+    c.mem = work - SAIL_WINDOW;
+    memset(&g_sail_calls, 0, sizeof g_sail_calls);
+    if (pair) {
+        (void)run_step((Step)(void*)(code + w->pair[form][0]), &c);
+        pc = SAIL_PAIR_PC + 4;
+        next = g_sail_calls.undef ? pc : run_step((Step)(void*)(code + w->pair[form][1]), &c);
+    } else
+        next = run_step((Step)(void*)(code + w->code[form]), &c);
+    sail_native_end(e, &c, next, pc, work, initial);
+}
+
 static int run(int argc, char** argv) {
-    unsigned states = 64, samples = 3, sequences = 4000, i, k;
+    unsigned states = SAIL_STATES_MAX, samples = 3, sequences = 4000, i, k;
+    int states_given = 0;
     unsigned hosts[2];
-    u32 *rows, *words;
-    size_t count, n = 0, failures = 0, unmade = 0, compared = 0, bytes = 0, made = 0, plain_unmade = 0;
+    u32* rows;
+    Word* words;
+    size_t count, n = 0, failures = 0, unmade = 0, compared = 0, made = 0, plain_unmade = 0;
     unsigned char* code;
-    size_t code_at = 0, code_cap = (size_t)1 << 26;
-    size_t (*offset)[2];
-    LlvmSteps set;
+    size_t code_at = 0, code_cap = (size_t)1 << 27;
+    static const char* const forms[2] = {"this", "a plain"};
+    SailHold hold = {0};
+    SailRef ref = {0};
+    int reference_kind = 0; /* 1: --reference, 2: --reference-if-there */
     char error[1024];
-    RtAPI rt = {.undef = on_undef, .sev = on_sev, .wfe = on_wfe, .cas128 = snx_runtime_cas128};
+    const char *reference = NULL, *frozen = NULL, *counts_path = NULL;
+    u32* list;
+    Made made_code;
+    RtAPI rt = {.cas128 = snx_runtime_cas128};
 #if !defined(_WIN32)
     struct sigaction sa;
 #endif
     for (i = 1; i < (unsigned)argc; ++i) {
-        if (!strcmp(argv[i], "--states") && i + 1 < (unsigned)argc) states = (unsigned)atoi(argv[++i]);
+        if (!strcmp(argv[i], "--states") && i + 1 < (unsigned)argc)
+            states = (unsigned)atoi(argv[++i]), states_given = 1;
         else if (!strcmp(argv[i], "--samples") && i + 1 < (unsigned)argc)
             samples = (unsigned)atoi(argv[++i]);
         else if (!strcmp(argv[i], "--pool") && i + 1 < (unsigned)argc)
@@ -717,7 +895,23 @@ static int run(int argc, char** argv) {
             snx_x64_set_xpool(atoi(argv[++i]));
         else if (!strcmp(argv[i], "--sequences") && i + 1 < (unsigned)argc)
             sequences = (unsigned)atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--verbose"))
+        else if (!strcmp(argv[i], "--qemu") && i + 3 < (unsigned)argc) {
+            hold.qemu = argv + i + 1;
+            i += 3;
+        } else if ((!strcmp(argv[i], "--reference") || !strcmp(argv[i], "--reference-if-there")) &&
+                   i + 1 < (unsigned)argc) {
+            reference_kind = argv[i][11] ? 2 : 1;
+            reference = argv[++i];
+        } else if (!strcmp(argv[i], "--record") && i + 1 < (unsigned)argc)
+            hold.record = argv[++i];
+        else if (!strcmp(argv[i], "--frozen") && i + 1 < (unsigned)argc)
+            frozen = argv[++i];
+        else if (!strcmp(argv[i], "--counts") && i + 1 < (unsigned)argc)
+            counts_path = argv[++i];
+        else if (!strcmp(argv[i], "--skip") && i + 1 < (unsigned)argc) {
+            printf("sail_x64 skipped: %s\n", argv[i + 1]);
+            return 77;
+        } else if (!strcmp(argv[i], "--verbose"))
             g_test.verbose = 1;
         else if (!strcmp(argv[i], "--trace"))
             g_test.verbose = 2; /* each word named before it runs: a crash's */
@@ -731,16 +925,40 @@ static int run(int argc, char** argv) {
             for (b = 0; b < got; ++b) printf("0x%02x%c", buf[b], b + 1 < got ? ' ' : '\n');
             if (!got) printf("(not made)\n");
             return 0;
-        }
-        else {
-            fprintf(stderr, "usage: snx-test-sail-x64 [--states N] [--samples N] [--verbose]\n");
+        } else {
+            fprintf(stderr, "snx-test-sail-x64: '%s' is not an option\n" USAGE, argv[i]);
             return 2;
         }
+    }
+    if (!counts_path && !hold.qemu == !reference_kind) {
+        fprintf(stderr,
+                "snx-test-sail-x64: the words are held to QEMU (--qemu) or to a reference of it (--reference): "
+                "%s\n" USAGE,
+                hold.qemu ? "both given" : "neither given");
+        return 2;
+    }
+    if (states > SAIL_STATES_MAX || (hold.record && states_given && states != SAIL_STATES_MAX)) {
+        fprintf(stderr, "snx-test-sail-x64: --states %u: a word has %u at most%s\n", states, SAIL_STATES_MAX,
+                hold.record ? ", and --record takes every one" : "");
+        return 2;
+    }
+    if (hold.record && !hold.qemu) {
+        fprintf(stderr, "snx-test-sail-x64: --record %s needs --qemu: it writes QEMU's ends\n", hold.record);
+        return 2;
     }
 #if !defined(__x86_64__)
     printf("not an x86-64 host: skipped\n");
     return 0;
 #endif
+    if (reference_kind && sail_ref_read(reference, &ref, error, sizeof error)) {
+        if (reference_kind == 2 && !there(reference)) {
+            printf("sail_x64 skipped: %s\n", error);
+            return 77;
+        }
+        fprintf(stderr, "FAIL: %s\n", error);
+        return 1;
+    }
+    sail_set_target(TARGET);
     g_test.seed = 0x9e3779b97f4a7c15ull;
     hosts[0] = host_features();
     hosts[1] = SNX_X64_BASELINE; /* no BMI1, BMI2, LZCNT, AVX, FMA or F16C */
@@ -755,10 +973,14 @@ static int run(int argc, char** argv) {
         g_test.memory[k] = snx_test_pages(MEMORY_SIZE);
         if (g_test.memory[k] == NULL) return 1;
     }
-    failures += check_fz_hot();
-    failures += check_fp_guards();
-    failures += check_fp_rows();
-    failures += check_casp();
+    if (!counts_path) { /* --counts makes the words' code alone */
+        failures += check_fz_hot();
+        failures += check_fcmp_paths();
+        failures += check_fcmp_image();
+        failures += check_fp_guards();
+        failures += check_fp_rows();
+        failures += check_casp();
+    }
     for (i = 0; i < MEMORY_SIZE; ++i) g_test.memory[2][i] = (unsigned char)rnd();
     memcpy(g_test.memory[0], g_test.memory[2], MEMORY_SIZE);
     memcpy(g_test.memory[1], g_test.memory[2], MEMORY_SIZE);
@@ -768,153 +990,116 @@ static int run(int argc, char** argv) {
         return 1;
     }
     /* the words: each row's samples, and each with Rd, Rn and Rm 31 */
-    count = lqd_row_words(samples, rnd, &g_test.rows);
+    count = sail_candidates(samples, &g_test.rows);
     rows = g_test.rows;
-    /* the offsets of the words' code, then the words: one block */
-    offset = g_test.offset = malloc((sizeof *offset + sizeof *words) * (count * 8 + 1));
-    if (!offset) return 1;
-    words = (u32*)(offset + count * 8 + 1);
+    words = g_test.words = (Word*)malloc(sizeof *words * (count + 1));
+    if (!words) return 1;
     for (i = 0; i < count; ++i) {
-        static const u32 fields[3] = {0x1fu, 0x1fu << 5, 0x1fu << 16};
-        const char* name = op_name(rows[i]);
-        unsigned f;
-        if (!name) continue;
-        for (f = 0; f < 8; ++f) {
-            u32 w = rows[i];
-            for (k = 0; k < 3; ++k)
-                if (f & (1u << k)) w |= fields[k];
-            if (f && (w == rows[i] || !op_name(w) || strcmp(op_name(w), name))) continue;
+        {
+            const u32 w = rows[i];
+            const char* name = op_name(w);
+            Word* x = &words[n];
+            int failed = 0, form;
+            size_t every = NONE;
             /* x86-64 code for both hosts; a word neither makes is not the x86-64 back end's */
-            {
-                size_t got[2] = {0, 0};
-                int failed = 0;
-                for (k = 0; k < 2; ++k) {
-                    g_test.jumping = 1;
-                    if (sigsetjmp(g_test.jump, 1)) {
-                        failed = 1;
-                        got[k] = 0;
-                    } else
-                        got[k] = snx_x64_step(w, 0x1000, TARGET, hosts[k], code + code_at, code_cap - code_at);
-                    g_test.jumping = 0;
-                    if (failed) break;
-                    offset[n][k] = code_at;
-                    code_at += (got[k] + 15) & ~(size_t)15;
+            x->word = w;
+            for (form = 0; form < 2 && !failed; ++form) {
+                x->code[form] = make(w, SAIL_PC, hosts[form], code, &code_at, code_cap, &failed);
+                x->bytes[form] = x->code[form] != NONE ? g_test.made_bytes : 0;
+                x->pair[form][0] = x->pair[form][1] = NONE;
+                if (x->code[form] != NONE && sail_pair(w, 1)) {
+                    x->pair[form][0] =
+                        make(sail_pair(w, 1), SAIL_PAIR_PC, hosts[form], code, &code_at, code_cap, &failed);
+                    x->pair[form][1] = make(w, SAIL_PAIR_PC + 4, hosts[form], code, &code_at, code_cap, &failed);
+                    if (x->pair[form][0] == NONE || x->pair[form][1] == NONE) x->code[form] = NONE;
                 }
-                if (failed) {
-                    ++unmade;
-                    ++failures;
-                    fprintf(stderr, "FAIL: %s %08x: the x86-64 back end takes it but can't make it\n", name, (unsigned)w);
-                    continue;
-                }
-                if (!got[0]) continue;
-                if (!got[1]) {
-                    /* a primitive no form without BMI1, BMI2 and LZCNT makes (CLZ without LZCNT): this host's alone */
-                    ++plain_unmade;
-                    offset[n][1] = (size_t)-1;
-                }
-                bytes += got[0];
+            }
+            if (!failed && hold.record && x->code[0] == NONE && x->code[1] == NONE) {
+                size_t at = code_at;
+                every = make(w, SAIL_PC, SNX_X64_EVERY, code, &code_at, code_cap, &failed);
+                code_at = at; /* only whether a host of every feature makes it */
+            }
+            if (failed) {
+                ++unmade;
+                ++failures;
+                fprintf(stderr, "FAIL: %s %08x: the x86-64 back end takes it but can't make it\n", name, (unsigned)w);
+                continue;
+            }
+            if (x->code[0] == NONE && x->code[1] == NONE && every == NONE) continue;
+            if (x->code[0] != NONE) {
                 ++made;
-                words[n++] = w;
+                if (x->code[1] == NONE) ++plain_unmade; /* a primitive no form without BMI1, BMI2 and LZCNT makes */
+            }
+            ++n;
+        }
+    }
+    if (counts_path) {
+        /* each word's code, its bytes as hex on this host's features and the plain host's ("-" where none) */
+        FILE* f = fopen(counts_path, "w");
+        if (!f) {
+            fprintf(stderr, "FAIL: can't write %s\n", counts_path);
+            return 1;
+        }
+        for (i = 0; i < n; ++i) {
+            fprintf(f, "%08x\t%s\t", (unsigned)words[i].word, op_name(words[i].word) ? op_name(words[i].word) : "?");
+            for (int form = 0; form < 2; ++form) {
+                if (!words[i].bytes[form]) fputc('-', f);
+                for (size_t b = 0; b < words[i].bytes[form]; ++b) fprintf(f, "%02x", code[words[i].code[form] + b]);
+                fputc(form ? '\n' : '\t', f);
             }
         }
+        fclose(f);
+        printf("sail_x64: %zu words in %s, nothing run\n", n, counts_path);
+        return 0;
     }
     if (snx_test_pages_exec(code, code_cap, 1)) {
         fprintf(stderr, "FAIL: the code can't be made executable\n");
         return 1;
     }
-    if (llvm_steps_begin(&set, 0, LLVM_STEPS_HOST, error, sizeof error)) {
-        fprintf(stderr, "FAIL: %s\n", error);
+    list = (u32*)malloc(sizeof *list * (n ? n : 1));
+    hold.work = (u8*)malloc(SAIL_WINDOW_SIZE);
+    if (!list || !hold.work) {
+        free(list), free(hold.work);
         return 1;
     }
-    for (i = 0; i < n; ++i) llvm_steps_add(&set, words[i], 0x1000, TARGET);
-    if (llvm_steps_load(&set, error, sizeof error)) {
-        fprintf(stderr, "FAIL: %s\n", error);
-        return 1;
-    }
-    for (i = 0; i < n; ++i)
-        for (k = 0; k < 2; ++k) {
-            Step x64;
-            unsigned s;
-            if (offset[i][k] == (size_t)-1) continue;
-            x64 = (Step)(void*)(code + offset[i][k]);
-            for (s = 0; s < states; ++s) {
-                CPU start, end[2];
-                u64 next[2];
-                unsigned undef[2], r;
-                memset(&start, 0, sizeof start);
-                for (r = 0; r < 32; ++r) start.x[r] = rnd();
-                fp_state(&start, s);
-                if (s & 1) start.x[rnd() & 31] = 0;
-                if (s & 2) start.x[rnd() & 31] = 0x8000000000000000ull;
-                if (s & 4) start.x[rnd() & 31] = ~0ull;
-                if (s & 8) start.x[rnd() & 31] = 0xffffffffull;
-                start.n = rnd() & 1;
-                start.z = rnd() & 1;
-                start.cf = rnd() & 1;
-                start.vf = rnd() & 1;
-                start.rt = &rt;
-                start.pc = 0x1000;
-                if (is_ldst(words[i])) ldst_start(&start, words[i], s);
-                end[0] = start;
-                end[1] = start;
-                end[0].mem = g_test.memory[0] + MEMORY_ZERO;
-                end[1].mem = g_test.memory[1] + MEMORY_ZERO;
-                g_test.undef = g_test.sev = g_test.wfe = 0;
-                if (g_test.verbose == 2) fprintf(stderr, "run %s %08x (%s host) state %u\n", op_name(words[i]),
-                                                 (unsigned)words[i], k ? "a plain" : "this", s);
-                next[0] = set.steps[i](&end[0]);
-                undef[0] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe;
-                g_test.undef = g_test.sev = g_test.wfe = 0;
-                next[1] = run_step(x64, &end[1]);
-                undef[1] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe;
-                ++compared;
-                {
-                    int memory = memcmp(g_test.memory[0] + MEMORY_ZERO, g_test.memory[1] + MEMORY_ZERO, MEMORY_TOUCHED);
-                    end[0].mem = end[1].mem = NULL;
-                    if (memory || end[0].excl_on != end[1].excl_on) next[1] = ~next[0]; /* a difference */
-                    memcpy(g_test.memory[0] + MEMORY_ZERO, g_test.memory[2] + MEMORY_ZERO, MEMORY_TOUCHED);
-                    memcpy(g_test.memory[1] + MEMORY_ZERO, g_test.memory[2] + MEMORY_ZERO, MEMORY_TOUCHED);
-                }
-                if (next[0] != next[1] || undef[0] != undef[1] || memcmp(end[0].x, end[1].x, sizeof end[0].x) ||
-                    end[0].n != end[1].n || end[0].z != end[1].z || end[0].cf != end[1].cf || end[0].vf != end[1].vf ||
-                    fp_differs(&end[0], &end[1])) {
-                    ++failures;
-                    fprintf(stderr, "FAIL: %s %08x (%s host) state %u: the x86-64 code's result differs\n",
-                            op_name(words[i]), (unsigned)words[i], k ? "a plain" : "this", s);
-                    if (g_test.verbose) {
-                        for (r = 0; r < 32; ++r)
-                            if (end[0].x[r] != end[1].x[r])
-                                fprintf(stderr, "  x%u: llvm %016llx x64 %016llx (was %016llx)\n", r,
-                                        (unsigned long long)end[0].x[r], (unsigned long long)end[1].x[r],
-                                        (unsigned long long)start.x[r]);
-                        fprintf(stderr, "  nzcv: llvm %u%u%u%u x64 %u%u%u%u; next: llvm %llx x64 %llx; undef %u %u\n",
-                                end[0].n, end[0].z, end[0].cf, end[0].vf, end[1].n, end[1].z, end[1].cf, end[1].vf,
-                                (unsigned long long)next[0], (unsigned long long)next[1], undef[0], undef[1]);
-                        fp_report(&end[0], &end[1], &start);
-                    }
-                    break;
-                }
-            }
-        }
-    llvm_steps_end(&set);
-    /* sequences: words in a row as one block, against their LLVM steps one after another */
+    for (i = 0; i < n; ++i) list[i] = words[i].word;
+    made_code.words = words;
+    made_code.code = code;
+    hold.ref = reference_kind ? &ref : NULL;
+    hold.name = "sail_x64";
+    hold.forms = forms;
+    hold.nforms = 2;
+    hold.verbose = g_test.verbose;
+    hold.user = &made_code;
+    hold.has = has_code;
+    hold.run = run_native;
+    failures += sail_hold(&hold, list, n, states, &compared);
+    if (frozen) failures += sail_frozen(&hold, frozen, list, n, &compared);
+    sail_ref_free(&ref);
+    free(list), free(hold.work);
+    /* sequences: words in a row as one block, against the code of each word alone at its pc, one after another */
+    sail_rt(&rt);
     if (n && sequences) {
         typedef struct {
             u32 w[4];
-            size_t count, code, first;
+            size_t count, code, alone[4];
         } Seq;
         Seq* seq = (Seq*)malloc(sizeof(Seq) * sequences);
-        size_t q, nseq = 0, steps = 0;
+        size_t q, nseq = 0;
         if (!seq) return 1;
         g_test.sequences = seq;
         if (snx_test_pages_exec(code, code_cap, 0)) return 1;
         for (q = 0; q < sequences; ++q) {
             Seq* sq = &seq[nseq];
             size_t len = 2 + rnd() % 3, got, j;
-            for (j = 0; j < len; ++j)
-                do
-                    sq->w[j] = words[rnd() % n];
-                while (is_ldst(sq->w[j])); /* their registers would point anywhere after another word */
+            int failed = 0;
+            for (j = 0; j < len; ++j) {
+                const Word* w;
+                do w = &words[rnd() % n];
+                while (w->code[0] == NONE || sail_is_ldst(w->word)); /* their registers would point anywhere after
+                                                                        another word */
+                sq->w[j] = w->word;
+            }
             sq->count = len;
             g_test.jumping = 1;
             if (sigsetjmp(g_test.jump, 1)) {
@@ -925,34 +1110,30 @@ static int run(int argc, char** argv) {
                 fprintf(stderr, " can't be made\n");
                 continue;
             }
-            got = snx_x64_block(sq->w, &sq->count, 0x1000, TARGET, hosts[0], code + code_at, code_cap - code_at);
+            got = snx_x64_block(sq->w, &sq->count, SAIL_PC, TARGET, hosts[0], code + code_at, code_cap - code_at);
             g_test.jumping = 0;
             if (!got) continue;
             sq->code = code_at;
             code_at += (got + 15) & ~(size_t)15;
+            for (j = 0; j < sq->count && !failed; ++j)
+                sq->alone[j] = make(sq->w[j], SAIL_PC + 4 * j, hosts[0], code, &code_at, code_cap, &failed);
+            for (j = 0; j < sq->count; ++j) failed |= sq->alone[j] == NONE;
+            if (failed) {
+                ++failures;
+                fprintf(stderr, "FAIL: a word of the block of %08x... can't be made alone at its pc\n",
+                        (unsigned)sq->w[0]);
+                continue;
+            }
             ++nseq;
         }
         if (snx_test_pages_exec(code, code_cap, 1)) return 1;
-        if (llvm_steps_begin(&set, 0, LLVM_STEPS_HOST, error, sizeof error)) {
-            fprintf(stderr, "FAIL: %s\n", error);
-            return 1;
-        }
         for (q = 0; q < nseq; ++q) {
-            size_t j;
-            seq[q].first = steps;
-            for (j = 0; j < seq[q].count; ++j, ++steps) llvm_steps_add(&set, seq[q].w[j], 0x1000 + 4 * j, TARGET);
-        }
-        if (llvm_steps_load(&set, error, sizeof error)) {
-            fprintf(stderr, "FAIL: %s\n", error);
-            return 1;
-        }
-        for (q = 0; q < nseq; ++q) {
-            Step x64 = (Step)(void*)(code + seq[q].code);
+            Step block = (Step)(void*)(code + seq[q].code);
             unsigned st;
             for (st = 0; st < states; ++st) {
                 CPU start, end[2];
                 u64 next[2] = {0, 0};
-                unsigned undef[2], r;
+                unsigned calls[2], r;
                 size_t j;
                 memset(&start, 0, sizeof start);
                 for (r = 0; r < 32; ++r) start.x[r] = rnd();
@@ -964,49 +1145,57 @@ static int run(int argc, char** argv) {
                 start.cf = rnd() & 1;
                 start.vf = rnd() & 1;
                 start.rt = &rt;
-                start.pc = 0x1000;
+                start.pc = SAIL_PC;
+                start.mem = g_test.memory[0] + MEMORY_ZERO;
                 end[0] = start;
                 end[1] = start;
-                g_test.undef = g_test.sev = g_test.wfe = 0;
-                for (j = 0; j < seq[q].count; ++j) next[0] = set.steps[seq[q].first + j](&end[0]);
-                undef[0] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe;
-                g_test.undef = g_test.sev = g_test.wfe = 0;
-                next[1] = run_step(x64, &end[1]);
-                undef[1] = g_test.undef + 16 * g_test.sev + 256 * g_test.wfe;
+                memset(&g_sail_calls, 0, sizeof g_sail_calls);
+                for (j = 0; j < seq[q].count && !g_sail_calls.undef; ++j)
+                    next[0] = run_step((Step)(void*)(code + seq[q].alone[j]), &end[0]);
+                calls[0] = g_sail_calls.undef + 16 * g_sail_calls.sev + 256 * g_sail_calls.wfe;
+                memset(&g_sail_calls, 0, sizeof g_sail_calls);
+                next[1] = run_step(block, &end[1]);
+                calls[1] = g_sail_calls.undef + 16 * g_sail_calls.sev + 256 * g_sail_calls.wfe;
                 ++compared;
-                if (next[0] != next[1] || undef[0] != undef[1] || memcmp(end[0].x, end[1].x, sizeof end[0].x) ||
-                    end[0].n != end[1].n || end[0].z != end[1].z || end[0].cf != end[1].cf || end[0].vf != end[1].vf ||
-                    fp_differs(&end[0], &end[1])) {
+                if ((!calls[0] && next[0] != next[1]) || calls[0] != calls[1] ||
+                    memcmp(end[0].x, end[1].x, sizeof end[0].x) || end[0].n != end[1].n || end[0].z != end[1].z ||
+                    end[0].cf != end[1].cf || end[0].vf != end[1].vf || fp_differs(&end[0], &end[1])) {
                     ++failures;
                     fprintf(stderr, "FAIL: the block of");
                     for (j = 0; j < seq[q].count; ++j)
                         fprintf(stderr, " %s %08x", op_name(seq[q].w[j]), (unsigned)seq[q].w[j]);
-                    fprintf(stderr, " state %u: the x86-64 code's result differs\n", st);
+                    fprintf(stderr, " state %u: its end is not the words' one after another\n", st);
                     if (g_test.verbose) {
                         for (r = 0; r < 32; ++r)
                             if (end[0].x[r] != end[1].x[r])
-                                fprintf(stderr, "  x%u: llvm %016llx x64 %016llx\n", r,
+                                fprintf(stderr, "  x%u: words %016llx block %016llx\n", r,
                                         (unsigned long long)end[0].x[r], (unsigned long long)end[1].x[r]);
-                        fprintf(stderr, "  nzcv: llvm %u%u%u%u x64 %u%u%u%u; next: llvm %llx x64 %llx; undef %u %u\n",
+                        fprintf(stderr,
+                                "  nzcv: words %u%u%u%u block %u%u%u%u; next: words %llx block %llx; calls "
+                                "%u %u\n",
                                 end[0].n, end[0].z, end[0].cf, end[0].vf, end[1].n, end[1].z, end[1].cf, end[1].vf,
-                                (unsigned long long)next[0], (unsigned long long)next[1], undef[0], undef[1]);
+                                (unsigned long long)next[0], (unsigned long long)next[1], calls[0], calls[1]);
                     }
                     break;
                 }
             }
         }
-        llvm_steps_end(&set);
         printf("sail_x64: %zu blocks of 2 to 4 words\n", nseq);
     }
-    printf("sail_x64: %zu words made (%zu bytes of x86-64 on this host's features, %.1f a word; %zu of them not without "
-           "BMI1, BMI2 and LZCNT), %zu runs, %zu failures (%zu words not made)\n",
-           made, bytes, made ? (double)bytes / (double)made : 0.0, plain_unmade, compared, failures, unmade);
+    printf("sail_x64: %zu words made (%zu of them not without BMI1, BMI2 and LZCNT), %zu runs, %zu failures (%zu words "
+           "not made)\n",
+           made, plain_unmade, compared, failures, unmade);
     return failures ? 1 : 0;
 }
 int main(int argc, char** argv) {
+    const char* cold = snx_x64_cold_pool();
+    if (cold) {
+        fprintf(stderr, "FAIL: the cold code's pool operand: %s\n", cold);
+        return 1;
+    }
     int rc = run(argc, argv);
     free(g_test.rows);
-    free(g_test.offset);
+    free(g_test.words);
     free(g_test.sequences);
     return rc;
 }

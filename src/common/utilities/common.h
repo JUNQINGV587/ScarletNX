@@ -36,6 +36,10 @@ void snx_path_native(char* path);
 /* fmt's path into out, of size bytes, its separators the system's (snx_path_native). 0; -1 when it does not fit,
    said with snx_error, out empty */
 int snx_path_format(char* out, size_t size, const char* fmt, ...);
+/* a screenshot's file in prefix's captures/ (prefix a folder's path ending with its separator, as the runtime's g_exedir
+   does), the folder made where it is missing: <prefix>captures/screenshot_YYYYMMDD_HHMMSS by the local time, without
+   its extension, into out (size bytes) */
+void snx_capture_path(char* out, size_t size, const char* prefix);
 /* says a line of error, "scarletnx: " and the line on stderr, or to the sink given to snx_error_sink. Returns 1 */
 int snx_error(const char* fmt, ...);
 /* an option given by the name an older version had, old (a literal), said once a run with its name now */
@@ -275,6 +279,9 @@ SnxU64 snx_file_time(const char* path);
 int snx_set_file_time(const char* path, SnxU64 seconds);
 int snx_make_executable(const char* path);
 unsigned snx_cpu_count(void);
+/* how many host CPUs the process may run on, for workers that run on any of them: plat_cpus's where it lists them
+   (desktop Linux, whose affinity a taskset narrows), else the system's every one (snx_cpu_count). At least 1 */
+int plat_cpu_count(void);
 /* the threads an AOT pass (a game's recompile) is given when its count is left open: the physical cores where the
    system says them, else the processors, capped at 75% of that (a reserve of one whole core, or a quarter), so a
    part of the computer stays free; at least 1, never more than snx_cpu_count() */
@@ -335,6 +342,36 @@ int snx_abort_requested(void);
 /* the memory this process is charged for now, in bytes: its footprint on macOS and iOS, its resident set on Linux,
    Android and FreeBSD, its working set on Windows; 0 where the system does not tell */
 SnxU64 snx_footprint(void);
+/* the most this process was charged for since it started, in bytes: its resident set's peak on Linux, Android, macOS,
+   iOS and FreeBSD, its working set's on Windows; 0 where the system does not tell */
+SnxU64 snx_footprint_peak(void);
+/* Where a recompile's time went, in seconds of wall time: finding the functions, compiling them (units: the seconds
+   its threads spent in them, summed), the module's descriptor, the link and the file's write. pack: link is the write
+   of a pack of objects, which takes the place of both */
+typedef struct {
+    double discovery, compile, units, descriptor, link, write;
+    unsigned threads; /* the threads that compiled */
+    int pack;
+    int streamed; /* the link wrote the file as it went: link is both, write what was left (the file put in place) */
+    SnxU64 peak;  /* snx_footprint_peak's */
+} SnxRecompilePhases;
+/* The line a module's making ends with, into out, without a newline: "code: discovery 1.2 s, compile 3.1 s (12.4 s
+   of units on 4 threads), descriptor 0.2 s, link 1.5 s, write 0.6 s; peak 2230 MiB"; a link that wrote the file as it
+   went, "link and write 2.1 s" */
+void snx_phases_line(char* out, size_t size, const SnxRecompilePhases* p);
+/* A module's SSA as its back end holds it before the bytes: the instructions each region of code kept once its
+   optimizing pass had run, the bytes those take in the back end's own structure, and the bytes they would take
+   stored packed (a count, nothing is written: tools/sailgen/mach.h's sgx_packed) */
+typedef struct {
+    SnxU64 instructions, bytes, packed;
+} SnxSsaCount;
+/* The line that says it, after snx_phases_line's, for guest's instructions: "ssa: 5850000 instructions for 1000000
+   guest instructions (5.85 each), 3072.0 MiB as the back end holds it, 700.0 MiB packed" */
+void snx_ssa_line(char* out, size_t size, const SnxSsaCount* ssa, SnxU64 guest);
+/* The line a program's recompile ends with, before its "Built": the seconds it took, those before its code (the
+   program read, its calls bound), its code's (every module's, snx_phases_line's each) and those after (the runtime's
+   copy, the stamp): "recompile: 8.1 s in all: 2.9 s before the code, 4.9 s the code, 0.3 s after it" */
+void snx_recompile_line(char* out, size_t size, double before, double code, double after);
 /* A recompile's progress, a line for each unit, the form every driver prints and the launcher reads
    (gui/steps.c): unit `done` of `count` finished, "  compiled block 3/40: code_002, <label> (4.2 s)", or "(cached)" */
 void snx_report_unit(size_t done, size_t count, const char* name, const char* label, int cached, double seconds);

@@ -145,7 +145,7 @@ NO_SET(vpad_showcase_corner_set)
 NO_SET(stats_corner_set)
 NO_SET(vpad_on_set)
 NO_SET(vpad_place_set)
-NO_SET(backend_touch_mode_set)
+NO_SET(vpad_touch_set)
 NO_SET(gamepad_background_set)
 NO_SET(gamepad_joycon_pair_set)
 NO_SET(gamepad_map_set)
@@ -526,6 +526,47 @@ static void test_dropped_keys_old(void) {
     CHECK(strstr(g_test.said, "keeps 11 keys this version does not use (nvn_direct, nvn_verify, nvn_trace, mme_hle, "
                               "mme_jit, mme_verify, astc_background_threads, press, press_at, mesh_draws, "
                               "hmma_astat), under [Deprecated]"));
+    free(text);
+    g_test.write = 0;
+}
+
+/* LLVM's keys, gone with it: a .ini an older version wrote keeps each under [Deprecated] after what became of it, its
+   passes and options (llvm_pass_*, llvm_*) by their prefixes, none under [Other], and the run's line names every one */
+static void test_llvm_keys_old(void) {
+    static const char* const old[] = {"opt=3",
+                                      "jit_opt=z",
+                                      "llvm_batch=ipo",
+                                      "slp_vectorizer=1",
+                                      "fpsr_flags=0",
+                                      "abi_contract=1",
+                                      "volatile_memory=1",
+                                      "ir_stats=1",
+                                      "ir_dump_pc=1000",
+                                      "ir_branch_profile=b.txt",
+                                      "linux_jit_opt=0",
+                                      "android_jit_opt=1",
+                                      "android_jit_keep_ir=ir",
+                                      "llvm_pass_gvn=0",
+                                      "llvm_fast_isel=1"};
+    char *text, file[1024] = "[Debug]\n", key[64], line[256];
+    size_t i;
+    for (i = 0; i < sizeof old / sizeof old[0]; ++i)
+        snprintf(file + strlen(file), sizeof file - strlen(file), "%s\n", old[i]);
+    g_test.write = 1;
+    text = open_ini(file);
+    CHECK(text && strstr(text, "\n[Deprecated]\n") && !strstr(text, "\n[Other]\n"));
+    for (i = 0; i < sizeof old / sizeof old[0]; ++i) { /* "; key: what became of it", then the line as it was */
+        snprintf(key, sizeof key, "%.*s", (int)strcspn(old[i], "="), old[i]);
+        CHECK(ini_deprecated(key));
+        snprintf(line, sizeof line, "\n; %s: %s\n%s\n", key, ini_deprecated(key), old[i]);
+        CHECK(strstr(text, line) && strstr(text, "\n[Deprecated]\n") < strstr(text, line));
+    }
+    CHECK(!strcmp(ini_deprecated("llvm_pass_gvn"), "went with LLVM's passes: the native back ends run none") &&
+          !strcmp(ini_deprecated("llvm_fast_isel"), "went with LLVM's options: the native back ends have none"));
+    CHECK(strstr(g_test.said, "keeps 15 keys this version does not use (opt, jit_opt, llvm_batch, slp_vectorizer, "
+                              "fpsr_flags, abi_contract, volatile_memory, ir_stats, ir_dump_pc, ir_branch_profile, "
+                              "linux_jit_opt, android_jit_opt, android_jit_keep_ir, llvm_pass_gvn, llvm_fast_isel), "
+                              "under [Deprecated]"));
     free(text);
     g_test.write = 0;
 }
@@ -963,7 +1004,8 @@ static int picks_hand(void) {
     return 0;
 }
 /* the picks file changed while the game runs (the launcher's Settings of the game): read once it settles, applied and
-   said. A key no pick takes is said with its value, does nothing, and is kept when the menu's change writes the file.
+   said. A key no pick takes is named, never with its value, does nothing, and is kept when the menu's change writes the
+   file.
    --launcher-picks=2 is said with the 0 it is taken as */
 static int picks_reload(void) {
     char *ini, *picks, *dir = picks_game("[Audio]\nvolume=100\n", "[Audio]\nvolume=40\n", &ini, &picks), *text;
@@ -982,8 +1024,8 @@ static int picks_reload(void) {
     ini_poll(0);
     CHECK(g_settings.volume == 20);
     CHECK(strstr(g_test.said, "game.picks reloaded\n"));
-    CHECK(strstr(g_test.said, "settings: newer_key=5 in ") &&
-          strstr(g_test.said, "game.picks is no setting a game's picks take: it is kept there and does nothing\n"));
+    CHECK(strstr(g_test.said, "game.picks: this version does not read newer_key, which stays as it is\n") &&
+          !strstr(g_test.said, "newer_key=5"));
     ini_set("fps_limit", "45");
     ini_poll(0);
     CHECK((text = file_text(picks)) && strstr(text, "\n[Audio]\nvolume=20\n") &&
@@ -996,12 +1038,13 @@ static int picks_reload(void) {
     free(dir);
     return 0;
 }
-/* the game's menu's Clean Old Settings: the .ini's deprecated keys and the picks' keys no pick takes counted, then
-   at the next tick taken out of both files, said in the log with their values, and none counted after */
+/* the game's menu's Clean Old Settings: the deprecated keys of the .ini and of the picks counted, then at the next
+   tick taken out of both files, said in the log with their values, and none counted after; another version's stays */
 static int picks_clean(void) {
-    char *ini, *picks, *dir = picks_game("[Display]\nstats=0\n[Performance]\nmemory_fit=1\n",
-                                         "[Audio]\nvolume=40\n[Other]\nnewer_key=5\n", &ini, &picks),
-                      *text;
+    char *ini, *picks,
+        *dir = picks_game("[Display]\nstats=0\n[Performance]\nmemory_fit=1\n",
+                          "[Audio]\nvolume=40\n[Other]\nvk_defrag=1\nnewer_key=5\n", &ini, &picks),
+        *text;
     g_test.write = 1;
     ini_open(ini);
     CHECK(ini_old_settings() == 2);
@@ -1012,12 +1055,13 @@ static int picks_clean(void) {
     CHECK(ini_poll_due() && !ini_poll_due());
     ini_poll(0);
     CHECK(ini_old_settings() == 0);
-    CHECK(strstr(g_test.said, "settings: Clean Old Settings took out memory_fit=1, newer_key=5 (") &&
-          strstr(g_test.said, "game.picks)\n"));
+    CHECK(strstr(g_test.said, "settings: Clean Old Settings took out memory_fit=1, vk_defrag=1 (") &&
+          strstr(g_test.said, "game.picks)\n") && !strstr(g_test.said, "newer_key"));
     CHECK((text = file_text(ini)) && !strstr(text, "[Deprecated]") && !strstr(text, "memory_fit=") &&
           strstr(text, "\nstats=0\n"));
     free(text);
-    CHECK((text = file_text(picks)) && strstr(text, "\n[Audio]\nvolume=40\n") && !strstr(text, "newer_key"));
+    CHECK((text = file_text(picks)) && strstr(text, "\n[Audio]\nvolume=40\n") && !strstr(text, "vk_defrag") &&
+          strstr(text, "\nnewer_key=5\n")); /* another version's stays */
     free(text);
     CHECK(g_settings.volume == 40);
     CHECK(!snx_remove_tree(dir));
@@ -1050,23 +1094,22 @@ static int picks_perf(void) {
     g_settings.async_pipelines = 1; /* the runtime's own pick, as for an Ounce program: nobody gave it */
     base = snx_path_join(dir, "game");
     CHECK(base);
-    /* no .abi: nothing of how it was made */
-    CHECK(options_perf_notice(base) == 5 && g_test.notices == 1);
-    CHECK(!strcmp(g_test.game, "memory_gb, jit_opt"));
+    /* no .abi: nothing of how it was made; jit_opt, LLVM's and deprecated, is none of the game's settings */
+    CHECK(options_perf_notice(base) == 4 && g_test.notices == 1);
+    CHECK(!strcmp(g_test.game, "memory_gb"));
     CHECK(!strcmp(g_test.global, "resolution, vsync, fps_limit"));
-    /* made at -O0 ahead of time, by a recompile with its batch and unit size off their defaults */
+    /* made by a recompile with its batch and unit size off their defaults: the made line's keys as it names them */
     abi(dir, "14\nmade opt=0 aot=1 found=1 code=2 off=llvm_batch,unit_instructions\n");
-    CHECK(options_perf_notice(base) == 8 && g_test.notices == 2);
-    CHECK(!strcmp(g_test.game, "memory_gb, jit_opt"));
-    CHECK(!strcmp(g_test.global, "resolution, vsync, fps_limit, opt, llvm_batch, unit_instructions"));
-    /* an older version's made line: its opt alone */
+    CHECK(options_perf_notice(base) == 6 && g_test.notices == 2);
+    CHECK(!strcmp(g_test.game, "memory_gb"));
+    CHECK(!strcmp(g_test.global, "resolution, vsync, fps_limit, llvm_batch, unit_instructions"));
+    /* the made line's level, LLVM's, names nothing, ahead of time or not, at 0 or at 2 */
     abi(dir, "14\nmade opt=0 aot=1 found=1 code=2\n");
-    CHECK(options_perf_notice(base) == 6 && !strcmp(g_test.global, "resolution, vsync, fps_limit, opt"));
-    /* --jit-only's, no code made ahead of time: its opt made nothing that runs; and opt's default */
+    CHECK(options_perf_notice(base) == 4 && !strcmp(g_test.global, "resolution, vsync, fps_limit"));
     abi(dir, "14\nmade opt=0 aot=0 found=0 code=2\n");
-    CHECK(options_perf_notice(base) == 5 && !strcmp(g_test.global, "resolution, vsync, fps_limit"));
+    CHECK(options_perf_notice(base) == 4 && !strcmp(g_test.global, "resolution, vsync, fps_limit"));
     abi(dir, "14\nmade opt=2 aot=1 found=1 code=2\n");
-    CHECK(options_perf_notice(base) == 5 && !strcmp(g_test.global, "resolution, vsync, fps_limit"));
+    CHECK(options_perf_notice(base) == 4 && !strcmp(g_test.global, "resolution, vsync, fps_limit"));
     CHECK(!snx_remove_tree(dir));
     free(base);
     free(ini);
@@ -1201,7 +1244,7 @@ static int picks_kind_oldpick(void) {
     CHECK(strstr(g_test.said, "settings: emulated_cores=1 in ") &&
           strstr(g_test.said, "game.picks, deprecated, is emulated_cores_mode=1 (On) there now "
                               "(docs/user/deprecations.md)\n"));
-    CHECK(!strstr(g_test.said, "is no setting a game's picks take"));
+    CHECK(!strstr(g_test.said, "does not read emulated_cores")); /* carried over, not kept */
     CHECK(g_settings.emulated_cores_mode == 1 &&
           options_kind_value("emulated_cores_mode", "0", "an Ounce program") == 0);
     CHECK(strstr(g_test.said, "settings: emulated_cores_mode=1 (On), the game's own pick, over the 0 (Off) its Auto "
@@ -1220,8 +1263,8 @@ static int picks_kind_oldpick(void) {
                      &picks);
     g_test.said[0] = 0;
     ini_open(ini);
-    CHECK(strstr(g_test.said, "settings: emulated_cores=1 in ") &&
-          strstr(g_test.said, "game.picks is no setting a game's picks take: it is kept there and does nothing\n"));
+    CHECK(strstr(g_test.said, "game.picks: this version does not read emulated_cores, which stays as it is\n") &&
+          !strstr(g_test.said, "emulated_cores=1"));
     CHECK(!snx_remove_tree(dir));
     free(ini);
     free(picks);
@@ -1332,7 +1375,10 @@ static void test_key_steps(void) {
     free(dir);
 }
 
+#include "config_files_options.c"
+
 int main(int argc, char** argv) {
+    if (argc > 2 && !strcmp(argv[1], "--config-files")) return config_files_options(argv[2]);
     if (argc > 1 && !strncmp(argv[1], "--picks-", 8)) return options_picks(argv[1]);
     if (argc > 1) return options_vk_descriptors_first(argv[1]);
     test_fixed();
@@ -1348,6 +1394,7 @@ int main(int argc, char** argv) {
     test_compress_shader_cache_old();
     test_controls_opacity_old();
     test_dropped_keys_old();
+    test_llvm_keys_old();
     test_vk_descriptors_old_default();
     test_vk_descriptors_old();
     test_write_tracking_hot_old();

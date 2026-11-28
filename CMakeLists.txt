@@ -147,6 +147,7 @@ if(DEFINED CACHE{SNX_MULTICALL}) # an option before, said and taken out of the c
     message(STATUS "SNX_MULTICALL is no longer an option: scarletnx is every driver the build has")
     unset(SNX_MULTICALL CACHE)
 endif()
+include(cmake/removed_options.cmake)
 if(SNX_BUILD_GUI AND SNX_TOOLS_ONLY)
     message(FATAL_ERROR "SNX_BUILD_GUI requires a runtime build, not a tools-only build")
 endif()
@@ -197,12 +198,10 @@ add_subdirectory(src/common)
 if(SNX_BUILD_NX)
     add_subdirectory(src/nx/runtime/driver host-tools)
 endif()
-# The recompiler library (docs/dev/library.md) is configured by the NX driver's tree or the GNU ABI runtime's. Without
-# either, as a project that only wants the library builds ScarletNX, it is configured here, with LLVM alone
+# The recompiler (docs/dev/library.md) is configured by the NX driver's tree or the GNU ABI runtime's. Without either, as
+# a project that only wants the library builds ScarletNX, it is configured here
 if(NOT SNX_BUILD_NX AND NOT SNX_BUILD_GNUABI)
-    include(cmake/llvm.cmake)
-    add_subdirectory(src/common/cpu/recompiler/llvm llvm-backend)
-    add_subdirectory(src/common/cpu/recompiler recompiler-library)
+    add_subdirectory(src/common/cpu/recompiler recompiler)
 endif()
 include(cmake/build_info.cmake) # the window titles' line; the driver stamps games with its commit
 if(SNX_BUILD_3DS)

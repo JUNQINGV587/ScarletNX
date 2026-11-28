@@ -8,8 +8,8 @@
    relocations' r_info laid out as n64's): a call's and snx_stale's literal in the code is a distance (R_MIPS_PC32), or
    in a JIT unit the address (R_MIPS_64), the callee entered through t9 */
 #include "common/cpu/recompiler/mips64/mips64_codegen.h"
-#include "common/cpu/recompiler/llvm/link.h"
-#include "common/cpu/recompiler/llvm/elf_object.h"
+#include "common/cpu/recompiler/object/link.h"
+#include "common/cpu/recompiler/object/elf_object.h"
 #include "common/cpu/aarch64/a64_decoder.h"
 #include "common/cpu/aarch64/cpu.h"
 #include "common/runtime/interface.h"
@@ -51,7 +51,7 @@ static inline void sgx_machine_op(SgXAsm* a, int at, const unsigned char* r);
 
 /* ---- what mach_codegen.inc asks of the machine ---- */
 #define MG_EM EM_MIPS
-#define MG_ELF_FLAGS 0x80000007u /* MIPS64 release 2, PIC, CPIC, NOREORDER: LLVM's mips64el objects' */
+#define MG_ELF_FLAGS         0x80000007u /* MIPS64 release 2, PIC, CPIC, NOREORDER */
 #define MG_R_INFO(sym, type) snx_elf_info(EM_MIPS, (sym), (type))
 #define MG_R_ABS64 SNX_MIPS_64
 #define MG_R_LITERAL SNX_MIPS_PC32
