@@ -241,6 +241,40 @@ int vk_present_quad(Surf* source, VkImage destination, VkFormat format, VkExtent
 }
 
 static void effects_say(const char* text) { LOG("vulkan: %s\n", text); }
+
+/* SNX_PRESENT_DEBUG=1: the frame the effects are given and the settings they read, the first frames of each shape and
+   each change of one, then every 300th; nothing else changes with it */
+static void present_debug_say(const SnxPresentSource* s, const VkRect2D* crop, VkRect2D to, int filter, int aa,
+                              int sharpen, int sharpness) {
+    static struct {
+        u32 w, h, crop_w, crop_h, out_w, out_h;
+        int filter, aa, sharpen, sharpness;
+        unsigned frames;
+    } said;
+    unsigned n = said.frames++;
+    int changed = said.w != s->width || said.h != s->height || said.crop_w != crop->extent.width ||
+                  said.crop_h != crop->extent.height || said.out_w != to.extent.width ||
+                  said.out_h != to.extent.height || said.filter != filter || said.aa != aa || said.sharpen != sharpen ||
+                  said.sharpness != sharpness;
+    if (changed) {
+        said.w = s->width;
+        said.h = s->height;
+        said.crop_w = crop->extent.width;
+        said.crop_h = crop->extent.height;
+        said.out_w = to.extent.width;
+        said.out_h = to.extent.height;
+        said.filter = filter;
+        said.aa = aa;
+        said.sharpen = sharpen;
+        said.sharpness = sharpness;
+    }
+    if (!changed && n >= 8 && n % 300) return;
+    LOG("present: the effects are given a %ux%u image, the frame %ux%u at %d,%d drawn at %d,%d %ux%u: upscaler %s, "
+        "anti-aliasing %s, sharpen %d at %d\n",
+        s->width, s->height, crop->extent.width, crop->extent.height, crop->offset.x, crop->offset.y, to.offset.x,
+        to.offset.y, to.extent.width, to.extent.height, snx_fx_upscale_label(filter), snx_fx_aa_label(aa), sharpen,
+        sharpness);
+}
 /* the settings' words, upscaler and anti_aliasing, as they are now: at start, or when, read under ui_lock as the game's
    menu and a reload of the .ini write them, they are not the words last read, they are the choice for the frames from
    now, over a shortcut's step; said in the log */
@@ -277,20 +311,39 @@ int vk_present_quad_effects(VkCommandBuffer cb, SnxPresentSource* s, VkRect2D* c
     int aa = atomic_load_explicit(&g_present_quad.aa, memory_order_relaxed);
     SNX_ZONE_TEXT(z_fx, "upscaler %d, aa %d", filter, aa);
     int sharpness = atomic_load_explicit((_Atomic int*)&g_settings.upscaler_sharpness, memory_order_relaxed);
+    int sharpen = atomic_load_explicit((_Atomic int*)&g_settings.sharpen, memory_order_relaxed);
+    /* sharpen's own pass is asked and has a strength: the frame is then not the window's blit */
+    int sharp_on = sharpen && sharpness > 0;
     u32 w = transform & 4 ? to.extent.height : to.extent.width, h = transform & 4 ? to.extent.width : to.extent.height;
     SnxFxImage out;
     /* Bilinear is the quad's own sampler: with anti-aliasing Off, it and Off record no pass (snx_fx_render), so they
-       neither make the effects nor drain the recording ring */
-    if (((filter == SNX_FX_UPSCALE_OFF || filter == SNX_FX_UPSCALE_BILINEAR) && aa == SNX_FX_AA_OFF) ||
-        g_present_quad.fx_failed || !w || !h)
+       neither make the effects nor drain the recording ring; sharpen does record one */
+    if ((((filter == SNX_FX_UPSCALE_OFF || filter == SNX_FX_UPSCALE_BILINEAR) && aa == SNX_FX_AA_OFF) && !sharp_on) ||
+        g_present_quad.fx_failed || !w || !h) {
+        if (snx_fx_present_debug())
+            LOG_LIMIT(8,
+                      "present: no pass is asked for the %ux%u frame drawn at %ux%u: upscaler %s, anti-aliasing %s, "
+                      "sharpen %d at %d%s%s%s\n",
+                      s->width, s->height, to.extent.width, to.extent.height, snx_fx_upscale_label(filter),
+                      snx_fx_aa_label(aa), sharpen, sharpness,
+                      g_present_quad.fx_failed ? " (their passes could not be made on this device)" : "",
+                      sharpness ? "" : " (upscaler_sharpness is 0, so no strength is asked)",
+                      (w && h) ? "" : " (the drawn rectangle has no size)");
         return 0;
+    }
     /* an HDR frame (a game's own, gpu/vk/hdr_swapchain.c) is shown as it is: the passes are for SDR's range */
     if (g_vk.sc_space != SNX_HDR_SPACE_SRGB) {
         SNX_MSG("vk pres: effects skipped for an HDR frame",
                 sizeof("vk pres: effects skipped for an HDR frame") - 1);
-        if (!g_present_quad.hdr_said++)
-            LOG("vulkan: upscaler %s and anti-aliasing %s: the game's HDR frames are shown without them\n",
-                snx_fx_upscale_label(filter), snx_fx_aa_label(aa));
+        if (!g_present_quad.hdr_said++) {
+            if (sharp_on)
+                LOG("vulkan: upscaler %s and anti-aliasing %s, with sharpen: the game's HDR frames are shown without "
+                    "them\n",
+                    snx_fx_upscale_label(filter), snx_fx_aa_label(aa));
+            else
+                LOG("vulkan: upscaler %s and anti-aliasing %s: the game's HDR frames are shown without them\n",
+                    snx_fx_upscale_label(filter), snx_fx_aa_label(aa));
+        }
         return 0;
     }
     g_present_quad.hdr_said = 0;
@@ -298,24 +351,35 @@ int vk_present_quad_effects(VkCommandBuffer cb, SnxPresentSource* s, VkRect2D* c
         g_present_quad.fx = snx_fx_create(g_vk.phys, g_vk.dev, vk_pipeline_cache(), VK_FRAMES, effects_say);
         if (!g_present_quad.fx) {
             g_present_quad.fx_failed = 1;
-            LOG("vulkan: upscaler %s and anti-aliasing %s: their passes could not be made on this device, so the window "
-                "shows the frame with both off\n",
-                snx_fx_upscale_label(filter), snx_fx_aa_label(aa));
+            if (sharp_on)
+                LOG("vulkan: upscaler %s and anti-aliasing %s, with sharpen: their passes could not be made on this "
+                    "device, so the window shows the frame with them off\n",
+                    snx_fx_upscale_label(filter), snx_fx_aa_label(aa));
+            else
+                LOG("vulkan: upscaler %s and anti-aliasing %s: their passes could not be made on this device, so the "
+                    "window shows the frame with both off\n",
+                    snx_fx_upscale_label(filter), snx_fx_aa_label(aa));
             return 0;
         }
         snx_fx_set_fp16(g_present_quad.fx, g_spirv_translate.float16);
     }
     snx_fx_set_sharpness(g_present_quad.fx, sharpness);
+    snx_fx_set_sharpen(g_present_quad.fx, sharpen);
     snx_fx_set_light(g_present_quad.fx, s->light);
     /* the passes record on cb at once, where the commands queued for the recording thread (vk_rec_call) come after
        what they read: the ring drained, every one of those is in cb */
     vk_rec_sync();
     ++g_present_quad.fx_frames;
+    if (snx_fx_present_debug()) present_debug_say(s, crop, to, filter, aa, sharpen, sharpness);
     int ran = snx_fx_render(g_present_quad.fx, cb, vk_frame_id() % VK_FRAMES, s->view,
                             VK_LAYOUT(SHADER_READ_ONLY_OPTIMAL), s->width, s->height, (u32)crop->offset.x,
                             (u32)crop->offset.y, crop->extent.width, crop->extent.height, 0, w, h, filter, aa, &out);
     vk_render_forget_state(); /* their pipelines and sets are bound now */
-    if (!ran) return 0;
+    if (!ran) {
+        if (snx_fx_present_debug())
+            LOG_LIMIT(8, "present: the effects ran no pass over the frame, their line above says why\n");
+        return 0;
+    }
     VkDescriptorSet set = vk_desc_alloc(g_present_quad.descriptors);
     if (!set) return 0;
     vk_barrier(cb, out.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, 0,

@@ -11,6 +11,9 @@
   * [Contexts and evaluations](#contexts-and-evaluations)
 * [The backends](#the-backends)
 * [In the renderer](#in-the-renderer)
+* [The presented frame](#the-presented-frame)
+  * [Where else it could be taken](#where-else-it-could-be-taken)
+  * [SNX_PRESENT_DEBUG=1](#snx_present_debug1)
 * [Tests](#tests)
 
 The runtime upscales a game's rendering in two places: a Switch 2 game's DLSS evaluations, and the upscalers of a
@@ -21,7 +24,18 @@ interface, `src/nx/gpu/vk/upscaler/upscaler.h`. Its caller gives a picture at a 
 it is told so and runs its own fallback.
 
 The presented frame's effects (FXAA, the present-time upscalers of the window) are another thing: they scale the
-frame the game finished, after everything here.
+frame the game finished, after everything here. They run from one module every Vulkan frontend shares,
+`src/common/gpu/vk/present_fx.c`: the window asks `snx_fx_render` for an image of the shown size (the Switch's
+presenter, `src/nx/gpu/vk/present_quad.c`, calls it for each frame right after the game's own rendering and before the
+interface is drawn over it), or `snx_fx_prepare` and `snx_fx_draw` for the last pass drawn into a rendering of its own
+(the 3DS's and the Vita's). `pick` chooses what runs there: at 1:1 (the shown size is the frame's) FSR 1, NIS and SGSR
+are not run, there being nothing to grow; with `sharpen=1`, FSR 1's RCAS alone then runs over the frame at its own
+size, at `upscaler_sharpness`'s strength, which is the one post process here that does something at 1:1. A frame
+drawn smaller or larger than the part of the window it fills is a copy or an upscaler's pass at that part's size first
+(FSR 1's own RCAS included, NIS and SGSR sharpening in their pass), and with `sharpen=1` and a plain copy (the filter
+off or bilinear) RCAS then runs over the copy at that size, in place of the copy's sharpening. `sharpen` is therefore
+the one place here that sharpens a frame the window does not show at its own size without asking for an upscaler;
+`record_sharp` is its pass, `fsr_rcas.frag` sampling by `texelFetch`, which needs no resample of its own.
 
 ## Who calls it
 
@@ -167,6 +181,68 @@ that onto the game's output target.
   output corner, its jitter and its motion vector scale, which count render pixels. Anything it can't take returns 0,
   and the caller's fallback runs, the reason in the log once.
 - The debug setting `fsr_input_conventions` flips the conventions of every call, to find a game's.
+
+## The presented frame
+
+A frame a game presents reaches the window in one path, and the part of it the window shows is scaled on the way:
+
+1. The game's present (`nvn_QueuePresentTexture`) says its buffer, its crop in it and its format.
+   `vkr_present_buffer` (`src/nx/gpu/vk/renderer.c`) finds the render target over that buffer (`vk_rt_for_cpu`), or
+   copies the buffer (`cpu_frame`) where there is none, and clips the crop to it. A target's pixels are the guest's
+   times the resolution scale, so the crop becomes `g_last_x/y/w/h`, in the target's pixels.
+2. `show` (`src/nx/gpu/vk/renderer.c`) takes the part of the frame the window shows (`crop`) and the rectangle of the
+   window it is drawn into (`to`, the letterbox inside the safe area, which the swapchain's size and the frame's
+   aspect decide), and calls `vk_ui_present` (`src/nx/gpu/vk/ui.c`) with both.
+3. `vk_ui_present` wraps the frame as the present quad's source (`vk_present_quad_source`,
+   `src/nx/gpu/vk/present_quad.c`) and gives it to the effects (`vk_present_quad_effects`) unless the source is a
+   hosted target with no image of its own. The effects record their passes on the window's command buffer
+   (`src/common/gpu/vk/present_fx.c`, shared with the 3DS's and the Vita's presenters) and put their result in the
+   source's place; the quad draws that into the swapchain image, and the interface draws over it in the same pass.
+
+So the frame is scaled by the present quad's sampler, or by the effects' copy and upscaler passes: nothing in the
+window layer scales it again, and `to` is the exact rectangle it is drawn at. A frame the window shows at another size
+than the game's target is not a special case of the effects: they are given the crop in the source's pixels and the
+rectangle to fill (the `w`, `h` and `out_w`, `out_h` of `snx_fx_render`), and a crop smaller than its target (a game's
+dynamic resolution) is copied out first so no sampler reads past it.
+
+`sharpen` (the setting, at `upscaler_sharpness`'s strength) runs there and only there: FSR 1's RCAS over the frame
+itself where its crop is the size it is drawn at, else a copy of the crop at the drawn size and RCAS over that copy. An
+upscaler that sharpens in its own pass (FSR 1's RCAS, NIS, SGSR) keeps it, so no second pass follows one of them. The
+interface is drawn after the frame in the same pass, so it is never sharpened, and a screenshot reads the game's own
+target (`vkr_screenshot`), so it is not sharpened either; a game's own HDR frame is shown as it is, without the
+effects.
+
+Where a frame is sharpened or scaled before the window — the game's own upscaler, the `resolution` setting's targets —
+that is part of what the effects are given, not something they can undo.
+
+### Where else it could be taken
+
+- The effects' hook (this one) is given the crop and the rectangle, so both a frame at its drawn size and one at
+  another size work, and the interface and screenshots are untouched. An HDR frame and a hosted target with no image
+  of its own are the two it cannot take.
+- `show`, between the render target and `vk_ui_present`, would cover a frame the quad is not given (`framed == 0`),
+  at the cost of an image of the window's size and a blit into it, on every present.
+- The game's own blit into its window texture is below the shim: sharpening there would need that blit's target
+  recognised as a frame, and would sharpen frames the window never sees (a screenshot's, a second window's).
+
+### SNX_PRESENT_DEBUG=1
+
+With `SNX_PRESENT_DEBUG=1` in the environment each stage of the path says what it was given and what it chose in the
+log, and nothing else changes, so a log taken with it set is of the same run as one without:
+
+- `present: nvn frame …` — the buffer the game presented, its format's kind, the part of it shown, and whether a
+  render target of the same or another size was found over it (`present: its render target is …`).
+- `present: window pass …` — whether the quad has a frame to draw at all.
+- `present: the effects are given …` — the source's size, the crop, the rectangle drawn at, and the upscaler,
+  anti-aliasing, `sharpen` and strength the effects read; else `present: no pass is asked …` with the reason (no
+  strength, no rectangle, or the passes could not be made on that device).
+- `vulkan: fx: …` — the passes' own line: the image, the crop, the size drawn at, and the pass that ends the frame,
+  or that nothing ran and the window's plain copy takes the frame.
+
+These lines are said for the first frames of each shape and each change of one, then every 300th frame, so a long
+run's log stays readable. A log with none of them, from a run with `sharpen=1` and a strength, means the frame never
+reached the effects: the binary may predate the setting (`scarletnx --settings` lists it where it has one), `framed` is
+0 (the pass clears the window instead of drawing a frame), or the game's present never reaches `vk_ui_present`.
 
 ## Tests
 

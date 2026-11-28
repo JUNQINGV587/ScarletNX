@@ -335,6 +335,43 @@ static int astc_content(const LevelSource* l, u32 nlayers, u64 content[2]) {
     }
     return 1;
 }
+/* SNX_RAWDUMP: a debugging aid. Writes the guest bytes of an ASTC level as they sit in memory (block linear, so the
+   GOBs in the order the GPU reads them), to compare with what a container holds. Reads through the same page walk as
+   astc_content, so it only ever sees bytes the CPU may read */
+static void raw_dump(const Surf* t, u64 gva, u64 lsz, u32 w, u32 h, u32 level) {
+    static u32 n;
+    const char* dir = getenv("SNX_RAWDUMP");
+    if (!dir || !dir[0] || n >= 400) return;
+    LOG_LIMIT(1, "raw_dump: %ux%u L%u lsz=%llu\n", w, h, level, (unsigned long long)lsz);
+    char path[1200];
+    snprintf(path, sizeof path, "%s/%04u_%ux%u_L%u_vk%x_bl%d_bh%u_bd%u_tw%u_pitch%u_lsz%llu.gob", dir, n++, w, h, level,
+             (unsigned)t->f.vk, t->bl, t->bh, t->bd, t->tile_w, t->pitch, (unsigned long long)lsz);
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+    for (u64 o = 0; o < lsz;) {
+        u64 cpu = 0, owners = 0, run = gmmu_run(gva + o, lsz - o, &cpu);
+        if (!run) {
+            run = 0x1000 - ((gva + o) & 0xFFF);
+            if (run > lsz - o) run = lsz - o;
+            if (fseek(f, (long)o, SEEK_SET) == 0) {
+                static const u8 zero[0x1000];
+                fwrite(zero, 1, (size_t)run, f);
+            }
+            o += run;
+            continue;
+        }
+        gmem_need(gva + o, run);
+        if (own_hash(cpu, run, &owners)) {
+            fclose(f);
+            return;
+        }
+        fseek(f, (long)o, SEEK_SET);
+        fwrite(GP(cpu), 1, (size_t)run, f);
+        o += run;
+    }
+    fclose(f);
+}
+
 /* A guest read while staging lands GPU results, and landing can submit the frame's command buffer: the upload's
    commands then belong to the one recording after it, with the image's transfer use established there again */
 static VkCommandBuffer upload_cb(Surf* t, VkCommandBuffer cb) {
@@ -2285,6 +2322,7 @@ static int tex_upload_(Surf* t) {
                 }
                 lv.pitch = (rowb + align - 1) / align * align;
                 lv.gobs_x = gobs_x;
+                raw_dump(t, t->gva + at, lsz, lw, lh, l);
                 complete = t->bl ? level_upload_bl(&u, &lv, t->gva + at, lsz, lbh, lbd, band)
                                  : level_upload_pitch(&u, &lv, t->gva + at, lsz, band);
             }

@@ -58,9 +58,11 @@ static struct {
     } real;
 } g_test;
 
-/* the effects' log: printed, and the last line kept */
+/* the effects' log: printed, and the last line kept. SNX_PRESENT_DEBUG=1's lines say the frames' sizes, not what the
+   effects chose, and they come after the choice's own line: the choice is the one kept */
 static void log_line(const char* text) {
     puts(text);
+    if (!strncmp(text, "fx: ", 4)) return;
     snprintf(g_test.said, sizeof g_test.said, "%s", text);
 }
 
@@ -788,6 +790,117 @@ int main(int argc, char** argv) {
                                    "a frame twice at most)"));
         serial = snx_vk_ring_submit(&t.ring, VK_NULL_HANDLE, VK_NULL_HANDLE);
         CHECK(snx_vk_ring_wait(&t.ring, serial, UINT64_MAX));
+    }
+    /* sharpen: FSR 1's RCAS over the frame, at its own size or over the copy at the window's size, said; a frame the
+       upscaler sharpens itself is not sharpened twice, and with sharpen off nothing runs */
+    {
+        SnxFxImage out = {0};
+        VkCommandBuffer cb;
+        uint64_t serial;
+        unsigned char *got, *soft, *sharpened;
+        int step;
+        snx_fx_set_sharpen(fx, 1);
+        /* at 1:1: RCAS alone over the frame, an image of the shown size */
+        cb = snx_vk_ring_commands(&t.ring);
+        CHECK(snx_fx_render(fx, cb, 0, src.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 320, 240, 0, 0, 320, 240, 0,
+                            320, 240, SNX_FX_UPSCALE_OFF, SNX_FX_AA_OFF, &out));
+        CHECK(!strcmp(g_test.said, "upscaler Off and anti-aliasing Off, 320x240 to 320x240 (sharpen: AMD FSR 1's RCAS "
+                                   "over the frame at its own size)"));
+        serial = snx_vk_ring_submit(&t.ring, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        CHECK(snx_vk_ring_wait(&t.ring, serial, UINT64_MAX));
+        CHECK(out.width == 320 && out.height == 240);
+        got = read_image_f16(&t, out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 320, 240);
+        CHECK(got);
+        /* the pass changed the frame's edges (the pattern has a circle, lines and squares) */
+        CHECK(memcmp(got, pixels, (size_t)320 * 240 * 4) != 0);
+        CHECK(max_step(got, 320, 240, &step) > 0);
+        write_ppm(showcase, "fx-sharpen-1to1", got, 320, 240);
+        free(got);
+        /* the upscaler asked at 1:1 does not grow, and the frame is still sharpened at its own size */
+        cb = snx_vk_ring_commands(&t.ring);
+        CHECK(snx_fx_render(fx, cb, 0, src.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 320, 240, 0, 0, 320, 240, 0,
+                            320, 240, SNX_FX_UPSCALE_FSR1, SNX_FX_AA_OFF, &out));
+        CHECK(strstr(g_test.said, "AMD FSR 1 grows a frame") && strstr(g_test.said, "sharpen: AMD FSR 1's RCAS"));
+        serial = snx_vk_ring_submit(&t.ring, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        CHECK(snx_vk_ring_wait(&t.ring, serial, UINT64_MAX));
+        /* supersampled: the frame is drawn twice as large and averaged down, so no pass over it runs */
+        cb = snx_vk_ring_commands(&t.ring);
+        CHECK(snx_fx_render(fx, cb, 0, src.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 320, 240, 0, 0, 320, 240, 0,
+                            320, 240, SNX_FX_UPSCALE_OFF, SNX_FX_AA_SSAA2, &out));
+        CHECK(!strcmp(g_test.said, "upscaler Off and anti-aliasing SSAA 2x, 320x240 to 320x240 (sharpen: SSAA 2x "
+                                   "supersamples the frame, so no RCAS pass runs over it)"));
+        serial = snx_vk_ring_submit(&t.ring, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        CHECK(snx_vk_ring_wait(&t.ring, serial, UINT64_MAX));
+        /* the window's own draw (the 3DS's and the Vita's presenters): RCAS's pass alone, and RCAS then FXAA, whose
+           pipeline is the one the draw ends with */
+        {
+            Image win = {0}, win_aa = {0};
+            const VkImageUsageFlags usage =
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            VkRect2D whole = {{0, 0}, {320, 240}};
+            Counts one = {0}, two = {0};
+            unsigned char* px;
+            CHECK(image_make(&t, &win, 320, 240, VK_FORMAT_B8G8R8A8_UNORM, usage));
+            CHECK(image_make(&t, &win_aa, 320, 240, VK_FORMAT_B8G8R8A8_UNORM, usage));
+            px = window_draw(&t, fx, &src, &win, VK_FORMAT_B8G8R8A8_UNORM, whole, SNX_FX_UPSCALE_OFF, SNX_FX_AA_OFF,
+                             &one);
+            CHECK(px && one.draws >= 1);
+            free(px);
+            px = window_draw(&t, fx, &src, &win_aa, VK_FORMAT_B8G8R8A8_UNORM, whole, SNX_FX_UPSCALE_OFF, SNX_FX_AA_FXAA,
+                             &two);
+            CHECK(px && two.draws > one.draws);
+            CHECK(strstr(g_test.said, "anti-aliasing FXAA") && strstr(g_test.said, "sharpen: AMD FSR 1's RCAS"));
+            free(px);
+            image_free(&t, &win);
+            image_free(&t, &win_aa);
+        }
+        /* shown larger: sampled to the window's size, then RCAS over that */
+        cb = snx_vk_ring_commands(&t.ring);
+        CHECK(snx_fx_render(fx, cb, 0, src.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 320, 240, 0, 0, 320, 240, 0,
+                            640, 480, SNX_FX_UPSCALE_OFF, SNX_FX_AA_OFF, &out));
+        CHECK(!strcmp(g_test.said, "upscaler Off and anti-aliasing Off, 320x240 to 640x480 (sharpen: AMD FSR 1's RCAS "
+                                   "over the frame sampled to 640x480)"));
+        serial = snx_vk_ring_submit(&t.ring, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        CHECK(snx_vk_ring_wait(&t.ring, serial, UINT64_MAX));
+        CHECK(out.width == 640 && out.height == 480);
+        got = read_image_f16(&t, out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 640, 480);
+        CHECK(got && max_step(got, 640, 480, &step) > 0);
+        write_ppm(showcase, "fx-sharpen-grown", got, 640, 480);
+        free(got);
+        /* shown smaller (a game renders above the window's size): sampled down to it, then RCAS over that */
+        cb = snx_vk_ring_commands(&t.ring);
+        CHECK(snx_fx_render(fx, cb, 0, src.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 320, 240, 0, 0, 320, 240, 0,
+                            160, 120, SNX_FX_UPSCALE_OFF, SNX_FX_AA_OFF, &out));
+        CHECK(!strcmp(g_test.said, "upscaler Off and anti-aliasing Off, 320x240 to 160x120 (sharpen: AMD FSR 1's RCAS "
+                                   "over the frame sampled to 160x120)"));
+        serial = snx_vk_ring_submit(&t.ring, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        CHECK(snx_vk_ring_wait(&t.ring, serial, UINT64_MAX));
+        CHECK(out.width == 160 && out.height == 120);
+        /* the upscaler sharpens the frame itself, at the same strength: sharpen adds no second pass, so the pixels are
+           the ones it draws with sharpen off */
+        snx_fx_set_sharpen(fx, 0);
+        cb = snx_vk_ring_commands(&t.ring);
+        CHECK(snx_fx_render(fx, cb, 0, src.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 320, 240, 0, 0, 320, 240, 0,
+                            640, 480, SNX_FX_UPSCALE_FSR1, SNX_FX_AA_OFF, &out));
+        serial = snx_vk_ring_submit(&t.ring, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        CHECK(snx_vk_ring_wait(&t.ring, serial, UINT64_MAX));
+        soft = read_image_f16(&t, out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 640, 480);
+        snx_fx_set_sharpen(fx, 1);
+        cb = snx_vk_ring_commands(&t.ring);
+        CHECK(snx_fx_render(fx, cb, 0, src.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 320, 240, 0, 0, 320, 240, 0,
+                            640, 480, SNX_FX_UPSCALE_FSR1, SNX_FX_AA_OFF, &out));
+        CHECK(strstr(g_test.said, "AMD FSR 1 sharpens the frame itself, at the same strength"));
+        serial = snx_vk_ring_submit(&t.ring, VK_NULL_HANDLE, VK_NULL_HANDLE);
+        CHECK(snx_vk_ring_wait(&t.ring, serial, UINT64_MAX));
+        sharpened = read_image_f16(&t, out.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, 640, 480);
+        CHECK(soft && sharpened && memcmp(soft, sharpened, (size_t)640 * 480 * 4) == 0);
+        free(soft);
+        free(sharpened);
+        snx_fx_set_sharpen(fx, 0);
+        /* sharpen off: no pass at 1:1 with the upscaler and the anti-aliasing off, as before the setting */
+        cb = snx_vk_ring_commands(&t.ring);
+        CHECK(!snx_fx_render(fx, cb, 0, src.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 320, 240, 0, 0, 320, 240,
+                             0, 320, 240, SNX_FX_UPSCALE_OFF, SNX_FX_AA_OFF, &out));
     }
     /* upscaler_sharpness: 100 draws the edges harder than 0 */
     {

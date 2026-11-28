@@ -78,6 +78,8 @@ struct SnxFx {
     uint32_t slots;
     void (*log)(const char*);
     int sharpness;    /* upscaler_sharpness: 0 the softest, 100 the sharpest */
+    int sharpen;      /* sharpen: FSR 1's RCAS over the frame, over it or over the copy at the window's size, at the
+                         sharpness */
     uint32_t max_dim; /* the device's largest 2D image side */
     int fp16;
     int light; /* the frames given hold linear light (snx_fx_set_light) */
@@ -118,8 +120,8 @@ struct SnxFx {
     VkBuffer tex_buf;
     VkDeviceMemory tex_mem;
     int tex_uploaded;
-    int said
-        [8]; /* the last choice the log said: filter, anti-aliasing, those asked, the crop's and the output's size */
+    int said[9]; /* the last choice the log said: filter, anti-aliasing, those asked, the crop's and the output's size,
+                    sharpen's pass on or not */
     int image_said, formats_said;
     FxLast last[SNX_FX_SLOTS_MAX];
     /* the last passes' pipelines for each format of the windows they are drawn into, made as each is first drawn */
@@ -755,6 +757,20 @@ void snx_fx_set_sharpness(SnxFx* fx, int sharpness) {
     if (fx) fx->sharpness = snx_clamp_int(sharpness, 0, 100);
 }
 
+void snx_fx_set_sharpen(SnxFx* fx, int sharpen) {
+    if (fx) fx->sharpen = sharpen != 0;
+}
+
+/* read once: a log taken with SNX_PRESENT_DEBUG=1 says the present's path, and the run is the same one */
+int snx_fx_present_debug(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char* said = getenv("SNX_PRESENT_DEBUG");
+        on = said && said[0] && strcmp(said, "0") != 0;
+    }
+    return on;
+}
+
 void snx_fx_set_fp16(SnxFx* fx, int on) {
     if (fx) fx->fp16 = on != 0;
 }
@@ -903,6 +919,24 @@ static void record_fsr(SnxFx* fx, VkCommandBuffer cb, uint32_t slot, VkImageView
              sizeof rcas);
 }
 
+/* RCAS over src itself, a pixel for a pixel at (ox, oy) of its target: sharpen's pass where the frame is shown at its
+   own size, record_fsr's EASU half left out */
+static void record_sharp(SnxFx* fx, uint32_t slot, VkImageView src, VkImageLayout layout, uint32_t transform,
+                         uint32_t dw, uint32_t dh, int32_t ox, int32_t oy, FxLast* last) {
+    FsrPush rcas = {0};
+    float sharp = (float)(100 - fx->sharpness) / 100.0f; /* RCAS's stops: 0 the sharpest */
+    snx_fx_fsr_rcas_con(rcas.con[0], sharp);
+    /* the frame itself is read, not EASU's grown copy, so its mirroring is the source's */
+    rcas.flip[0] = (transform & 1) ? 1.0f : 0.0f;
+    rcas.flip[1] = (transform & 2) ? 1.0f : 0.0f;
+    rcas.crop[2] = rcas.crop[3] = 1.0f;
+    rcas.origin[0] = (float)ox;
+    rcas.origin[1] = (float)oy;
+    bind_sampled(fx, fx->fsr_rcas[slot], src, layout, 0, fx->sampler);
+    last_set(last, fx->fp16 && fx->rcas16 ? LAST_RCAS16 : LAST_RCAS, fx->fsr_rcas[slot], dw, dh, ox, oy, &rcas,
+             sizeof rcas);
+}
+
 /* ---- anti-aliasing ---- */
 
 /* FXAA's pass over src, a pixel for a pixel, at (ox, oy) of its target */
@@ -984,6 +1018,13 @@ failed:
     img_free(fx, &ai);
     img_free(fx, &si);
     return 0;
+}
+
+/* whether sharpen asks for its own RCAS pass over a frame the filter draws a pixel for a pixel: asked, a strength
+   that sharpens, a device that holds the pass's image, and no upscaler whose pass sharpens the frame itself */
+static int sharp_asked(SnxFx* fx, int filter) {
+    return fx->sharpen && fx->sharpness > 0 && format_ok(fx) &&
+           (filter == SNX_FX_UPSCALE_OFF || filter == SNX_FX_UPSCALE_BILINEAR);
 }
 
 /* What runs for the filter and anti-aliasing asked over w x h shown at out_w x out_h, and why where it is not what was
@@ -1141,22 +1182,40 @@ static void sgsr_last(SnxFx* fx, uint32_t slot, VkImageView src, VkImageLayout l
 
 /* ---- a frame ---- */
 
-/* the filter and anti-aliasing that run for those asked over w x h shown at out_w x out_h (pick), said once for each
-   choice, size and reason where either is asked */
+/* the filter and anti-aliasing that run for those asked over w x h shown at out_w x out_h (pick), and sharpen's own
+   pass (over the frame or over the copy at the shown size, or why it is not its own pass), said once for each choice,
+   size and reason where either is asked */
 static void choose(SnxFx* fx, int* filter, int* aa, uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h) {
-    char why[96];
+    char why[96], sharp_why[160];
     int asked_filter = *filter, asked_aa = *aa;
+    int sharp_on = fx->sharpen && fx->sharpness > 0;
     pick(fx, filter, aa, w, h, out_w, out_h, why, sizeof why);
-    if (asked_filter == SNX_FX_UPSCALE_OFF && asked_aa == SNX_FX_AA_OFF) return;
+    sharp_why[0] = 0;
+    if (sharp_on && format_ok(fx)) {
+        if (*aa == SNX_FX_AA_SSAA2 || *aa == SNX_FX_AA_SSAA4)
+            snprintf(sharp_why, sizeof sharp_why,
+                     " (sharpen: %s supersamples the frame, so no RCAS pass runs over it)", aa_labels[*aa]);
+        else if (*filter == SNX_FX_UPSCALE_FSR1 || *filter == SNX_FX_UPSCALE_NIS || *filter == SNX_FX_UPSCALE_SGSR)
+            snprintf(sharp_why, sizeof sharp_why,
+                     " (sharpen: %s sharpens the frame itself, at the same strength, so no RCAS pass follows it)",
+                     upscale_labels[*filter]);
+        else if (w == out_w && h == out_h)
+            snprintf(sharp_why, sizeof sharp_why, " (sharpen: AMD FSR 1's RCAS over the frame at its own size)");
+        else
+            snprintf(sharp_why, sizeof sharp_why,
+                     " (sharpen: AMD FSR 1's RCAS over the frame sampled to %ux%u)", out_w, out_h);
+    }
+    /* where the device cannot hold the pass's image, pick's why says so */
+    if (asked_filter == SNX_FX_UPSCALE_OFF && asked_aa == SNX_FX_AA_OFF && !sharp_on) return;
     /* a frame a second of another size says it again */
     if (*filter != fx->said[0] || *aa != fx->said[1] || asked_filter != fx->said[2] || asked_aa != fx->said[3] ||
         w != (uint32_t)fx->said[4] || h != (uint32_t)fx->said[5] || out_w != (uint32_t)fx->said[6] ||
-        out_h != (uint32_t)fx->said[7]) {
-        char said[192];
-        int now[8] = {*filter, *aa, asked_filter, asked_aa, (int)w, (int)h, (int)out_w, (int)out_h};
+        out_h != (uint32_t)fx->said[7] || sharp_on != fx->said[8]) {
+        char said[320];
+        int now[9] = {*filter, *aa, asked_filter, asked_aa, (int)w, (int)h, (int)out_w, (int)out_h, sharp_on};
         memcpy(fx->said, now, sizeof now);
-        snprintf(said, sizeof said, "upscaler %s and anti-aliasing %s, %ux%u to %ux%u%s", upscale_labels[*filter],
-                 aa_labels[*aa], w, h, out_w, out_h, why);
+        snprintf(said, sizeof said, "upscaler %s and anti-aliasing %s, %ux%u to %ux%u%s%s", upscale_labels[*filter],
+                 aa_labels[*aa], w, h, out_w, out_h, why, sharp_why);
         fx_echo(fx, said);
     }
 }
@@ -1169,6 +1228,40 @@ static int last_kind(const SnxFx* fx, int filter, int aa) {
     if (filter == SNX_FX_UPSCALE_FSR1) return fx->fp16 && fx->rcas16 ? LAST_RCAS16 : LAST_RCAS;
     if (filter == SNX_FX_UPSCALE_SGSR) return LAST_SGSR;
     return filter == SNX_FX_UPSCALE_NIS ? LAST_NONE : LAST_COPY;
+}
+
+/* SNX_PRESENT_DEBUG=1: the name of the pass a frame ends in, for the line frame says */
+static const char* last_name(int kind) {
+    switch (kind) {
+    case LAST_COPY: return "a copy";
+    case LAST_RCAS: return "RCAS";
+    case LAST_RCAS16: return "RCAS in fp16";
+    case LAST_SGSR: return "SGSR";
+    case LAST_FXAA: return "FXAA";
+    case LAST_BLEND: return "SMAA's blend";
+    default: return "NIS's compute pass";
+    }
+}
+
+/* SNX_PRESENT_DEBUG=1: whether this frame's sizes are said, the first eight and each change of one, then every 300th
+   (a frame is presented sixty times a second, and the log is read after the run) */
+static int debug_frame(uint32_t img_w, uint32_t img_h, uint32_t w, uint32_t h, uint32_t out_w, uint32_t out_h) {
+    static struct {
+        uint32_t img_w, img_h, w, h, out_w, out_h;
+        unsigned frames;
+    } said;
+    unsigned n = said.frames++;
+    int changed = said.img_w != img_w || said.img_h != img_h || said.w != w || said.h != h || said.out_w != out_w ||
+                  said.out_h != out_h;
+    if (changed) {
+        said.img_w = img_w;
+        said.img_h = img_h;
+        said.w = w;
+        said.h = h;
+        said.out_w = out_w;
+        said.out_h = out_h;
+    }
+    return changed || n < 8 || n % 300 == 0;
 }
 
 /* an image of the effects made, or said once (the frame then shows as with both off) */
@@ -1195,18 +1288,25 @@ static int frame(SnxFx* fx, VkCommandBuffer cb, uint32_t slot, VkImageView src, 
                  FxImage** done) {
     uint32_t work_w = out_w, work_h = out_h;
     int kind, entry = -1;
+    int may, sharp, scaled;
     FxLast* last = &fx->last[slot];
     FxImage* main = &fx->main[slot];
     NisConfig nis = {0};
     last->kind = LAST_NONE;
     choose(fx, &filter, &aa, w, h, out_w, out_h);
-    if ((filter == SNX_FX_UPSCALE_OFF || filter == SNX_FX_UPSCALE_BILINEAR) && aa == SNX_FX_AA_OFF) goto plain;
+    may = sharp_asked(fx, filter);
+    if ((filter == SNX_FX_UPSCALE_OFF || filter == SNX_FX_UPSCALE_BILINEAR) && aa == SNX_FX_AA_OFF && !may) goto plain;
     if (!make_pipelines(fx)) goto plain;
     if (aa == SNX_FX_AA_SSAA2 || aa == SNX_FX_AA_SSAA4) {
         uint32_t mult = aa == SNX_FX_AA_SSAA4 ? 4 : 2;
         work_w = out_w * mult;
         work_h = out_h * mult;
     }
+    /* the pass draws a pixel for a pixel where the frame is the window's size. Where it is not, the copy is drawn
+       first at the window's size, then RCAS over it. None where supersampling grows the frame first */
+    sharp = may && work_w == w && work_h == h;
+    scaled = may && !sharp && work_w == out_w && work_h == out_h;
+
     /* A crop that is not its whole image (a dynamic resolution drawn into part of the target): every filter samples
        past its pixel (EASU's 12 taps, NIS's 6x6 kernel, SGSR's gathers, a bilinear copy's half pixel), which there is
        the image's hidden part. The crop is copied alone first, at its own size, so the sampler's clamp to the edge is
@@ -1230,8 +1330,22 @@ static int frame(SnxFx* fx, VkCommandBuffer cb, uint32_t slot, VkImageView src, 
                                                                             img_w, img_h, x, y, w, h, work_w, work_h)))
         filter = SNX_FX_UPSCALE_FSR1;
     if (filter == SNX_FX_UPSCALE_SGSR && !ensure_sgsr(fx)) filter = SNX_FX_UPSCALE_FSR1;
-    kind = last_kind(fx, filter, aa);
+    /* the kind drawn last, into the window: sharpen's pass where no anti-aliasing follows it, else what follows */
+    kind = (sharp || scaled) && aa == SNX_FX_AA_OFF ? (fx->fp16 && fx->rcas16 ? LAST_RCAS16 : LAST_RCAS)
+                                                    : last_kind(fx, filter, aa);
     if (window && !window_pipe(fx, kind == LAST_NONE ? LAST_COPY : kind, format, &entry)) goto plain;
+    if (snx_fx_present_debug() && debug_frame(img_w, img_h, w, h, out_w, out_h)) {
+        char said[256];
+        snprintf(said, sizeof said,
+                 "fx: %ux%u image, the frame %ux%u at %u,%u shown at %ux%u, upscaler %s and anti-aliasing %s: %s, the "
+                 "last pass %s",
+                 img_w, img_h, w, h, x, y, out_w, out_h, upscale_labels[filter], aa_labels[aa],
+                 sharp    ? "sharpen's RCAS over the frame at its own size"
+                 : scaled ? "the copy at the window's size, then sharpen's RCAS over it"
+                          : "no sharpen pass",
+                 last_name(kind));
+        fx_echo(fx, said);
+    }
     {
         /* the filter's pass is the last where no anti-aliasing follows it: at the caller's place then */
         int ends = aa == SNX_FX_AA_OFF;
@@ -1247,6 +1361,21 @@ static int frame(SnxFx* fx, VkCommandBuffer cb, uint32_t slot, VkImageView src, 
                 copy_last(fx, fx->copy_set[slot], main->view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, work_w, work_h,
                           0, 0, work_w, work_h, 0, out_w, out_h, 1, ox, oy, last);
             }
+        } else if (sharp) {
+            record_sharp(fx, slot, src, layout, transform, work_w, work_h, fx_x, fx_y, last);
+        } else if (scaled) {
+            /* the frame sampled to the window's size, then RCAS over that */
+            if (!fx_image(fx, &fx->mid[slot], work_w, work_h, choose_format(fx), fx_usage())) goto plain;
+            copy_last(fx, fx->copy_set[slot], src, layout, img_w, img_h, x, y, w, h, transform, work_w, work_h,
+                      filter == SNX_FX_UPSCALE_OFF && fx->off_sharp, 0, 0, last);
+            draw_own(fx, cb, last, &fx->mid[slot]);
+            fx_barrier(fx, cb, fx->mid[slot].image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                       VK_ACCESS_2_TRANSFER_READ_BIT,
+                       VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+            record_sharp(fx, slot, fx->mid[slot].view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, 0, work_w, work_h,
+                         fx_x, fx_y, last);
         } else {
             if (filter == SNX_FX_UPSCALE_SGSR)
                 sgsr_last(fx, slot, src, layout, img_w, img_h, x, y, w, h, transform, work_w, work_h, fx_x, fx_y, last);
@@ -1258,10 +1387,10 @@ static int frame(SnxFx* fx, VkCommandBuffer cb, uint32_t slot, VkImageView src, 
                       anti-aliasing smooths the edges a pixel shows on the screen and leaves the pixels whole */
                 copy_last(fx, fx->copy_set[slot], src, layout, img_w, img_h, x, y, w, h, transform, work_w, work_h,
                           filter == SNX_FX_UPSCALE_OFF && fx->off_sharp, 0, 0, last);
-            if (!ends) {
-                if (!fx_image(fx, main, work_w, work_h, choose_format(fx), fx_usage())) goto plain;
-                draw_own(fx, cb, last, main);
-            }
+        }
+        if (!ends && filter != SNX_FX_UPSCALE_NIS) {
+            if (!fx_image(fx, main, work_w, work_h, choose_format(fx), fx_usage())) goto plain;
+            draw_own(fx, cb, last, main);
         }
     }
     if (aa != SNX_FX_AA_OFF)
@@ -1337,6 +1466,13 @@ static int frame(SnxFx* fx, VkCommandBuffer cb, uint32_t slot, VkImageView src, 
     }
     return 1;
 plain:
+    if (snx_fx_present_debug() && debug_frame(img_w, img_h, w, h, out_w, out_h)) {
+        char said[224];
+        snprintf(said, sizeof said,
+                 "fx: %ux%u image, the frame %ux%u at %u,%u shown at %ux%u: nothing runs, the window's plain copy",
+                 img_w, img_h, w, h, x, y, out_w, out_h);
+        fx_echo(fx, said);
+    }
     /* where neither runs, or the effects can't: the window samples the frame itself, as with both off (the upscaler
        Off in sharp pixels where the window keeps them), the crop in place */
     last->kind = LAST_NONE;

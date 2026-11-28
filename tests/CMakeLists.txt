@@ -2930,6 +2930,37 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME port_fork_check COMMAND "${Python3_EXECUTABLE}" "${PROJECT_SOURCE_DIR}/scripts/check-port-fork.py")
     add_test(NAME port_fork_check_script
              COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/port_fork_test.py")
+    # a Frostpunk asset container: the 29-byte records, the zip gaps between blocks, and the refusal of a
+    # replacement whose size or decompression does not match its record (scripts/frostpunk-assets.py)
+    add_test(NAME frostpunk_assets
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_assets_test.py")
+    # a Frostpunk asset container round-trips without losing a payload: the set is rewritten, read back and every
+    # payload hash compared; a deliberately corrupt block is reported by its resource id (scripts/frostpunk-assets.py)
+    add_test(NAME frostpunk_roundtrip
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_roundtrip_test.py")
+    # every resource in a Frostpunk container with its block kind, declared size, offset and payload, and the
+    # filters, size sort and JSON/TSV export that trace what is on screen back to a texture in the package
+    # (scripts/frostpunk-assets.py)
+    add_test(NAME frostpunk_inventory
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_inventory_test.py")
+    # the alignment of the Switch and the PC package by id, and the replacement plan: the three counts, the readable
+    # PC blocks per group, a whitelist that leaves a texture out, a plan read back with a line deleted, a
+    # non-power-of-two source and an over-budget refusal (scripts/frostpunk-assets.py)
+    add_test(NAME frostpunk_plan
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_plan_test.py")
+    # a plan turned into a replacement container: a PC texture decoded (DXT5 at 4 by 4 and 8 by 8, raw
+    # RGBA8, a chain whose full-size level is last), encoded to ASTC 4x4, put under the header of the block it
+    # replaces with only the words that describe the pixels changed, and a size report that matches the file
+    # (scripts/frostpunk-assets.py)
+    add_test(NAME frostpunk_apply
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_apply_test.py")
+    # a plan turned into a replacement container of BC3 in the block-linear layout: the level sizes of a 1024
+    # texture (1,400,320 bytes over 11 levels, block height shrinking to 0), the block layout round-tripping, an
+    # 8 by 8 image read back out of the payload it was encoded into, the refusals (another format, pixels that are
+    # not that layout, a missing PC block, raw PC pixels, a PC image below the Switch size, a cap below it) and the
+    # padding that keeps the file as long as the one it replaces (scripts/frostpunk-assets.py, scripts/frostpunk_bl.py)
+    add_test(NAME frostpunk_apply_bc3
+             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/frostpunk_apply_bc3_test.py")
     # which GitHub Actions caches the cleanup workflow deletes (scripts/trim-caches.py)
     add_test(NAME trim_caches COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/trim_caches_test.py")
     # build.yml's LLVM builds, each saved by the step right after it: a later failure or a cancelled run keeps it;
