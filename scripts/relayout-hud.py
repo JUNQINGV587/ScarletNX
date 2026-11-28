@@ -142,8 +142,9 @@ def main():
         print(f, os.path.getsize(p))
 
     if a.verify:
-        ds2 = fp.DatSet(os.path.join(a.out, 'switch-templates.dat'),
-                        os.path.join(a.out, 'switch-templates.idx'), a.str)
+        stem = os.path.splitext(os.path.basename(a.dat))[0]
+        ds2 = fp.DatSet(os.path.join(a.out, stem + '.dat'),
+                        os.path.join(a.out, stem + '.idx'), a.str)
         for t, name in TEMPLATES.items():
             rec = next(r for r in ds2.records if r.rid == t)
             p = ds2.read_payload(rec)

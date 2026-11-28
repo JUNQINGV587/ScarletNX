@@ -93,6 +93,12 @@ CATEGORIES = (
                  "citydetail/")),
     ("buildings", ("buildings/",)),
     ("rocks", ("environment/rocks/", "environment/endless/")),
+    ("characters", ("characters/",)),
+    ("resources", ("resources/",)),
+    ("trees", ("trees/",)),
+    ("effects", ("effects/",)),
+    ("clouds", ("clouds/",)),
+    ("glass", ("glass/",)),
 )
 ROCK_WORD = "rock"
 ROCK_SCOPE = "environment/"
@@ -2682,7 +2688,7 @@ def main(argv=None):
     p.add_argument("--read", metavar="PLAN",
                    help="summarise an existing plan instead of making one")
     p.add_argument("--categories",
-                   default=",".join(CATEGORY_NAMES),
+                   default="terrain,buildings,rocks",
                    help="comma list of categories to replace, or all "
                         "(default: %(default)s)")
     p.add_argument("--include", action="append", default=[],
